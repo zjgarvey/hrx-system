@@ -625,6 +625,14 @@ typedef struct iree_hal_streaming_event_t {
   // Timing information.
   iree_time_t record_time_ns;
 
+  // Device-side timing. When non-NULL the event records a device GPU-clock tick
+  // into this 8-byte buffer at record time and elapsed time is computed from
+  // the device timestamp domain using |timestamp_frequency_hz|. When NULL the
+  // event falls back to host-side timing via record_time_ns (devices that do
+  // not expose a device timestamp domain).
+  iree_hal_buffer_t* timestamp_buffer;
+  uint64_t timestamp_frequency_hz;
+
   // Platform-specific IPC handle, if the event is IPC enabled.
   void* ipc_handle;
 
