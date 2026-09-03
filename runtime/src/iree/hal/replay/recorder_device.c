@@ -452,8 +452,9 @@ static iree_status_t iree_hal_replay_device_queue_alloca(
   }
   if (iree_status_is_ok(status)) {
     status = iree_hal_replay_recorder_buffer_create_proxy(
-        device->recorder, device->device_id, buffer_id, base_device,
-        base_buffer, device->host_allocator, &replay_buffer);
+        device->recorder, device->device_id, buffer_id,
+        IREE_HAL_REPLAY_OBJECT_ID_NONE, base_device, base_buffer,
+        device->host_allocator, &replay_buffer);
   }
 
   iree_hal_replay_buffer_object_payload_t object_payload;

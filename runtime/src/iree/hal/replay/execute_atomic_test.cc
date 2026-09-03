@@ -77,6 +77,10 @@ typedef struct CapturingCommandBuffer {
 typedef struct CapturingDevice {
   // Base resource dispatched through the public HAL API.
   iree_hal_resource_t resource;
+  // Borrowed task device used to create concrete completion semaphores.
+  iree_hal_device_t* task_device;
+  // Number of unexpected standalone completion barriers received.
+  iree_host_size_t completion_barrier_count;
   // Most recent atomic backend invocation.
   AtomicInvocation invocation;
   // Total number of atomic backend invocations.
@@ -166,6 +170,34 @@ static iree_status_t CapturingCommandBufferAtomicRmw(
 
 static void CapturingDeviceDestroy(iree_hal_device_t* base_device) {
   (void)base_device;
+}
+
+static iree_status_t CapturingDeviceCreateSemaphore(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    uint64_t initial_value, iree_hal_semaphore_flags_t flags,
+    iree_hal_semaphore_t** out_semaphore) {
+  return iree_hal_semaphore_create(CastDevice(base_device)->task_device,
+                                   queue_affinity, initial_value, flags,
+                                   out_semaphore);
+}
+
+static iree_status_t CapturingDeviceQueueExecute(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_command_buffer_t* command_buffer,
+    iree_hal_buffer_binding_table_t binding_table,
+    iree_hal_execute_flags_t flags) {
+  (void)queue_affinity;
+  (void)flags;
+  if (wait_semaphore_list.count != 0 || command_buffer ||
+      binding_table.count != 0) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "test device expected a completion barrier");
+  }
+  ++CastDevice(base_device)->completion_barrier_count;
+  return iree_hal_semaphore_list_signal(signal_semaphore_list,
+                                        /*frontier=*/nullptr);
 }
 
 static AtomicInvocation* BeginDeviceInvocation(
@@ -363,11 +395,14 @@ class ReplayAtomicExecutionTest : public ::testing::Test {
     IREE_ASSERT_OK(iree_hal_command_buffer_begin(&command_buffer_.base));
 
     device_vtable_.destroy = CapturingDeviceDestroy;
+    device_vtable_.create_semaphore = CapturingDeviceCreateSemaphore;
+    device_vtable_.queue_execute = CapturingDeviceQueueExecute;
     device_vtable_.queue_atomic_wait = CapturingDeviceAtomicWait;
     device_vtable_.queue_atomic_store = CapturingDeviceAtomicStore;
     device_vtable_.queue_atomic_rmw = CapturingDeviceAtomicRmw;
     device_vtable_.queue_flush = CapturingDeviceQueueFlush;
     iree_hal_resource_initialize(&device_vtable_, &device_.resource);
+    device_.task_device = task_device_;
     execute_options_ = iree_hal_replay_execute_options_default();
     IREE_ASSERT_OK(iree_hal_replay_executor_initialize(
         &executor_, iree_const_byte_span_empty(), /*object_capacity=*/8,
@@ -573,12 +608,15 @@ TEST_F(ReplayAtomicExecutionTest, ReplaysQueueOperations) {
   IREE_ASSERT_OK(Replay(record));
   EXPECT_EQ(1u, device_.invocation_count);
   EXPECT_EQ(1u, device_.flush_count);
+  EXPECT_EQ(0u, device_.completion_barrier_count);
+  EXPECT_EQ(0u, executor_.queue_completion_count);
+  EXPECT_TRUE(executor_.queue_completions_drained);
   EXPECT_EQ(kAtomicInvocationWait, device_.invocation.kind);
   EXPECT_EQ(1u, device_.invocation.queue_affinity);
   EXPECT_EQ(1u, device_.invocation.wait_semaphore_count);
   EXPECT_EQ(wait_semaphore_, device_.invocation.wait_timepoint.semaphore);
   EXPECT_EQ(7u, device_.invocation.wait_timepoint.value);
-  EXPECT_EQ(1u, device_.invocation.signal_semaphore_count);
+  EXPECT_EQ(2u, device_.invocation.signal_semaphore_count);
   EXPECT_EQ(signal_semaphore_, device_.invocation.signal_timepoint.semaphore);
   EXPECT_EQ(9u, device_.invocation.signal_timepoint.value);
   EXPECT_EQ(target_buffer_, device_.invocation.target_ref.buffer);
@@ -605,6 +643,7 @@ TEST_F(ReplayAtomicExecutionTest, ReplaysQueueOperations) {
   IREE_ASSERT_OK(Replay(record));
   EXPECT_EQ(2u, device_.invocation_count);
   EXPECT_EQ(2u, device_.flush_count);
+  EXPECT_EQ(0u, device_.completion_barrier_count);
   EXPECT_EQ(kAtomicInvocationStore, device_.invocation.kind);
   EXPECT_EQ(16u, device_.invocation.target_ref.offset);
   EXPECT_EQ(4u, device_.invocation.target_ref.length);
@@ -628,6 +667,7 @@ TEST_F(ReplayAtomicExecutionTest, ReplaysQueueOperations) {
   IREE_ASSERT_OK(Replay(record));
   EXPECT_EQ(3u, device_.invocation_count);
   EXPECT_EQ(3u, device_.flush_count);
+  EXPECT_EQ(0u, device_.completion_barrier_count);
   EXPECT_EQ(kAtomicInvocationRmw, device_.invocation.kind);
   EXPECT_EQ(24u, device_.invocation.target_ref.offset);
   EXPECT_EQ(8u, device_.invocation.target_ref.length);
@@ -637,6 +677,33 @@ TEST_F(ReplayAtomicExecutionTest, ReplaysQueueOperations) {
   EXPECT_EQ(rmw_payload.params.width, device_.invocation.rmw_params.width);
   EXPECT_EQ(rmw_payload.params.operation,
             device_.invocation.rmw_params.operation);
+}
+
+TEST_F(ReplayAtomicExecutionTest, TracksSignalLessQueueCompletion) {
+  OperationRecord record;
+  iree_hal_replay_device_queue_atomic_store_payload_t payload = {};
+  payload.target_ref = DirectTarget(/*offset=*/0, /*length=*/4);
+  payload.queue_affinity = 1;
+  payload.params.value = 1;
+  payload.params.width = IREE_HAL_ATOMIC_WIDTH_32;
+  record.Reset(IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_ATOMIC_STORE,
+               IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_STORE,
+               kDeviceId, payload);
+
+  IREE_ASSERT_OK(Replay(record));
+  EXPECT_EQ(1u, device_.invocation_count);
+  EXPECT_EQ(1u, device_.invocation.signal_semaphore_count);
+  EXPECT_EQ(0u, device_.completion_barrier_count);
+  EXPECT_EQ(1u, device_.flush_count);
+  ASSERT_EQ(1u, executor_.queue_completion_count);
+  EXPECT_EQ(executor_.queue_completions[0].semaphore,
+            device_.invocation.signal_timepoint.semaphore);
+  EXPECT_EQ(1u, device_.invocation.signal_timepoint.value);
+  EXPECT_FALSE(executor_.queue_completions_drained);
+
+  IREE_ASSERT_OK(iree_hal_replay_executor_drain_queue_completions(&executor_));
+  EXPECT_TRUE(executor_.queue_completions_drained);
+  EXPECT_EQ(2u, device_.flush_count);
 }
 
 TEST_F(ReplayAtomicExecutionTest, RejectsMalformedRecords) {

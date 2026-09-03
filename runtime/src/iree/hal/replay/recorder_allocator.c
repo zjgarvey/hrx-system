@@ -8,6 +8,7 @@
 
 #include <string.h>
 
+#include "iree/base/threading/mutex.h"
 #include "iree/hal/replay/recorder_buffer.h"
 #include "iree/hal/replay/recorder_record.h"
 
@@ -19,6 +20,9 @@
 //===----------------------------------------------------------------------===//
 // iree_hal_replay_recorder_allocator_t
 //===----------------------------------------------------------------------===//
+
+typedef struct iree_hal_replay_recorder_physical_memory_t
+    iree_hal_replay_recorder_physical_memory_t;
 
 typedef struct iree_hal_replay_recorder_allocator_t {
   // HAL resource header for the recording wrapper allocator.
@@ -35,23 +39,21 @@ typedef struct iree_hal_replay_recorder_allocator_t {
   iree_hal_replay_object_id_t device_id;
   // Session-local object id assigned to this allocator.
   iree_hal_replay_object_id_t allocator_id;
+  // Serializes VMM proxy validation with backend use and consumption.
+  iree_slim_mutex_t virtual_memory_mutex;
+  // Live physical-memory tokens created by this exact recorder allocator.
+  iree_hal_replay_recorder_physical_memory_t* physical_memory_list;
 } iree_hal_replay_recorder_allocator_t;
 
 // Recording wrapper for an allocator-owned opaque physical memory handle.
-typedef struct iree_hal_replay_recorder_physical_memory_t {
+struct iree_hal_replay_recorder_physical_memory_t {
   // Underlying allocator handle forwarded to the backend.
   iree_hal_physical_memory_t* base_physical_memory;
-  // Host allocator used for this wrapper's lifetime.
-  iree_allocator_t host_allocator;
   // Session-local object id assigned to the physical memory handle.
   iree_hal_replay_object_id_t physical_memory_id;
-} iree_hal_replay_recorder_physical_memory_t;
-
-static iree_hal_replay_recorder_physical_memory_t*
-iree_hal_replay_recorder_physical_memory_cast(
-    iree_hal_physical_memory_t* physical_memory) {
-  return (iree_hal_replay_recorder_physical_memory_t*)physical_memory;
-}
+  // Next live token in the originating allocator registry.
+  iree_hal_replay_recorder_physical_memory_t* next;
+};
 
 static const iree_hal_allocator_vtable_t
     iree_hal_replay_recorder_allocator_vtable;
@@ -96,6 +98,38 @@ static iree_status_t iree_hal_replay_recorder_allocator_begin_operation(
       payload_type, out_pending_record);
 }
 
+// Begins a stateful VMM operation if capture is still available. Once capture
+// has failed or closed, the zero pending record keeps backend forwarding
+// available while recorder close remains responsible for the capture error.
+static void iree_hal_replay_recorder_allocator_begin_passthrough_operation(
+    iree_hal_replay_recorder_allocator_t* allocator,
+    iree_hal_replay_object_id_t related_object_id,
+    iree_hal_replay_operation_code_t operation_code,
+    iree_hal_replay_payload_type_t payload_type,
+    iree_hal_replay_pending_record_t* out_pending_record) {
+  iree_status_t status = iree_hal_replay_recorder_allocator_begin_operation(
+      allocator, related_object_id, operation_code, payload_type,
+      out_pending_record);
+  if (!iree_status_is_ok(status)) {
+    iree_status_ignore(status);
+    memset(out_pending_record, 0, sizeof(*out_pending_record));
+  }
+}
+
+// Finds a physical-memory token while |virtual_memory_mutex| is held. Pointer
+// equality is checked before the opaque public token is ever dereferenced.
+static iree_hal_replay_recorder_physical_memory_t*
+iree_hal_replay_recorder_allocator_find_physical_memory_locked(
+    iree_hal_replay_recorder_allocator_t* allocator,
+    iree_hal_physical_memory_t* physical_memory) {
+  iree_hal_replay_recorder_physical_memory_t* current =
+      allocator->physical_memory_list;
+  while (current && (iree_hal_physical_memory_t*)current != physical_memory) {
+    current = current->next;
+  }
+  return current;
+}
+
 static void iree_hal_replay_recorder_allocator_destroy(
     iree_hal_allocator_t* IREE_RESTRICT base_allocator) {
   iree_hal_replay_recorder_allocator_t* allocator =
@@ -103,6 +137,8 @@ static void iree_hal_replay_recorder_allocator_destroy(
   iree_allocator_t host_allocator = allocator->host_allocator;
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  IREE_ASSERT(allocator->physical_memory_list == NULL);
+  iree_slim_mutex_deinitialize(&allocator->virtual_memory_mutex);
   iree_hal_allocator_release(allocator->base_allocator);
   iree_hal_replay_recorder_release(allocator->recorder);
   iree_allocator_free(host_allocator, allocator);
@@ -203,8 +239,8 @@ static iree_status_t iree_hal_replay_recorder_allocator_allocate_buffer(
   if (iree_status_is_ok(status)) {
     status = iree_hal_replay_recorder_buffer_create_proxy(
         allocator->recorder, allocator->device_id, buffer_id,
-        allocator->placement_device, base_buffer, allocator->host_allocator,
-        &replay_buffer);
+        IREE_HAL_REPLAY_OBJECT_ID_NONE, allocator->placement_device,
+        base_buffer, allocator->host_allocator, &replay_buffer);
   }
 
   iree_hal_replay_buffer_object_payload_t object_payload;
@@ -305,8 +341,8 @@ static iree_status_t iree_hal_replay_recorder_allocator_import_buffer(
   if (iree_status_is_ok(status)) {
     status = iree_hal_replay_recorder_buffer_create_proxy(
         allocator->recorder, allocator->device_id, buffer_id,
-        allocator->placement_device, base_buffer, allocator->host_allocator,
-        &replay_buffer);
+        IREE_HAL_REPLAY_OBJECT_ID_NONE, allocator->placement_device,
+        base_buffer, allocator->host_allocator, &replay_buffer);
   }
 
   iree_hal_replay_buffer_object_payload_t object_payload;
@@ -412,8 +448,8 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_reserve(
   if (iree_status_is_ok(status)) {
     status = iree_hal_replay_recorder_buffer_create_proxy(
         allocator->recorder, allocator->device_id, buffer_id,
-        allocator->placement_device, base_buffer, allocator->host_allocator,
-        &replay_buffer);
+        allocator->allocator_id, allocator->placement_device, base_buffer,
+        allocator->host_allocator, &replay_buffer);
   }
 
   iree_hal_replay_buffer_object_payload_t object_payload;
@@ -444,12 +480,16 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_release(
     iree_hal_buffer_t* IREE_RESTRICT virtual_buffer) {
   iree_hal_replay_recorder_allocator_t* allocator =
       iree_hal_replay_recorder_allocator_cast(base_allocator);
-  const iree_hal_replay_object_id_t virtual_buffer_id =
-      iree_hal_replay_recorder_buffer_id_or_none(virtual_buffer);
-  if (IREE_UNLIKELY(virtual_buffer_id == IREE_HAL_REPLAY_OBJECT_ID_NONE)) {
-    return iree_make_status(
-        IREE_STATUS_INVALID_ARGUMENT,
-        "virtual memory reservation was not created by this replay recorder");
+  iree_slim_mutex_lock(&allocator->virtual_memory_mutex);
+  iree_hal_replay_object_id_t virtual_buffer_id =
+      IREE_HAL_REPLAY_OBJECT_ID_NONE;
+  iree_hal_buffer_t* base_buffer = NULL;
+  iree_status_t status = iree_hal_replay_recorder_buffer_resolve_virtual_memory(
+      virtual_buffer, allocator->recorder, allocator->allocator_id,
+      &virtual_buffer_id, &base_buffer);
+  if (!iree_status_is_ok(status)) {
+    iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+    return status;
   }
   const iree_hal_replay_allocator_virtual_memory_release_payload_t payload = {
       .virtual_buffer_id = virtual_buffer_id,
@@ -457,19 +497,20 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_release(
   const iree_const_byte_span_t iovec =
       iree_make_const_byte_span((const uint8_t*)&payload, sizeof(payload));
   iree_hal_replay_pending_record_t pending_record;
-  IREE_RETURN_IF_ERROR(iree_hal_replay_recorder_allocator_begin_operation(
+  iree_hal_replay_recorder_allocator_begin_passthrough_operation(
       allocator, virtual_buffer_id,
       IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_RELEASE,
       IREE_HAL_REPLAY_PAYLOAD_TYPE_ALLOCATOR_VIRTUAL_MEMORY_RELEASE,
-      &pending_record));
-  iree_status_t status = iree_hal_allocator_virtual_memory_release(
-      allocator->base_allocator,
-      iree_hal_replay_recorder_buffer_base_or_self(virtual_buffer));
+      &pending_record);
+  status = iree_hal_allocator_virtual_memory_release(allocator->base_allocator,
+                                                     base_buffer);
   if (iree_status_is_ok(status)) {
     iree_hal_replay_recorder_buffer_consume_virtual_memory(virtual_buffer);
   }
-  return iree_hal_replay_recorder_end_operation_with_payload(&pending_record,
-                                                             status, 1, &iovec);
+  status = iree_hal_replay_recorder_end_passthrough_operation_with_payload(
+      &pending_record, status, 1, &iovec);
+  iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+  return status;
 }
 
 static iree_status_t
@@ -505,20 +546,24 @@ iree_hal_replay_recorder_allocator_physical_memory_allocate(
       allocator->base_allocator, params, size, host_allocator,
       &base_physical_memory);
   if (iree_status_is_ok(status)) {
-    status =
-        iree_allocator_malloc(host_allocator, sizeof(*replay_physical_memory),
-                              (void**)&replay_physical_memory);
+    status = iree_allocator_malloc(allocator->host_allocator,
+                                   sizeof(*replay_physical_memory),
+                                   (void**)&replay_physical_memory);
   }
   if (iree_status_is_ok(status)) {
     replay_physical_memory->base_physical_memory = base_physical_memory;
-    replay_physical_memory->host_allocator = host_allocator;
     replay_physical_memory->physical_memory_id = physical_memory_id;
+    replay_physical_memory->next = NULL;
   }
   status = iree_hal_replay_recorder_end_creation_operation(
       &pending_record, status, 1, &operation_iovec,
       IREE_HAL_REPLAY_OBJECT_TYPE_PHYSICAL_MEMORY, physical_memory_id,
       IREE_HAL_REPLAY_PAYLOAD_TYPE_NONE, 0, NULL);
   if (iree_status_is_ok(status)) {
+    iree_slim_mutex_lock(&allocator->virtual_memory_mutex);
+    replay_physical_memory->next = allocator->physical_memory_list;
+    allocator->physical_memory_list = replay_physical_memory;
+    iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
     *out_physical_memory = (iree_hal_physical_memory_t*)replay_physical_memory;
     return iree_ok_status();
   }
@@ -528,7 +573,7 @@ iree_hal_replay_recorder_allocator_physical_memory_allocate(
         status, iree_hal_allocator_physical_memory_free(
                     allocator->base_allocator, base_physical_memory));
   }
-  iree_allocator_free(host_allocator, replay_physical_memory);
+  iree_allocator_free(allocator->host_allocator, replay_physical_memory);
   return status;
 }
 
@@ -537,27 +582,43 @@ static iree_status_t iree_hal_replay_recorder_allocator_physical_memory_free(
     iree_hal_physical_memory_t* IREE_RESTRICT physical_memory) {
   iree_hal_replay_recorder_allocator_t* allocator =
       iree_hal_replay_recorder_allocator_cast(base_allocator);
+  iree_slim_mutex_lock(&allocator->virtual_memory_mutex);
   iree_hal_replay_recorder_physical_memory_t* replay_physical_memory =
-      iree_hal_replay_recorder_physical_memory_cast(physical_memory);
+      iree_hal_replay_recorder_allocator_find_physical_memory_locked(
+          allocator, physical_memory);
+  if (IREE_UNLIKELY(!replay_physical_memory)) {
+    iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "physical memory was not allocated by this replay recorder allocator");
+  }
   const iree_hal_replay_allocator_physical_memory_free_payload_t payload = {
       .physical_memory_id = replay_physical_memory->physical_memory_id,
   };
   const iree_const_byte_span_t iovec =
       iree_make_const_byte_span((const uint8_t*)&payload, sizeof(payload));
   iree_hal_replay_pending_record_t pending_record;
-  IREE_RETURN_IF_ERROR(iree_hal_replay_recorder_allocator_begin_operation(
+  iree_hal_replay_recorder_allocator_begin_passthrough_operation(
       allocator, replay_physical_memory->physical_memory_id,
       IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_PHYSICAL_MEMORY_FREE,
       IREE_HAL_REPLAY_PAYLOAD_TYPE_ALLOCATOR_PHYSICAL_MEMORY_FREE,
-      &pending_record));
+      &pending_record);
   iree_status_t status = iree_hal_allocator_physical_memory_free(
       allocator->base_allocator, replay_physical_memory->base_physical_memory);
-  if (iree_status_is_ok(status)) {
-    iree_allocator_t host_allocator = replay_physical_memory->host_allocator;
-    iree_allocator_free(host_allocator, replay_physical_memory);
+  const bool consumed = iree_status_is_ok(status);
+  if (consumed) {
+    iree_hal_replay_recorder_physical_memory_t** link =
+        &allocator->physical_memory_list;
+    while (*link != replay_physical_memory) link = &(*link)->next;
+    *link = replay_physical_memory->next;
   }
-  return iree_hal_replay_recorder_end_operation_with_payload(&pending_record,
-                                                             status, 1, &iovec);
+  status = iree_hal_replay_recorder_end_passthrough_operation_with_payload(
+      &pending_record, status, 1, &iovec);
+  iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+  if (consumed) {
+    iree_allocator_free(allocator->host_allocator, replay_physical_memory);
+  }
+  return status;
 }
 
 static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_map(
@@ -568,14 +629,24 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_map(
     iree_device_size_t physical_offset, iree_device_size_t size) {
   iree_hal_replay_recorder_allocator_t* allocator =
       iree_hal_replay_recorder_allocator_cast(base_allocator);
+  iree_slim_mutex_lock(&allocator->virtual_memory_mutex);
+  iree_hal_replay_object_id_t virtual_buffer_id =
+      IREE_HAL_REPLAY_OBJECT_ID_NONE;
+  iree_hal_buffer_t* base_buffer = NULL;
+  iree_status_t status = iree_hal_replay_recorder_buffer_resolve_virtual_memory(
+      virtual_buffer, allocator->recorder, allocator->allocator_id,
+      &virtual_buffer_id, &base_buffer);
   iree_hal_replay_recorder_physical_memory_t* replay_physical_memory =
-      iree_hal_replay_recorder_physical_memory_cast(physical_memory);
-  const iree_hal_replay_object_id_t virtual_buffer_id =
-      iree_hal_replay_recorder_buffer_id_or_none(virtual_buffer);
-  if (IREE_UNLIKELY(virtual_buffer_id == IREE_HAL_REPLAY_OBJECT_ID_NONE)) {
-    return iree_make_status(
+      iree_hal_replay_recorder_allocator_find_physical_memory_locked(
+          allocator, physical_memory);
+  if (iree_status_is_ok(status) && !replay_physical_memory) {
+    status = iree_make_status(
         IREE_STATUS_INVALID_ARGUMENT,
-        "virtual memory reservation was not created by this replay recorder");
+        "physical memory was not allocated by this replay recorder allocator");
+  }
+  if (!iree_status_is_ok(status)) {
+    iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+    return status;
   }
   const iree_hal_replay_allocator_virtual_memory_map_payload_t payload = {
       .virtual_buffer_id = virtual_buffer_id,
@@ -587,19 +658,18 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_map(
   const iree_const_byte_span_t iovec =
       iree_make_const_byte_span((const uint8_t*)&payload, sizeof(payload));
   iree_hal_replay_pending_record_t pending_record;
-  IREE_RETURN_IF_ERROR(iree_hal_replay_recorder_allocator_begin_operation(
+  iree_hal_replay_recorder_allocator_begin_passthrough_operation(
       allocator, virtual_buffer_id,
       IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_MAP,
       IREE_HAL_REPLAY_PAYLOAD_TYPE_ALLOCATOR_VIRTUAL_MEMORY_MAP,
-      &pending_record));
-  return iree_hal_replay_recorder_end_operation_with_payload(
-      &pending_record,
-      iree_hal_allocator_virtual_memory_map(
-          allocator->base_allocator,
-          iree_hal_replay_recorder_buffer_base_or_self(virtual_buffer),
-          virtual_offset, replay_physical_memory->base_physical_memory,
-          physical_offset, size),
-      1, &iovec);
+      &pending_record);
+  status = iree_hal_allocator_virtual_memory_map(
+      allocator->base_allocator, base_buffer, virtual_offset,
+      replay_physical_memory->base_physical_memory, physical_offset, size);
+  status = iree_hal_replay_recorder_end_passthrough_operation_with_payload(
+      &pending_record, status, 1, &iovec);
+  iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+  return status;
 }
 
 static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_unmap(
@@ -608,12 +678,16 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_unmap(
     iree_device_size_t virtual_offset, iree_device_size_t size) {
   iree_hal_replay_recorder_allocator_t* allocator =
       iree_hal_replay_recorder_allocator_cast(base_allocator);
-  const iree_hal_replay_object_id_t virtual_buffer_id =
-      iree_hal_replay_recorder_buffer_id_or_none(virtual_buffer);
-  if (IREE_UNLIKELY(virtual_buffer_id == IREE_HAL_REPLAY_OBJECT_ID_NONE)) {
-    return iree_make_status(
-        IREE_STATUS_INVALID_ARGUMENT,
-        "virtual memory reservation was not created by this replay recorder");
+  iree_slim_mutex_lock(&allocator->virtual_memory_mutex);
+  iree_hal_replay_object_id_t virtual_buffer_id =
+      IREE_HAL_REPLAY_OBJECT_ID_NONE;
+  iree_hal_buffer_t* base_buffer = NULL;
+  iree_status_t status = iree_hal_replay_recorder_buffer_resolve_virtual_memory(
+      virtual_buffer, allocator->recorder, allocator->allocator_id,
+      &virtual_buffer_id, &base_buffer);
+  if (!iree_status_is_ok(status)) {
+    iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+    return status;
   }
   const iree_hal_replay_allocator_virtual_memory_unmap_payload_t payload = {
       .virtual_buffer_id = virtual_buffer_id,
@@ -623,18 +697,17 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_unmap(
   const iree_const_byte_span_t iovec =
       iree_make_const_byte_span((const uint8_t*)&payload, sizeof(payload));
   iree_hal_replay_pending_record_t pending_record;
-  IREE_RETURN_IF_ERROR(iree_hal_replay_recorder_allocator_begin_operation(
+  iree_hal_replay_recorder_allocator_begin_passthrough_operation(
       allocator, virtual_buffer_id,
       IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_UNMAP,
       IREE_HAL_REPLAY_PAYLOAD_TYPE_ALLOCATOR_VIRTUAL_MEMORY_UNMAP,
-      &pending_record));
-  return iree_hal_replay_recorder_end_operation_with_payload(
-      &pending_record,
-      iree_hal_allocator_virtual_memory_unmap(
-          allocator->base_allocator,
-          iree_hal_replay_recorder_buffer_base_or_self(virtual_buffer),
-          virtual_offset, size),
-      1, &iovec);
+      &pending_record);
+  status = iree_hal_allocator_virtual_memory_unmap(
+      allocator->base_allocator, base_buffer, virtual_offset, size);
+  status = iree_hal_replay_recorder_end_passthrough_operation_with_payload(
+      &pending_record, status, 1, &iovec);
+  iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+  return status;
 }
 
 static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_protect(
@@ -646,12 +719,16 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_protect(
     iree_hal_memory_protection_t protection) {
   iree_hal_replay_recorder_allocator_t* allocator =
       iree_hal_replay_recorder_allocator_cast(base_allocator);
-  const iree_hal_replay_object_id_t virtual_buffer_id =
-      iree_hal_replay_recorder_buffer_id_or_none(virtual_buffer);
-  if (IREE_UNLIKELY(virtual_buffer_id == IREE_HAL_REPLAY_OBJECT_ID_NONE)) {
-    return iree_make_status(
-        IREE_STATUS_INVALID_ARGUMENT,
-        "virtual memory reservation was not created by this replay recorder");
+  iree_slim_mutex_lock(&allocator->virtual_memory_mutex);
+  iree_hal_replay_object_id_t virtual_buffer_id =
+      IREE_HAL_REPLAY_OBJECT_ID_NONE;
+  iree_hal_buffer_t* base_buffer = NULL;
+  iree_status_t status = iree_hal_replay_recorder_buffer_resolve_virtual_memory(
+      virtual_buffer, allocator->recorder, allocator->allocator_id,
+      &virtual_buffer_id, &base_buffer);
+  if (!iree_status_is_ok(status)) {
+    iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+    return status;
   }
   const iree_hal_replay_allocator_virtual_memory_protect_payload_t payload = {
       .virtual_buffer_id = virtual_buffer_id,
@@ -664,18 +741,18 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_protect(
   const iree_const_byte_span_t iovec =
       iree_make_const_byte_span((const uint8_t*)&payload, sizeof(payload));
   iree_hal_replay_pending_record_t pending_record;
-  IREE_RETURN_IF_ERROR(iree_hal_replay_recorder_allocator_begin_operation(
+  iree_hal_replay_recorder_allocator_begin_passthrough_operation(
       allocator, virtual_buffer_id,
       IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_PROTECT,
       IREE_HAL_REPLAY_PAYLOAD_TYPE_ALLOCATOR_VIRTUAL_MEMORY_PROTECT,
-      &pending_record));
-  return iree_hal_replay_recorder_end_operation_with_payload(
-      &pending_record,
-      iree_hal_allocator_virtual_memory_protect(
-          allocator->base_allocator,
-          iree_hal_replay_recorder_buffer_base_or_self(virtual_buffer),
-          virtual_offset, size, queue_affinity, access_scope, protection),
-      1, &iovec);
+      &pending_record);
+  status = iree_hal_allocator_virtual_memory_protect(
+      allocator->base_allocator, base_buffer, virtual_offset, size,
+      queue_affinity, access_scope, protection);
+  status = iree_hal_replay_recorder_end_passthrough_operation_with_payload(
+      &pending_record, status, 1, &iovec);
+  iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+  return status;
 }
 
 static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_advise(
@@ -685,12 +762,16 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_advise(
     iree_hal_queue_affinity_t queue_affinity, iree_hal_memory_advice_t advice) {
   iree_hal_replay_recorder_allocator_t* allocator =
       iree_hal_replay_recorder_allocator_cast(base_allocator);
-  const iree_hal_replay_object_id_t virtual_buffer_id =
-      iree_hal_replay_recorder_buffer_id_or_none(virtual_buffer);
-  if (IREE_UNLIKELY(virtual_buffer_id == IREE_HAL_REPLAY_OBJECT_ID_NONE)) {
-    return iree_make_status(
-        IREE_STATUS_INVALID_ARGUMENT,
-        "virtual memory reservation was not created by this replay recorder");
+  iree_slim_mutex_lock(&allocator->virtual_memory_mutex);
+  iree_hal_replay_object_id_t virtual_buffer_id =
+      IREE_HAL_REPLAY_OBJECT_ID_NONE;
+  iree_hal_buffer_t* base_buffer = NULL;
+  iree_status_t status = iree_hal_replay_recorder_buffer_resolve_virtual_memory(
+      virtual_buffer, allocator->recorder, allocator->allocator_id,
+      &virtual_buffer_id, &base_buffer);
+  if (!iree_status_is_ok(status)) {
+    iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+    return status;
   }
   const iree_hal_replay_allocator_virtual_memory_advise_payload_t payload = {
       .virtual_buffer_id = virtual_buffer_id,
@@ -702,18 +783,18 @@ static iree_status_t iree_hal_replay_recorder_allocator_virtual_memory_advise(
   const iree_const_byte_span_t iovec =
       iree_make_const_byte_span((const uint8_t*)&payload, sizeof(payload));
   iree_hal_replay_pending_record_t pending_record;
-  IREE_RETURN_IF_ERROR(iree_hal_replay_recorder_allocator_begin_operation(
+  iree_hal_replay_recorder_allocator_begin_passthrough_operation(
       allocator, virtual_buffer_id,
       IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_ADVISE,
       IREE_HAL_REPLAY_PAYLOAD_TYPE_ALLOCATOR_VIRTUAL_MEMORY_ADVISE,
-      &pending_record));
-  return iree_hal_replay_recorder_end_operation_with_payload(
-      &pending_record,
-      iree_hal_allocator_virtual_memory_advise(
-          allocator->base_allocator,
-          iree_hal_replay_recorder_buffer_base_or_self(virtual_buffer),
-          virtual_offset, size, queue_affinity, advice),
-      1, &iovec);
+      &pending_record);
+  status = iree_hal_allocator_virtual_memory_advise(
+      allocator->base_allocator, base_buffer, virtual_offset, size,
+      queue_affinity, advice);
+  status = iree_hal_replay_recorder_end_passthrough_operation_with_payload(
+      &pending_record, status, 1, &iovec);
+  iree_slim_mutex_unlock(&allocator->virtual_memory_mutex);
+  return status;
 }
 
 iree_status_t iree_hal_replay_recorder_wrap_allocator(
@@ -729,6 +810,7 @@ iree_status_t iree_hal_replay_recorder_wrap_allocator(
   IREE_RETURN_IF_ERROR(iree_allocator_malloc(host_allocator, sizeof(*allocator),
                                              (void**)&allocator));
   memset(allocator, 0, sizeof(*allocator));
+  iree_slim_mutex_initialize(&allocator->virtual_memory_mutex);
   iree_hal_resource_initialize(&iree_hal_replay_recorder_allocator_vtable,
                                &allocator->resource);
   allocator->host_allocator = host_allocator;
@@ -746,6 +828,7 @@ iree_status_t iree_hal_replay_recorder_wrap_allocator(
   if (iree_status_is_ok(status)) {
     *out_allocator = (iree_hal_allocator_t*)allocator;
   } else {
+    iree_slim_mutex_deinitialize(&allocator->virtual_memory_mutex);
     iree_hal_allocator_release(allocator->base_allocator);
     iree_hal_replay_recorder_release(allocator->recorder);
     iree_allocator_free(host_allocator, allocator);

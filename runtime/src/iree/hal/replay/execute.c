@@ -96,6 +96,20 @@ typedef struct iree_hal_replay_plan_queue_execute_t {
   const iree_hal_replay_buffer_ref_payload_t* binding_payloads;
 } iree_hal_replay_plan_queue_execute_t;
 
+// Static dependency information for one queue submission. This is used to
+// prove that replay can safely wait at a mid-stream VMM synchronization point
+// before any backend operation is issued.
+typedef struct iree_hal_replay_plan_queue_dependency_t {
+  bool is_submission;
+  bool may_wait_on_device_memory;
+  iree_hal_replay_object_id_t command_buffer_id;
+  iree_host_size_t wait_semaphore_count;
+  const iree_hal_replay_semaphore_timepoint_payload_t* wait_semaphore_payloads;
+  iree_host_size_t signal_semaphore_count;
+  const iree_hal_replay_semaphore_timepoint_payload_t*
+      signal_semaphore_payloads;
+} iree_hal_replay_plan_queue_dependency_t;
+
 typedef struct iree_hal_replay_plan_record_t {
   // Parsed replay record borrowed from the original replay file.
   iree_hal_replay_file_record_t file_record;
@@ -313,6 +327,466 @@ static iree_status_t iree_hal_replay_plan_prepare_queue_execute(
   out_execute->binding_payloads =
       (const iree_hal_replay_buffer_ref_payload_t*)cursor;
   return iree_ok_status();
+}
+
+static iree_status_t iree_hal_replay_plan_prepare_queue_dependency_lists(
+    const iree_hal_replay_file_record_t* record,
+    iree_hal_replay_payload_type_t payload_type, iree_host_size_t header_length,
+    uint64_t wait_semaphore_count, uint64_t signal_semaphore_count,
+    uint64_t trailing_payload_length,
+    iree_hal_replay_plan_queue_dependency_t* out_dependency) {
+  IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+      record, payload_type, header_length));
+  if (IREE_UNLIKELY(wait_semaphore_count > IREE_HOST_SIZE_MAX ||
+                    signal_semaphore_count > IREE_HOST_SIZE_MAX ||
+                    trailing_payload_length > IREE_HOST_SIZE_MAX)) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "replay queue dependency length exceeds host size");
+  }
+  const iree_host_size_t wait_count = (iree_host_size_t)wait_semaphore_count;
+  const iree_host_size_t signal_count =
+      (iree_host_size_t)signal_semaphore_count;
+  iree_host_size_t wait_size = 0;
+  iree_host_size_t signal_size = 0;
+  iree_host_size_t expected_length = 0;
+  if (IREE_UNLIKELY(
+          !iree_host_size_checked_mul(
+              wait_count, sizeof(iree_hal_replay_semaphore_timepoint_payload_t),
+              &wait_size) ||
+          !iree_host_size_checked_mul(
+              signal_count,
+              sizeof(iree_hal_replay_semaphore_timepoint_payload_t),
+              &signal_size) ||
+          !iree_host_size_checked_add(header_length, wait_size,
+                                      &expected_length) ||
+          !iree_host_size_checked_add(expected_length, signal_size,
+                                      &expected_length) ||
+          !iree_host_size_checked_add(expected_length,
+                                      (iree_host_size_t)trailing_payload_length,
+                                      &expected_length) ||
+          expected_length != record->payload.data_length)) {
+    return iree_make_status(IREE_STATUS_DATA_LOSS,
+                            "replay queue dependency payload length mismatch");
+  }
+  const uint8_t* cursor = record->payload.data + header_length;
+  out_dependency->is_submission = true;
+  out_dependency->wait_semaphore_count = wait_count;
+  out_dependency->wait_semaphore_payloads =
+      (const iree_hal_replay_semaphore_timepoint_payload_t*)cursor;
+  cursor += wait_size;
+  out_dependency->signal_semaphore_count = signal_count;
+  out_dependency->signal_semaphore_payloads =
+      (const iree_hal_replay_semaphore_timepoint_payload_t*)cursor;
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_replay_plan_prepare_queue_dependency(
+    const iree_hal_replay_file_record_t* record,
+    iree_hal_replay_plan_queue_dependency_t* out_dependency) {
+  memset(out_dependency, 0, sizeof(*out_dependency));
+  if (record->header.record_type !=
+          IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION ||
+      record->header.status_code != IREE_STATUS_OK) {
+    return iree_ok_status();
+  }
+  switch (record->header.operation_code) {
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_ALLOCA: {
+      iree_hal_replay_device_queue_alloca_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ALLOCA,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ALLOCA,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, /*trailing_payload_length=*/0,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_DEALLOCA: {
+      iree_hal_replay_device_queue_dealloca_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_DEALLOCA,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_DEALLOCA,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, /*trailing_payload_length=*/0,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_FILL: {
+      iree_hal_replay_device_queue_fill_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_FILL,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_FILL,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, payload.pattern_length,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_UPDATE: {
+      iree_hal_replay_device_queue_update_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_UPDATE,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_UPDATE,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, payload.data_length, out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_COPY: {
+      iree_hal_replay_device_queue_copy_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_COPY,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_COPY,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, /*trailing_payload_length=*/0,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_READ: {
+      iree_hal_replay_device_queue_read_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_READ,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_READ,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, payload.captured_data_length,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_WRITE: {
+      iree_hal_replay_device_queue_write_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_WRITE,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_WRITE,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, /*trailing_payload_length=*/0,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_ATOMIC_WAIT: {
+      iree_hal_replay_device_queue_atomic_wait_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_WAIT,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      out_dependency->may_wait_on_device_memory = true;
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_WAIT,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, /*trailing_payload_length=*/0,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_ATOMIC_STORE: {
+      iree_hal_replay_device_queue_atomic_store_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_STORE,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_STORE,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, /*trailing_payload_length=*/0,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_ATOMIC_RMW: {
+      iree_hal_replay_device_queue_atomic_rmw_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_RMW,
+          sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      return iree_hal_replay_plan_prepare_queue_dependency_lists(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_RMW,
+          sizeof(payload), payload.wait_semaphore_count,
+          payload.signal_semaphore_count, /*trailing_payload_length=*/0,
+          out_dependency);
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_DISPATCH: {
+      iree_hal_replay_dispatch_payload_t payload;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_require_payload(
+          record, IREE_HAL_REPLAY_PAYLOAD_TYPE_DISPATCH, sizeof(payload)));
+      memcpy(&payload, record->payload.data, sizeof(payload));
+      iree_host_size_t wait_offset = 0;
+      iree_host_size_t wait_size = 0;
+      iree_host_size_t signal_offset = 0;
+      iree_host_size_t signal_size = 0;
+      iree_host_size_t constants_offset = 0;
+      iree_host_size_t binding_offset = 0;
+      iree_host_size_t binding_size = 0;
+      IREE_RETURN_IF_ERROR(iree_hal_replay_executor_dispatch_layout(
+          record, &payload, &wait_offset, &wait_size, &signal_offset,
+          &signal_size, &constants_offset, &binding_offset, &binding_size));
+      (void)wait_size;
+      (void)signal_size;
+      (void)constants_offset;
+      (void)binding_offset;
+      (void)binding_size;
+      out_dependency->is_submission = true;
+      out_dependency->wait_semaphore_count =
+          (iree_host_size_t)payload.wait_semaphore_count;
+      out_dependency->wait_semaphore_payloads =
+          (const iree_hal_replay_semaphore_timepoint_payload_t*)(record->payload
+                                                                     .data +
+                                                                 wait_offset);
+      out_dependency->signal_semaphore_count =
+          (iree_host_size_t)payload.signal_semaphore_count;
+      out_dependency->signal_semaphore_payloads =
+          (const iree_hal_replay_semaphore_timepoint_payload_t*)(record->payload
+                                                                     .data +
+                                                                 signal_offset);
+      return iree_ok_status();
+    }
+    case IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_EXECUTE: {
+      iree_hal_replay_plan_queue_execute_t execute;
+      memset(&execute, 0, sizeof(execute));
+      IREE_RETURN_IF_ERROR(
+          iree_hal_replay_plan_prepare_queue_execute(record, &execute));
+      out_dependency->is_submission = true;
+      out_dependency->command_buffer_id = execute.command_buffer_id;
+      out_dependency->wait_semaphore_count = execute.wait_semaphore_count;
+      out_dependency->wait_semaphore_payloads = execute.wait_semaphore_payloads;
+      out_dependency->signal_semaphore_count = execute.signal_semaphore_count;
+      out_dependency->signal_semaphore_payloads =
+          execute.signal_semaphore_payloads;
+      return iree_ok_status();
+    }
+    default:
+      return iree_ok_status();
+  }
+}
+
+typedef struct iree_hal_replay_plan_semaphore_state_t {
+  bool is_defined;
+  uint64_t known_value;
+} iree_hal_replay_plan_semaphore_state_t;
+
+static bool iree_hal_replay_plan_queue_dependency_can_complete(
+    const iree_hal_replay_plan_queue_dependency_t* dependency,
+    const iree_hal_replay_plan_semaphore_state_t* semaphore_states,
+    iree_host_size_t object_capacity,
+    const bool* command_buffer_may_wait_on_device_memory) {
+  if (dependency->may_wait_on_device_memory) return false;
+  if (dependency->command_buffer_id != IREE_HAL_REPLAY_OBJECT_ID_NONE &&
+      command_buffer_may_wait_on_device_memory[dependency->command_buffer_id]) {
+    return false;
+  }
+  for (iree_host_size_t i = 0; i < dependency->wait_semaphore_count; ++i) {
+    const iree_hal_replay_semaphore_timepoint_payload_t wait =
+        dependency->wait_semaphore_payloads[i];
+    IREE_ASSERT(wait.semaphore_id < object_capacity);
+    if (semaphore_states[wait.semaphore_id].known_value < wait.value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void iree_hal_replay_plan_publish_queue_signals(
+    const iree_hal_replay_plan_queue_dependency_t* dependency,
+    iree_hal_replay_plan_semaphore_state_t* semaphore_states) {
+  for (iree_host_size_t i = 0; i < dependency->signal_semaphore_count; ++i) {
+    const iree_hal_replay_semaphore_timepoint_payload_t signal =
+        dependency->signal_semaphore_payloads[i];
+    if (semaphore_states[signal.semaphore_id].known_value < signal.value) {
+      semaphore_states[signal.semaphore_id].known_value = signal.value;
+    }
+  }
+}
+
+static bool iree_hal_replay_plan_is_completion_boundary(
+    const iree_hal_replay_file_record_t* record) {
+  if (record->header.record_type !=
+          IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION ||
+      record->header.status_code != IREE_STATUS_OK) {
+    return false;
+  }
+  switch (record->header.operation_code) {
+    case IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_UNMAP:
+    case IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_PROTECT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static iree_status_t iree_hal_replay_plan_verify_completion_dependencies(
+    const iree_hal_replay_plan_t* plan, iree_allocator_t host_allocator) {
+  iree_hal_replay_plan_semaphore_state_t* semaphore_states = NULL;
+  bool* command_buffer_may_wait_on_device_memory = NULL;
+  iree_hal_replay_plan_queue_dependency_t* pending_dependencies = NULL;
+  iree_status_t status = iree_ok_status();
+  if (plan->object_capacity != 0) {
+    iree_host_size_t semaphore_states_size = 0;
+    iree_host_size_t command_buffer_flags_size = 0;
+    if (IREE_UNLIKELY(!iree_host_size_checked_mul(plan->object_capacity,
+                                                  sizeof(*semaphore_states),
+                                                  &semaphore_states_size) ||
+                      !iree_host_size_checked_mul(
+                          plan->object_capacity,
+                          sizeof(*command_buffer_may_wait_on_device_memory),
+                          &command_buffer_flags_size))) {
+      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                              "replay dependency table size overflow");
+    }
+    status = iree_allocator_malloc(host_allocator, semaphore_states_size,
+                                   (void**)&semaphore_states);
+    if (iree_status_is_ok(status)) {
+      status = iree_allocator_malloc(
+          host_allocator, command_buffer_flags_size,
+          (void**)&command_buffer_may_wait_on_device_memory);
+    }
+    if (!iree_status_is_ok(status)) {
+      iree_allocator_free(host_allocator, semaphore_states);
+      return status;
+    }
+    memset(semaphore_states, 0, semaphore_states_size);
+    memset(command_buffer_may_wait_on_device_memory, 0,
+           command_buffer_flags_size);
+  }
+  if (plan->record_count != 0) {
+    iree_host_size_t pending_dependencies_size = 0;
+    if (IREE_UNLIKELY(!iree_host_size_checked_mul(
+            plan->record_count, sizeof(*pending_dependencies),
+            &pending_dependencies_size))) {
+      status = iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                                "replay pending dependency table overflow");
+    } else {
+      status = iree_allocator_malloc(host_allocator, pending_dependencies_size,
+                                     (void**)&pending_dependencies);
+    }
+    if (!iree_status_is_ok(status)) {
+      iree_allocator_free(host_allocator,
+                          command_buffer_may_wait_on_device_memory);
+      iree_allocator_free(host_allocator, semaphore_states);
+      return status;
+    }
+  }
+
+  iree_host_size_t pending_dependency_count = 0;
+  for (iree_host_size_t i = 0;
+       i < plan->record_count && iree_status_is_ok(status); ++i) {
+    const iree_hal_replay_file_record_t* record = &plan->records[i].file_record;
+    if (record->header.record_type ==
+            IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION &&
+        record->header.status_code == IREE_STATUS_OK) {
+      if (record->header.operation_code ==
+          IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_CREATE_SEMAPHORE) {
+        if (record->payload.data_length >=
+                sizeof(iree_hal_replay_semaphore_object_payload_t) &&
+            record->header.related_object_id < plan->object_capacity) {
+          iree_hal_replay_semaphore_object_payload_t payload;
+          memcpy(&payload, record->payload.data, sizeof(payload));
+          iree_hal_replay_plan_semaphore_state_t* semaphore_state =
+              &semaphore_states[record->header.related_object_id];
+          semaphore_state->is_defined = true;
+          semaphore_state->known_value = payload.initial_value;
+        }
+      } else if (
+          record->header.operation_code ==
+              IREE_HAL_REPLAY_OPERATION_CODE_COMMAND_BUFFER_ATOMIC_WAIT &&
+          record->header.object_id < plan->object_capacity) {
+        command_buffer_may_wait_on_device_memory[record->header.object_id] =
+            true;
+      }
+    }
+
+    iree_hal_replay_plan_queue_dependency_t dependency;
+    status = iree_hal_replay_plan_prepare_queue_dependency(record, &dependency);
+    if (!iree_status_is_ok(status)) break;
+    if (dependency.is_submission) {
+      if (dependency.command_buffer_id != IREE_HAL_REPLAY_OBJECT_ID_NONE &&
+          dependency.command_buffer_id >= plan->object_capacity) {
+        status = iree_make_status(IREE_STATUS_DATA_LOSS,
+                                  "replay queue command buffer id is invalid");
+      }
+      for (iree_host_size_t j = 0;
+           j < dependency.wait_semaphore_count && iree_status_is_ok(status);
+           ++j) {
+        const iree_hal_replay_object_id_t semaphore_id =
+            dependency.wait_semaphore_payloads[j].semaphore_id;
+        if (semaphore_id >= plan->object_capacity ||
+            !semaphore_states[semaphore_id].is_defined) {
+          status =
+              iree_make_status(IREE_STATUS_DATA_LOSS,
+                               "replay queue wait semaphore id is not defined");
+        }
+      }
+      for (iree_host_size_t j = 0;
+           j < dependency.signal_semaphore_count && iree_status_is_ok(status);
+           ++j) {
+        const iree_hal_replay_object_id_t semaphore_id =
+            dependency.signal_semaphore_payloads[j].semaphore_id;
+        if (semaphore_id >= plan->object_capacity ||
+            !semaphore_states[semaphore_id].is_defined) {
+          status = iree_make_status(
+              IREE_STATUS_DATA_LOSS,
+              "replay queue signal semaphore id is not defined");
+        }
+      }
+      if (!iree_status_is_ok(status)) break;
+
+      const bool can_complete =
+          iree_hal_replay_plan_queue_dependency_can_complete(
+              &dependency, semaphore_states, plan->object_capacity,
+              command_buffer_may_wait_on_device_memory);
+      if (can_complete) {
+        iree_hal_replay_plan_publish_queue_signals(&dependency,
+                                                   semaphore_states);
+      } else if (dependency.signal_semaphore_count != 0) {
+        status = iree_make_status(
+            IREE_STATUS_FAILED_PRECONDITION,
+            "replay signaled queue operation at sequence %" PRIu64
+            " has an unresolved forward or device-memory dependency",
+            record->header.sequence_ordinal);
+        break;
+      } else {
+        pending_dependencies[pending_dependency_count++] = dependency;
+      }
+
+      iree_host_size_t retained_dependency_count = 0;
+      for (iree_host_size_t j = 0; j < pending_dependency_count; ++j) {
+        if (!iree_hal_replay_plan_queue_dependency_can_complete(
+                &pending_dependencies[j], semaphore_states,
+                plan->object_capacity,
+                command_buffer_may_wait_on_device_memory)) {
+          pending_dependencies[retained_dependency_count++] =
+              pending_dependencies[j];
+        }
+      }
+      pending_dependency_count = retained_dependency_count;
+    }
+
+    if (iree_hal_replay_plan_is_completion_boundary(record)) {
+      if (pending_dependency_count != 0) {
+        status = iree_make_status(
+            IREE_STATUS_FAILED_PRECONDITION,
+            "replay completion synchronization at sequence %" PRIu64
+            " follows queue work with unresolved forward or device-memory "
+            "dependencies",
+            record->header.sequence_ordinal);
+      }
+    }
+  }
+  if (iree_status_is_ok(status) && pending_dependency_count != 0) {
+    status = iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "replay end-of-file follows queue work with unresolved forward or "
+        "device-memory dependencies");
+  }
+
+  iree_allocator_free(host_allocator, command_buffer_may_wait_on_device_memory);
+  iree_allocator_free(host_allocator, pending_dependencies);
+  iree_allocator_free(host_allocator, semaphore_states);
+  return status;
 }
 
 static iree_status_t iree_hal_replay_plan_prepare_record(
@@ -612,7 +1086,8 @@ static iree_status_t iree_hal_replay_plan_execute_queue_execute(
           (const uint8_t*)queue_execute->wait_semaphore_payloads,
           queue_execute->wait_semaphore_count *
               sizeof(*queue_execute->wait_semaphore_payloads)),
-      queue_execute->wait_semaphore_count, &wait_storage));
+      queue_execute->wait_semaphore_count, /*additional_capacity=*/0,
+      &wait_storage));
   iree_hal_replay_semaphore_list_storage_t signal_storage;
   iree_status_t status = iree_hal_replay_executor_make_semaphore_list(
       executor,
@@ -620,7 +1095,8 @@ static iree_status_t iree_hal_replay_plan_execute_queue_execute(
           (const uint8_t*)queue_execute->signal_semaphore_payloads,
           queue_execute->signal_semaphore_count *
               sizeof(*queue_execute->signal_semaphore_payloads)),
-      queue_execute->signal_semaphore_count, &signal_storage);
+      queue_execute->signal_semaphore_count, /*additional_capacity=*/1,
+      &signal_storage);
 
   iree_hal_replay_buffer_binding_table_storage_t binding_storage = {0};
   if (iree_status_is_ok(status)) {
@@ -654,6 +1130,12 @@ static iree_status_t iree_hal_replay_plan_execute_queue_execute(
         executor, queue_execute->command_buffer_id,
         IREE_HAL_REPLAY_OBJECT_TYPE_COMMAND_BUFFER, &command_buffer_entry);
   }
+  iree_hal_replay_queue_completion_t* completion = NULL;
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_replay_executor_prepare_queue_completion(
+        executor, device_entry->value.device, queue_execute->queue_affinity,
+        &signal_storage, &completion);
+  }
   if (iree_status_is_ok(status)) {
     if (command_buffer_entry) {
       status = iree_hal_device_queue_execute(
@@ -671,15 +1153,8 @@ static iree_status_t iree_hal_replay_plan_execute_queue_execute(
           "replay queue barrier payload unexpectedly has bindings");
     }
   }
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_device_queue_flush(device_entry->value.device,
-                                         queue_execute->queue_affinity);
-  }
-  if (iree_status_is_ok(status) && signal_storage.list.count != 0) {
-    status = iree_hal_semaphore_list_wait(signal_storage.list,
-                                          iree_infinite_timeout(),
-                                          IREE_ASYNC_WAIT_FLAG_NONE);
-  }
+  status = iree_hal_replay_executor_finalize_queue_completion(
+      executor, completion, status);
 
   iree_hal_replay_buffer_binding_table_storage_deinitialize(
       &binding_storage, executor->host_allocator);
@@ -747,6 +1222,9 @@ IREE_API_EXPORT iree_status_t iree_hal_replay_plan_execute(
         "replay execute file path remaps require a remap list");
   }
 
+  IREE_RETURN_IF_ERROR(iree_hal_replay_plan_verify_completion_dependencies(
+      plan, host_allocator));
+
   iree_hal_replay_executor_t executor;
   IREE_RETURN_IF_ERROR(iree_hal_replay_executor_initialize(
       &executor, plan->file_contents, plan->object_capacity, device_group,
@@ -766,6 +1244,14 @@ IREE_API_EXPORT iree_status_t iree_hal_replay_plan_execute(
         " device(s) but the target device group contains %" PRIhsz " device(s)",
         executor.next_device_index,
         iree_hal_device_group_device_count(executor.device_group));
+  }
+
+  if (!iree_status_is_ok(status) && executor.queue_completion_count != 0) {
+    // Some accepted queue work may depend on records that were not submitted
+    // after the execution error. Waiting could block forever, while releasing
+    // replay objects could race that work. Retain the executor-owned state for
+    // process-lifetime safety; a recoverable cleanup API can be added later.
+    return status;
   }
 
   return iree_status_join(status,

@@ -25,14 +25,22 @@ typedef struct VmmAllocatorState {
   iree_host_size_t reserve_count = 0;
   // Number of successful reservation release calls received by this allocator.
   iree_host_size_t release_count = 0;
+  // Number of reservation release calls attempted on this allocator.
+  iree_host_size_t release_attempt_count = 0;
   // Number of successful physical allocation calls received by this allocator.
   iree_host_size_t physical_allocate_count = 0;
   // Number of successful physical free calls received by this allocator.
   iree_host_size_t physical_free_count = 0;
+  // Number of physical free calls attempted on this allocator.
+  iree_host_size_t physical_free_attempt_count = 0;
   // Number of successful mapping calls received by this allocator.
   iree_host_size_t map_count = 0;
   // Number of successful unmapping calls received by this allocator.
   iree_host_size_t unmap_count = 0;
+  // Number of unmapping calls attempted on this allocator.
+  iree_host_size_t unmap_attempt_count = 0;
+  // Whether unmapping should fail without changing live state.
+  bool fail_unmap = false;
   // Number of successful protection calls received by this allocator.
   iree_host_size_t protect_count = 0;
   // Number of successful advice calls received by this allocator.
@@ -158,6 +166,7 @@ static iree_status_t vmm_test_allocator_virtual_memory_release(
     iree_hal_allocator_t* base_allocator, iree_hal_buffer_t* virtual_buffer) {
   VmmTestAllocator* allocator = vmm_test_allocator_cast(base_allocator);
   VmmAllocatorState* state = allocator->state;
+  ++state->release_attempt_count;
   if (virtual_buffer != state->virtual_buffer) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "test reservation handle mismatch");
@@ -201,6 +210,7 @@ static iree_status_t vmm_test_allocator_physical_memory_free(
     iree_hal_physical_memory_t* physical_memory) {
   VmmTestAllocator* allocator = vmm_test_allocator_cast(base_allocator);
   VmmAllocatorState* state = allocator->state;
+  ++state->physical_free_attempt_count;
   if (physical_memory != state->physical_memory) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "test physical memory handle mismatch");
@@ -243,6 +253,11 @@ static iree_status_t vmm_test_allocator_virtual_memory_unmap(
     iree_device_size_t virtual_offset, iree_device_size_t size) {
   VmmTestAllocator* allocator = vmm_test_allocator_cast(base_allocator);
   VmmAllocatorState* state = allocator->state;
+  ++state->unmap_attempt_count;
+  if (state->fail_unmap) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "injected unmap failure");
+  }
   if (virtual_buffer != state->virtual_buffer || !state->is_mapped ||
       virtual_offset != state->map_virtual_offset || size != state->map_size) {
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
@@ -426,6 +441,30 @@ static void TruncateCapturedFileAfterOperation(
   FAIL() << "captured replay operation was not found";
 }
 
+static iree_host_size_t FindCapturedOperationOffset(
+    const std::vector<uint8_t>& storage,
+    iree_hal_replay_operation_code_t operation_code) {
+  iree_hal_replay_file_header_t file_header;
+  iree_host_size_t record_offset = 0;
+  IREE_CHECK_OK(iree_hal_replay_file_parse_header(
+      iree_make_const_byte_span(storage.data(), storage.size()), &file_header,
+      &record_offset));
+  const iree_const_byte_span_t file_contents = iree_make_const_byte_span(
+      storage.data(), static_cast<iree_host_size_t>(file_header.file_length));
+  while (record_offset < file_contents.data_length) {
+    const iree_host_size_t current_record_offset = record_offset;
+    iree_hal_replay_file_record_t record;
+    IREE_CHECK_OK(iree_hal_replay_file_parse_record(
+        file_contents, record_offset, &record, &record_offset));
+    if (record.header.record_type ==
+            IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION &&
+        record.header.operation_code == operation_code) {
+      return current_record_offset;
+    }
+  }
+  return 0;
+}
+
 TEST(ReplayVmmTest, PreservesCompleteVirtualMemoryLifecycle) {
   constexpr iree_hal_queue_affinity_t kQueueAffinity = 1;
   constexpr iree_device_size_t kReservationSize = 16384;
@@ -601,6 +640,374 @@ TEST(ReplayVmmTest, CleansUpLiveMappingsAtEndOfReplay) {
   EXPECT_EQ(replay_state.virtual_buffer, nullptr);
   EXPECT_EQ(replay_state.physical_memory, nullptr);
   EXPECT_FALSE(replay_state.is_mapped);
+}
+constexpr iree_hal_queue_affinity_t kTestQueueAffinity = 1;
+constexpr iree_device_size_t kTestReservationSize = 16384;
+constexpr iree_device_size_t kTestVirtualOffset = 4096;
+constexpr iree_device_size_t kTestPhysicalOffset = 8192;
+constexpr iree_device_size_t kTestMappingSize = 4096;
+const iree_hal_buffer_params_t kTestPhysicalParams = {
+    /*.usage=*/IREE_HAL_BUFFER_USAGE_STORAGE,
+    /*.access=*/IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE,
+    /*.type=*/IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+    /*.queue_affinity=*/kTestQueueAffinity,
+    /*.min_alignment=*/4096,
+};
+
+static void ReserveAndAllocateTestMemory(
+    iree_hal_allocator_t* allocator, iree_hal_buffer_t** out_virtual_buffer,
+    iree_hal_physical_memory_t** out_physical_memory) {
+  IREE_CHECK_OK(iree_hal_allocator_virtual_memory_reserve(
+      allocator, kTestQueueAffinity, kTestReservationSize, out_virtual_buffer));
+  IREE_CHECK_OK(iree_hal_allocator_physical_memory_allocate(
+      allocator, kTestPhysicalParams, kTestReservationSize,
+      iree_allocator_system(), out_physical_memory));
+}
+
+static void MapProtectAndAdviseTestMemory(
+    iree_hal_allocator_t* allocator, iree_hal_buffer_t* virtual_buffer,
+    iree_hal_physical_memory_t* physical_memory) {
+  IREE_CHECK_OK(iree_hal_allocator_virtual_memory_map(
+      allocator, virtual_buffer, kTestVirtualOffset, physical_memory,
+      kTestPhysicalOffset, kTestMappingSize));
+  IREE_CHECK_OK(iree_hal_allocator_virtual_memory_protect(
+      allocator, virtual_buffer, kTestVirtualOffset, kTestMappingSize,
+      kTestQueueAffinity, IREE_HAL_VIRTUAL_MEMORY_ACCESS_SCOPE_DEVICE,
+      IREE_HAL_MEMORY_PROTECTION_READ_WRITE));
+  IREE_CHECK_OK(iree_hal_allocator_virtual_memory_advise(
+      allocator, virtual_buffer, kTestVirtualOffset, kTestMappingSize,
+      kTestQueueAffinity, IREE_HAL_MEMORY_ADVICE_WILL_NEED));
+}
+
+static std::vector<uint8_t> CaptureCompleteTestLifecycle() {
+  std::vector<uint8_t> storage(65536, 0);
+  iree_hal_replay_recorder_t* recorder = CreateHostAllocationRecorder(&storage);
+  VmmAllocatorState state;
+  iree_hal_device_group_t* source_group = CreateVmmTestDeviceGroup(&state);
+  iree_hal_device_group_t* wrapped_group = nullptr;
+  IREE_CHECK_OK(iree_hal_replay_wrap_device_group(
+      recorder, source_group, iree_allocator_system(), &wrapped_group));
+
+  iree_hal_allocator_t* allocator = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(wrapped_group, 0));
+  iree_hal_buffer_t* virtual_buffer = nullptr;
+  iree_hal_physical_memory_t* physical_memory = nullptr;
+  ReserveAndAllocateTestMemory(allocator, &virtual_buffer, &physical_memory);
+  MapProtectAndAdviseTestMemory(allocator, virtual_buffer, physical_memory);
+  IREE_CHECK_OK(iree_hal_allocator_virtual_memory_unmap(
+      allocator, virtual_buffer, kTestVirtualOffset, kTestMappingSize));
+  IREE_CHECK_OK(
+      iree_hal_allocator_physical_memory_free(allocator, physical_memory));
+  IREE_CHECK_OK(
+      iree_hal_allocator_virtual_memory_release(allocator, virtual_buffer));
+  IREE_CHECK_OK(iree_hal_replay_recorder_close(recorder));
+
+  iree_hal_device_group_release(wrapped_group);
+  iree_hal_device_group_release(source_group);
+  iree_hal_replay_recorder_release(recorder);
+  return storage;
+}
+
+TEST(ReplayVmmTest, AppendFailureDoesNotChangePhysicalFreeResult) {
+  const std::vector<uint8_t> complete_storage = CaptureCompleteTestLifecycle();
+  const iree_host_size_t free_offset = FindCapturedOperationOffset(
+      complete_storage,
+      IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_PHYSICAL_MEMORY_FREE);
+  ASSERT_NE(free_offset, 0u);
+  std::vector<uint8_t> storage(free_offset, 0);
+
+  iree_hal_replay_recorder_t* recorder = CreateHostAllocationRecorder(&storage);
+  VmmAllocatorState state;
+  iree_hal_device_group_t* source_group = CreateVmmTestDeviceGroup(&state);
+  iree_hal_device_group_t* wrapped_group = nullptr;
+  IREE_ASSERT_OK(iree_hal_replay_wrap_device_group(
+      recorder, source_group, iree_allocator_system(), &wrapped_group));
+  iree_hal_allocator_t* allocator = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(wrapped_group, 0));
+
+  iree_hal_buffer_t* virtual_buffer = nullptr;
+  iree_hal_physical_memory_t* physical_memory = nullptr;
+  ReserveAndAllocateTestMemory(allocator, &virtual_buffer, &physical_memory);
+  MapProtectAndAdviseTestMemory(allocator, virtual_buffer, physical_memory);
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_unmap(
+      allocator, virtual_buffer, kTestVirtualOffset, kTestMappingSize));
+
+  IREE_ASSERT_OK(
+      iree_hal_allocator_physical_memory_free(allocator, physical_memory));
+  physical_memory = nullptr;
+  EXPECT_EQ(state.physical_free_count, 1u);
+  EXPECT_EQ(state.physical_memory, nullptr);
+
+  IREE_ASSERT_OK(
+      iree_hal_allocator_virtual_memory_release(allocator, virtual_buffer));
+  virtual_buffer = nullptr;
+  EXPECT_EQ(state.release_count, 1u);
+  EXPECT_EQ(state.virtual_buffer, nullptr);
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_OUT_OF_RANGE,
+                        iree_hal_replay_recorder_close(recorder));
+
+  iree_hal_device_group_release(wrapped_group);
+  iree_hal_device_group_release(source_group);
+  iree_hal_replay_recorder_release(recorder);
+}
+
+TEST(ReplayVmmTest, AppendFailureDoesNotChangeVirtualReleaseResult) {
+  const std::vector<uint8_t> complete_storage = CaptureCompleteTestLifecycle();
+  const iree_host_size_t release_offset = FindCapturedOperationOffset(
+      complete_storage,
+      IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_RELEASE);
+  ASSERT_NE(release_offset, 0u);
+  std::vector<uint8_t> storage(release_offset, 0);
+
+  iree_hal_replay_recorder_t* recorder = CreateHostAllocationRecorder(&storage);
+  VmmAllocatorState state;
+  iree_hal_device_group_t* source_group = CreateVmmTestDeviceGroup(&state);
+  iree_hal_device_group_t* wrapped_group = nullptr;
+  IREE_ASSERT_OK(iree_hal_replay_wrap_device_group(
+      recorder, source_group, iree_allocator_system(), &wrapped_group));
+  iree_hal_allocator_t* allocator = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(wrapped_group, 0));
+
+  iree_hal_buffer_t* virtual_buffer = nullptr;
+  iree_hal_physical_memory_t* physical_memory = nullptr;
+  ReserveAndAllocateTestMemory(allocator, &virtual_buffer, &physical_memory);
+  MapProtectAndAdviseTestMemory(allocator, virtual_buffer, physical_memory);
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_unmap(
+      allocator, virtual_buffer, kTestVirtualOffset, kTestMappingSize));
+  IREE_ASSERT_OK(
+      iree_hal_allocator_physical_memory_free(allocator, physical_memory));
+  physical_memory = nullptr;
+
+  IREE_ASSERT_OK(
+      iree_hal_allocator_virtual_memory_release(allocator, virtual_buffer));
+  virtual_buffer = nullptr;
+  EXPECT_EQ(state.release_count, 1u);
+  EXPECT_EQ(state.virtual_buffer, nullptr);
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_OUT_OF_RANGE,
+                        iree_hal_replay_recorder_close(recorder));
+
+  iree_hal_device_group_release(wrapped_group);
+  iree_hal_device_group_release(source_group);
+  iree_hal_replay_recorder_release(recorder);
+}
+
+TEST(ReplayVmmTest, TerminalRecorderFailureDoesNotBlockMappedVmmTeardown) {
+  const std::vector<uint8_t> complete_storage = CaptureCompleteTestLifecycle();
+  const iree_host_size_t map_offset = FindCapturedOperationOffset(
+      complete_storage,
+      IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_MAP);
+  ASSERT_NE(map_offset, 0u);
+  std::vector<uint8_t> storage(map_offset, 0);
+
+  iree_hal_replay_recorder_t* recorder = CreateHostAllocationRecorder(&storage);
+  VmmAllocatorState state;
+  iree_hal_device_group_t* source_group = CreateVmmTestDeviceGroup(&state);
+  iree_hal_device_group_t* wrapped_group = nullptr;
+  IREE_ASSERT_OK(iree_hal_replay_wrap_device_group(
+      recorder, source_group, iree_allocator_system(), &wrapped_group));
+  iree_hal_allocator_t* allocator = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(wrapped_group, 0));
+
+  iree_hal_buffer_t* virtual_buffer = nullptr;
+  iree_hal_physical_memory_t* physical_memory = nullptr;
+  ReserveAndAllocateTestMemory(allocator, &virtual_buffer, &physical_memory);
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_map(
+      allocator, virtual_buffer, kTestVirtualOffset, physical_memory,
+      kTestPhysicalOffset, kTestMappingSize));
+  EXPECT_TRUE(state.is_mapped);
+
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_unmap(
+      allocator, virtual_buffer, kTestVirtualOffset, kTestMappingSize));
+  IREE_ASSERT_OK(
+      iree_hal_allocator_physical_memory_free(allocator, physical_memory));
+  physical_memory = nullptr;
+  IREE_ASSERT_OK(
+      iree_hal_allocator_virtual_memory_release(allocator, virtual_buffer));
+  virtual_buffer = nullptr;
+  EXPECT_FALSE(state.is_mapped);
+  EXPECT_EQ(state.unmap_count, 1u);
+  EXPECT_EQ(state.physical_free_count, 1u);
+  EXPECT_EQ(state.release_count, 1u);
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_OUT_OF_RANGE,
+                        iree_hal_replay_recorder_close(recorder));
+
+  iree_hal_device_group_release(wrapped_group);
+  iree_hal_device_group_release(source_group);
+  iree_hal_replay_recorder_release(recorder);
+}
+
+TEST(ReplayVmmTest, RejectsForeignRecorderVmmHandles) {
+  std::vector<uint8_t> storage_a(65536, 0);
+  std::vector<uint8_t> storage_b(65536, 0);
+  iree_hal_replay_recorder_t* recorder_a =
+      CreateHostAllocationRecorder(&storage_a);
+  iree_hal_replay_recorder_t* recorder_b =
+      CreateHostAllocationRecorder(&storage_b);
+  VmmAllocatorState state;
+  iree_hal_device_group_t* source_group = CreateVmmTestDeviceGroup(&state);
+  iree_hal_device_group_t* wrapped_group_a = nullptr;
+  iree_hal_device_group_t* wrapped_group_b = nullptr;
+  IREE_ASSERT_OK(iree_hal_replay_wrap_device_group(
+      recorder_a, source_group, iree_allocator_system(), &wrapped_group_a));
+  IREE_ASSERT_OK(iree_hal_replay_wrap_device_group(
+      recorder_b, source_group, iree_allocator_system(), &wrapped_group_b));
+  iree_hal_allocator_t* allocator_a = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(wrapped_group_a, 0));
+  iree_hal_allocator_t* allocator_b = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(wrapped_group_b, 0));
+
+  iree_hal_buffer_t* virtual_buffer = nullptr;
+  iree_hal_physical_memory_t* physical_memory = nullptr;
+  ReserveAndAllocateTestMemory(allocator_a, &virtual_buffer, &physical_memory);
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_map(
+      allocator_a, virtual_buffer, kTestVirtualOffset, physical_memory,
+      kTestPhysicalOffset, kTestMappingSize));
+
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_INVALID_ARGUMENT,
+      iree_hal_allocator_virtual_memory_protect(
+          allocator_b, virtual_buffer, kTestVirtualOffset, kTestMappingSize,
+          kTestQueueAffinity, IREE_HAL_VIRTUAL_MEMORY_ACCESS_SCOPE_DEVICE,
+          IREE_HAL_MEMORY_PROTECTION_READ_WRITE));
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_INVALID_ARGUMENT,
+      iree_hal_allocator_virtual_memory_advise(
+          allocator_b, virtual_buffer, kTestVirtualOffset, kTestMappingSize,
+          kTestQueueAffinity, IREE_HAL_MEMORY_ADVICE_WILL_NEED));
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_INVALID_ARGUMENT,
+      iree_hal_allocator_virtual_memory_unmap(
+          allocator_b, virtual_buffer, kTestVirtualOffset, kTestMappingSize));
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_INVALID_ARGUMENT,
+      iree_hal_allocator_physical_memory_free(allocator_b, physical_memory));
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_INVALID_ARGUMENT,
+      iree_hal_allocator_virtual_memory_release(allocator_b, virtual_buffer));
+  EXPECT_EQ(state.protect_count, 0u);
+  EXPECT_EQ(state.advise_count, 0u);
+  EXPECT_EQ(state.unmap_attempt_count, 0u);
+  EXPECT_EQ(state.physical_free_attempt_count, 0u);
+  EXPECT_EQ(state.release_attempt_count, 0u);
+
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_unmap(
+      allocator_a, virtual_buffer, kTestVirtualOffset, kTestMappingSize));
+  IREE_ASSERT_OK(
+      iree_hal_allocator_physical_memory_free(allocator_a, physical_memory));
+  IREE_ASSERT_OK(
+      iree_hal_allocator_virtual_memory_release(allocator_a, virtual_buffer));
+  IREE_ASSERT_OK(iree_hal_replay_recorder_close(recorder_a));
+  IREE_ASSERT_OK(iree_hal_replay_recorder_close(recorder_b));
+
+  iree_hal_device_group_release(wrapped_group_b);
+  iree_hal_device_group_release(wrapped_group_a);
+  iree_hal_device_group_release(source_group);
+  iree_hal_replay_recorder_release(recorder_b);
+  iree_hal_replay_recorder_release(recorder_a);
+
+  VmmAllocatorState replay_state;
+  iree_hal_device_group_t* replay_group =
+      CreateVmmTestDeviceGroup(&replay_state);
+  const iree_hal_replay_execute_options_t options =
+      iree_hal_replay_execute_options_default();
+  IREE_ASSERT_OK(iree_hal_replay_execute_file(
+      GetCapturedFileContents(storage_b), replay_group, &options,
+      iree_allocator_system()));
+  iree_hal_device_group_release(replay_group);
+  EXPECT_EQ(replay_state.reserve_count, 0u);
+  EXPECT_EQ(replay_state.physical_allocate_count, 0u);
+  EXPECT_EQ(replay_state.map_count, 0u);
+}
+
+TEST(ReplayVmmTest, RejectsRawVmmHandlesBeforeDereference) {
+  std::vector<uint8_t> storage(65536, 0);
+  iree_hal_replay_recorder_t* recorder = CreateHostAllocationRecorder(&storage);
+  VmmAllocatorState state;
+  iree_hal_device_group_t* source_group = CreateVmmTestDeviceGroup(&state);
+  iree_hal_device_group_t* wrapped_group = nullptr;
+  IREE_ASSERT_OK(iree_hal_replay_wrap_device_group(
+      recorder, source_group, iree_allocator_system(), &wrapped_group));
+  iree_hal_allocator_t* source_allocator = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(source_group, 0));
+  iree_hal_allocator_t* wrapped_allocator = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(wrapped_group, 0));
+
+  iree_hal_buffer_t* raw_virtual_buffer = nullptr;
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_reserve(
+      source_allocator, kTestQueueAffinity, kTestReservationSize,
+      &raw_virtual_buffer));
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_INVALID_ARGUMENT,
+                        iree_hal_allocator_virtual_memory_release(
+                            wrapped_allocator, raw_virtual_buffer));
+  EXPECT_EQ(state.release_attempt_count, 0u);
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_release(source_allocator,
+                                                           raw_virtual_buffer));
+
+  iree_hal_buffer_t* virtual_buffer = nullptr;
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_reserve(
+      wrapped_allocator, kTestQueueAffinity, kTestReservationSize,
+      &virtual_buffer));
+  iree_hal_physical_memory_t* raw_physical_memory = nullptr;
+  IREE_ASSERT_OK(iree_hal_allocator_physical_memory_allocate(
+      source_allocator, kTestPhysicalParams, kTestReservationSize,
+      iree_allocator_system(), &raw_physical_memory));
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_INVALID_ARGUMENT,
+      iree_hal_allocator_virtual_memory_map(
+          wrapped_allocator, virtual_buffer, kTestVirtualOffset,
+          raw_physical_memory, kTestPhysicalOffset, kTestMappingSize));
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_INVALID_ARGUMENT,
+                        iree_hal_allocator_physical_memory_free(
+                            wrapped_allocator, raw_physical_memory));
+  EXPECT_EQ(state.map_count, 0u);
+  EXPECT_EQ(state.physical_free_attempt_count, 0u);
+
+  IREE_ASSERT_OK(iree_hal_allocator_physical_memory_free(source_allocator,
+                                                         raw_physical_memory));
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_release(wrapped_allocator,
+                                                           virtual_buffer));
+  IREE_ASSERT_OK(iree_hal_replay_recorder_close(recorder));
+
+  iree_hal_device_group_release(wrapped_group);
+  iree_hal_device_group_release(source_group);
+  iree_hal_replay_recorder_release(recorder);
+}
+
+TEST(ReplayVmmTest, FailedCleanupUnmapSkipsDependentDestruction) {
+  std::vector<uint8_t> storage = CaptureCompleteTestLifecycle();
+  TruncateCapturedFileAfterOperation(
+      &storage, IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_MAP);
+
+  VmmAllocatorState replay_state;
+  replay_state.fail_unmap = true;
+  iree_hal_device_group_t* replay_group =
+      CreateVmmTestDeviceGroup(&replay_state);
+  const iree_hal_replay_execute_options_t options =
+      iree_hal_replay_execute_options_default();
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_RESOURCE_EXHAUSTED,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            &options, iree_allocator_system()));
+
+  EXPECT_EQ(replay_state.unmap_attempt_count, 1u);
+  EXPECT_EQ(replay_state.unmap_count, 0u);
+  EXPECT_EQ(replay_state.physical_free_attempt_count, 0u);
+  EXPECT_EQ(replay_state.release_attempt_count, 0u);
+  ASSERT_TRUE(replay_state.is_mapped);
+  ASSERT_NE(replay_state.virtual_buffer, nullptr);
+  ASSERT_NE(replay_state.physical_memory, nullptr);
+
+  replay_state.fail_unmap = false;
+  iree_hal_allocator_t* replay_allocator = iree_hal_device_allocator(
+      iree_hal_device_group_device_at(replay_group, 0));
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_unmap(
+      replay_allocator, replay_state.virtual_buffer, kTestVirtualOffset,
+      kTestMappingSize));
+  IREE_ASSERT_OK(iree_hal_allocator_physical_memory_free(
+      replay_allocator, replay_state.physical_memory));
+  IREE_ASSERT_OK(iree_hal_allocator_virtual_memory_release(
+      replay_allocator, replay_state.virtual_buffer));
+  iree_hal_device_group_release(replay_group);
 }
 
 }  // namespace

@@ -18,6 +18,7 @@
 #include "iree/async/util/proactor_pool.h"
 #include "iree/hal/drivers/task/registration/driver_module.h"
 #include "iree/hal/replay/file_reader.h"
+#include "iree/hal/replay/file_writer.h"
 #include "iree/hal/replay/recorder.h"
 #include "iree/hal/testing/mock_device.h"
 #include "iree/io/file_contents.h"
@@ -128,6 +129,340 @@ static iree_const_byte_span_t GetCapturedFileContents(
                                    (iree_host_size_t)file_header.file_length);
 }
 
+static void AppendReplayRecord(
+    iree_hal_replay_file_writer_t* writer,
+    const iree_hal_replay_file_record_metadata_t& metadata,
+    std::initializer_list<iree_const_byte_span_t> payload_iovecs) {
+  IREE_CHECK_OK(iree_hal_replay_file_writer_append_record(
+      writer, &metadata, payload_iovecs.size(), payload_iovecs.begin(),
+      /*out_payload_range=*/nullptr));
+}
+
+static void AppendQueueBarrierRecord(iree_hal_replay_file_writer_t* writer,
+                                     uint64_t sequence_ordinal, bool is_wait) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kSemaphoreId = 2;
+  const iree_hal_replay_device_queue_execute_payload_t payload = {
+      /*.command_buffer_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.queue_affinity=*/1,
+      /*.flags=*/IREE_HAL_EXECUTE_FLAG_NONE,
+      /*.wait_semaphore_count=*/is_wait ? 1u : 0u,
+      /*.signal_semaphore_count=*/is_wait ? 0u : 1u,
+      /*.binding_count=*/0,
+  };
+  const iree_hal_replay_semaphore_timepoint_payload_t timepoint = {
+      /*.semaphore_id=*/kSemaphoreId,
+      /*.value=*/1,
+  };
+  const iree_hal_replay_file_record_metadata_t metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal,
+      /*.thread_id=*/0,
+      /*.device_id=*/kDeviceId,
+      /*.object_id=*/kDeviceId,
+      /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/
+      IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_EXECUTE,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/
+      IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_EXECUTE,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(
+      writer, metadata,
+      {iree_make_const_byte_span(&payload, sizeof(payload)),
+       iree_make_const_byte_span(&timepoint, sizeof(timepoint))});
+}
+
+static void AppendQueueAtomicWaitRecord(iree_hal_replay_file_writer_t* writer,
+                                        uint64_t sequence_ordinal) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  iree_hal_replay_device_queue_atomic_wait_payload_t payload = {};
+  payload.target_ref.buffer_id = IREE_HAL_REPLAY_OBJECT_ID_NONE;
+  payload.target_ref.length = 4;
+  payload.queue_affinity = 1;
+  payload.params.value = 1;
+  payload.params.width = IREE_HAL_ATOMIC_WIDTH_32;
+  payload.params.condition = IREE_HAL_ATOMIC_WAIT_CONDITION_EQUAL;
+  const iree_hal_replay_file_record_metadata_t metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal,
+      /*.thread_id=*/0,
+      /*.device_id=*/kDeviceId,
+      /*.object_id=*/kDeviceId,
+      /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ATOMIC_WAIT,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/
+      IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_ATOMIC_WAIT,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(writer, metadata,
+                     {iree_make_const_byte_span(&payload, sizeof(payload))});
+}
+
+static std::vector<uint8_t> MakeVmmDependencyReplay(
+    bool signal_before_wait, bool include_vmm_boundary = true,
+    bool signal_after_wait = true, bool atomic_wait = false) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kSemaphoreId = 2;
+  constexpr iree_hal_replay_object_id_t kAllocatorId = 3;
+  constexpr iree_hal_replay_object_id_t kVirtualBufferId = 4;
+  std::vector<uint8_t> storage(32768, 0);
+  iree_io_file_handle_t* file_handle = nullptr;
+  IREE_CHECK_OK(iree_io_file_handle_wrap_host_allocation(
+      IREE_IO_FILE_ACCESS_READ | IREE_IO_FILE_ACCESS_WRITE,
+      iree_make_byte_span(storage.data(), storage.size()),
+      iree_io_file_handle_release_callback_null(), iree_allocator_system(),
+      &file_handle));
+  iree_hal_replay_file_writer_t* writer = nullptr;
+  IREE_CHECK_OK(iree_hal_replay_file_writer_allocate(
+      file_handle, iree_allocator_system(), &writer));
+  iree_io_file_handle_release(file_handle);
+
+  uint64_t sequence_ordinal = 0;
+  const iree_hal_replay_scope_payload_t scope_payload = {
+      /*.name_length=*/7,
+      /*.flags=*/IREE_HAL_REPLAY_SCOPE_FLAG_NONE,
+  };
+  const iree_hal_replay_file_record_metadata_t scope_metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal++,
+      /*.thread_id=*/0,
+      /*.device_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_REPLAY_SCOPE,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/IREE_HAL_REPLAY_OPERATION_CODE_REPLAY_SCOPE_BEGIN,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(
+      writer, scope_metadata,
+      {iree_make_const_byte_span(&scope_payload, sizeof(scope_payload)),
+       iree_make_const_byte_span("started", 7)});
+
+  const iree_hal_replay_file_record_metadata_t device_metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal++,
+      /*.thread_id=*/0,
+      /*.device_id=*/kDeviceId,
+      /*.object_id=*/kDeviceId,
+      /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OBJECT,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_NONE,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_DEVICE,
+      /*.operation_code=*/IREE_HAL_REPLAY_OPERATION_CODE_NONE,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(writer, device_metadata, {});
+
+  const iree_hal_replay_semaphore_object_payload_t semaphore_payload = {
+      /*.queue_affinity=*/1,
+      /*.initial_value=*/0,
+      /*.flags=*/IREE_HAL_SEMAPHORE_FLAG_DEFAULT,
+  };
+  const iree_hal_replay_file_record_metadata_t semaphore_metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal++,
+      /*.thread_id=*/0,
+      /*.device_id=*/kDeviceId,
+      /*.object_id=*/kDeviceId,
+      /*.related_object_id=*/kSemaphoreId,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_SEMAPHORE_OBJECT,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/
+      IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_CREATE_SEMAPHORE,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(writer, semaphore_metadata,
+                     {iree_make_const_byte_span(&semaphore_payload,
+                                                sizeof(semaphore_payload))});
+
+  if (signal_before_wait) {
+    AppendQueueBarrierRecord(writer, sequence_ordinal++, /*is_wait=*/false);
+  }
+  if (atomic_wait) {
+    AppendQueueAtomicWaitRecord(writer, sequence_ordinal++);
+  } else {
+    AppendQueueBarrierRecord(writer, sequence_ordinal++, /*is_wait=*/true);
+  }
+
+  if (include_vmm_boundary) {
+    const iree_hal_replay_allocator_virtual_memory_protect_payload_t
+        protect_payload = {
+            /*.virtual_buffer_id=*/kVirtualBufferId,
+            /*.virtual_offset=*/0,
+            /*.size=*/4096,
+            /*.queue_affinity=*/1,
+            /*.access_scope=*/IREE_HAL_VIRTUAL_MEMORY_ACCESS_SCOPE_DEVICE,
+            /*.reserved0=*/0,
+            /*.protection=*/IREE_HAL_MEMORY_PROTECTION_READ,
+        };
+    const iree_hal_replay_file_record_metadata_t protect_metadata = {
+        /*.sequence_ordinal=*/sequence_ordinal++,
+        /*.thread_id=*/0,
+        /*.device_id=*/kDeviceId,
+        /*.object_id=*/kAllocatorId,
+        /*.related_object_id=*/kVirtualBufferId,
+        /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+        /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+        /*.payload_type=*/
+        IREE_HAL_REPLAY_PAYLOAD_TYPE_ALLOCATOR_VIRTUAL_MEMORY_PROTECT,
+        /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+        /*.operation_code=*/
+        IREE_HAL_REPLAY_OPERATION_CODE_ALLOCATOR_VIRTUAL_MEMORY_PROTECT,
+        /*.status_code=*/IREE_STATUS_OK,
+    };
+    AppendReplayRecord(
+        writer, protect_metadata,
+        {iree_make_const_byte_span(&protect_payload, sizeof(protect_payload))});
+  }
+
+  if (!signal_before_wait && signal_after_wait && !atomic_wait) {
+    AppendQueueBarrierRecord(writer, sequence_ordinal++, /*is_wait=*/false);
+  }
+  IREE_CHECK_OK(iree_hal_replay_file_writer_close(writer));
+  iree_hal_replay_file_writer_free(writer);
+  return storage;
+}
+
+static std::vector<uint8_t> MakeDispatchThenHostDataReplay(
+    bool command_buffer_dispatch) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kCommandBufferId = 2;
+  constexpr iree_hal_replay_object_id_t kBufferId = 3;
+  constexpr iree_hal_replay_object_id_t kExecutableId = 4;
+  std::vector<uint8_t> storage(32768, 0);
+  iree_io_file_handle_t* file_handle = nullptr;
+  IREE_CHECK_OK(iree_io_file_handle_wrap_host_allocation(
+      IREE_IO_FILE_ACCESS_READ | IREE_IO_FILE_ACCESS_WRITE,
+      iree_make_byte_span(storage.data(), storage.size()),
+      iree_io_file_handle_release_callback_null(), iree_allocator_system(),
+      &file_handle));
+  iree_hal_replay_file_writer_t* writer = nullptr;
+  IREE_CHECK_OK(iree_hal_replay_file_writer_allocate(
+      file_handle, iree_allocator_system(), &writer));
+  iree_io_file_handle_release(file_handle);
+
+  uint64_t sequence_ordinal = 0;
+  const iree_hal_replay_scope_payload_t scope_payload = {
+      /*.name_length=*/7,
+      /*.flags=*/IREE_HAL_REPLAY_SCOPE_FLAG_NONE,
+  };
+  const iree_hal_replay_file_record_metadata_t scope_metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal++,
+      /*.thread_id=*/0,
+      /*.device_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_REPLAY_SCOPE,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/IREE_HAL_REPLAY_OPERATION_CODE_REPLAY_SCOPE_BEGIN,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(
+      writer, scope_metadata,
+      {iree_make_const_byte_span(&scope_payload, sizeof(scope_payload)),
+       iree_make_const_byte_span("started", 7)});
+
+  iree_hal_replay_dispatch_payload_t dispatch_payload = {};
+  dispatch_payload.executable_id = kExecutableId;
+  dispatch_payload.queue_affinity = command_buffer_dispatch ? 0 : 1;
+  dispatch_payload.workgroup_size[0] = 1;
+  dispatch_payload.workgroup_size[1] = 1;
+  dispatch_payload.workgroup_size[2] = 1;
+  dispatch_payload.workgroup_count[0] = 1;
+  dispatch_payload.workgroup_count[1] = 1;
+  dispatch_payload.workgroup_count[2] = 1;
+  const iree_hal_replay_file_record_metadata_t dispatch_metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal++,
+      /*.thread_id=*/0,
+      /*.device_id=*/kDeviceId,
+      /*.object_id=*/command_buffer_dispatch ? kCommandBufferId : kDeviceId,
+      /*.related_object_id=*/kExecutableId,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_DISPATCH,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/
+      command_buffer_dispatch
+          ? IREE_HAL_REPLAY_OPERATION_CODE_COMMAND_BUFFER_DISPATCH
+          : IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_DISPATCH,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(
+      writer, dispatch_metadata,
+      {iree_make_const_byte_span(&dispatch_payload, sizeof(dispatch_payload))});
+
+  if (command_buffer_dispatch) {
+    const iree_hal_replay_device_queue_execute_payload_t execute_payload = {
+        /*.command_buffer_id=*/kCommandBufferId,
+        /*.queue_affinity=*/1,
+        /*.flags=*/IREE_HAL_EXECUTE_FLAG_NONE,
+        /*.wait_semaphore_count=*/0,
+        /*.signal_semaphore_count=*/0,
+        /*.binding_count=*/0,
+    };
+    const iree_hal_replay_file_record_metadata_t execute_metadata = {
+        /*.sequence_ordinal=*/sequence_ordinal++,
+        /*.thread_id=*/0,
+        /*.device_id=*/kDeviceId,
+        /*.object_id=*/kDeviceId,
+        /*.related_object_id=*/kCommandBufferId,
+        /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+        /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+        /*.payload_type=*/
+        IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_EXECUTE,
+        /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+        /*.operation_code=*/
+        IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_EXECUTE,
+        /*.status_code=*/IREE_STATUS_OK,
+    };
+    AppendReplayRecord(
+        writer, execute_metadata,
+        {iree_make_const_byte_span(&execute_payload, sizeof(execute_payload))});
+  }
+
+  constexpr uint32_t kData = 0xA5A5A5A5u;
+  const iree_hal_replay_buffer_range_data_payload_t data_payload = {
+      /*.byte_offset=*/0,
+      /*.byte_length=*/sizeof(kData),
+      /*.data_length=*/sizeof(kData),
+      /*.mapping_mode=*/0,
+      /*.memory_access=*/IREE_HAL_MEMORY_ACCESS_WRITE,
+      /*.reserved0=*/0,
+      /*.reserved1=*/0,
+  };
+  const iree_hal_replay_file_record_metadata_t data_metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal++,
+      /*.thread_id=*/0,
+      /*.device_id=*/kDeviceId,
+      /*.object_id=*/kBufferId,
+      /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_BUFFER_RANGE_DATA,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/IREE_HAL_REPLAY_OPERATION_CODE_BUFFER_FLUSH_RANGE,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(
+      writer, data_metadata,
+      {iree_make_const_byte_span(&data_payload, sizeof(data_payload)),
+       iree_make_const_byte_span(&kData, sizeof(kData))});
+
+  IREE_CHECK_OK(iree_hal_replay_file_writer_close(writer));
+  iree_hal_replay_file_writer_free(writer);
+  return storage;
+}
+
 static iree_status_t NoopHostCall(void* user_data, const uint64_t args[4],
                                   iree_hal_host_call_context_t* context) {
   (void)user_data;
@@ -160,6 +495,138 @@ static iree_status_t RecordReplayScopeEvent(
   text.append(event->name.data, event->name.size);
   state->events->push_back(text);
   return iree_ok_status();
+}
+
+TEST(ReplayExecuteTest, RejectsForwardQueueDependencyBeforeVmmBoundary) {
+  std::vector<uint8_t> storage =
+      MakeVmmDependencyReplay(/*signal_before_wait=*/false);
+  std::vector<std::string> events;
+  ReplayScopeCallbackState callback_state = {
+      /*.events=*/&events,
+  };
+  iree_hal_replay_execute_options_t options =
+      iree_hal_replay_execute_options_default();
+  options.scope_event_callback.fn = RecordReplayScopeEvent;
+  options.scope_event_callback.user_data = &callback_state;
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            &options, iree_allocator_system()));
+
+  iree_hal_device_group_release(replay_group);
+  EXPECT_TRUE(events.empty());
+}
+
+TEST(ReplayExecuteTest, AllowsSatisfiedQueueDependencyBeforeVmmBoundary) {
+  std::vector<uint8_t> storage =
+      MakeVmmDependencyReplay(/*signal_before_wait=*/true);
+  std::vector<std::string> events;
+  ReplayScopeCallbackState callback_state = {
+      /*.events=*/&events,
+  };
+  iree_hal_replay_execute_options_t options =
+      iree_hal_replay_execute_options_default();
+  options.scope_event_callback.fn = RecordReplayScopeEvent;
+  options.scope_event_callback.user_data = &callback_state;
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+
+  // The dependency preflight passes and execution reaches the intentionally
+  // undefined allocator used as the terminal VMM boundary fixture.
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            &options, iree_allocator_system()));
+
+  iree_hal_device_group_release(replay_group);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0], "begin:started");
+}
+TEST(ReplayExecuteTest, AllowsForwardQueueDependencyAtEndOfFile) {
+  std::vector<uint8_t> storage = MakeVmmDependencyReplay(
+      /*signal_before_wait=*/false, /*include_vmm_boundary=*/false);
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+
+  IREE_EXPECT_OK(iree_hal_replay_execute_file(GetCapturedFileContents(storage),
+                                              replay_group, nullptr,
+                                              iree_allocator_system()));
+
+  iree_hal_device_group_release(replay_group);
+}
+
+TEST(ReplayExecuteTest, RejectsUnresolvedQueueDependencyAtEndOfFile) {
+  std::vector<uint8_t> storage = MakeVmmDependencyReplay(
+      /*signal_before_wait=*/false, /*include_vmm_boundary=*/false,
+      /*signal_after_wait=*/false);
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            nullptr, iree_allocator_system()));
+
+  iree_hal_device_group_release(replay_group);
+}
+
+TEST(ReplayExecuteTest, RejectsDeviceMemoryWaitAtEndOfFile) {
+  std::vector<uint8_t> storage = MakeVmmDependencyReplay(
+      /*signal_before_wait=*/false, /*include_vmm_boundary=*/false,
+      /*signal_after_wait=*/false, /*atomic_wait=*/true);
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            nullptr, iree_allocator_system()));
+
+  iree_hal_device_group_release(replay_group);
+}
+
+TEST(ReplayExecuteTest, AllowsDirectDispatchBeforeCapturedHostData) {
+  std::vector<uint8_t> storage =
+      MakeDispatchThenHostDataReplay(/*command_buffer_dispatch=*/false);
+  std::vector<std::string> events;
+  ReplayScopeCallbackState callback_state = {
+      /*.events=*/&events,
+  };
+  iree_hal_replay_execute_options_t options =
+      iree_hal_replay_execute_options_default();
+  options.scope_event_callback.fn = RecordReplayScopeEvent;
+  options.scope_event_callback.user_data = &callback_state;
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            &options, iree_allocator_system()));
+
+  iree_hal_device_group_release(replay_group);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0], "begin:started");
+}
+
+TEST(ReplayExecuteTest, AllowsCommandBufferDispatchBeforeCapturedHostData) {
+  std::vector<uint8_t> storage =
+      MakeDispatchThenHostDataReplay(/*command_buffer_dispatch=*/true);
+  std::vector<std::string> events;
+  ReplayScopeCallbackState callback_state = {
+      /*.events=*/&events,
+  };
+  iree_hal_replay_execute_options_t options =
+      iree_hal_replay_execute_options_default();
+  options.scope_event_callback.fn = RecordReplayScopeEvent;
+  options.scope_event_callback.user_data = &callback_state;
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            &options, iree_allocator_system()));
+
+  iree_hal_device_group_release(replay_group);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0], "begin:started");
 }
 
 typedef struct MockExecutableFunctionRecord {
@@ -844,6 +1311,80 @@ TEST(ReplayExecuteTest, ExecutesRecordedMappedBufferWrite) {
       iree_hal_replay_execute_options_default();
   IREE_EXPECT_OK(iree_hal_replay_execute_file(GetCapturedFileContents(storage),
                                               replay_group, &options,
+                                              iree_allocator_system()));
+  iree_hal_device_group_release(replay_group);
+  iree_hal_replay_recorder_release(recorder);
+}
+
+TEST(ReplayExecuteTest, ExecutesForwardQueueDependencyAcrossCapturedHostData) {
+  std::vector<uint8_t> storage(32768, 0);
+  iree_hal_replay_recorder_t* recorder = CreateHostAllocationRecorder(&storage);
+
+  iree_hal_device_group_t* source_group = CreateTaskDeviceGroup();
+  iree_hal_device_group_t* wrapped_group = nullptr;
+  IREE_ASSERT_OK(iree_hal_replay_wrap_device_group(
+      recorder, source_group, iree_allocator_system(), &wrapped_group));
+
+  iree_hal_device_t* wrapped_device =
+      iree_hal_device_group_device_at(wrapped_group, 0);
+  iree_hal_allocator_t* allocator = iree_hal_device_allocator(wrapped_device);
+  ASSERT_NE(nullptr, allocator);
+
+  iree_hal_buffer_params_t params = {0};
+  params.type = IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+  params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+  params.usage = IREE_HAL_BUFFER_USAGE_MAPPING;
+  iree_hal_buffer_t* buffer = nullptr;
+  IREE_ASSERT_OK(
+      iree_hal_allocator_allocate_buffer(allocator, params, 16, &buffer));
+
+  iree_hal_semaphore_t* semaphore = nullptr;
+  IREE_ASSERT_OK(iree_hal_semaphore_create(
+      wrapped_device, IREE_HAL_QUEUE_AFFINITY_ANY, /*initial_value=*/0,
+      IREE_HAL_SEMAPHORE_FLAG_DEFAULT, &semaphore));
+  iree_hal_semaphore_t* semaphores[] = {semaphore};
+  uint64_t value = 1;
+  const iree_hal_semaphore_list_t semaphore_list = {IREE_ARRAYSIZE(semaphores),
+                                                    semaphores, &value};
+
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      wrapped_device, IREE_HAL_QUEUE_AFFINITY_ANY, semaphore_list,
+      iree_hal_semaphore_list_empty(), /*command_buffer=*/nullptr,
+      iree_hal_buffer_binding_table_empty(), IREE_HAL_EXECUTE_FLAG_NONE));
+
+  iree_hal_buffer_mapping_t mapping;
+  IREE_ASSERT_OK(iree_hal_buffer_map_range(buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+                                           IREE_HAL_MEMORY_ACCESS_DISCARD_WRITE,
+                                           0, 16, &mapping));
+  iree_byte_span_t span;
+  IREE_ASSERT_OK(iree_hal_buffer_mapping_subspan(
+      &mapping, IREE_HAL_MEMORY_ACCESS_WRITE, 0, 16, &span));
+  const uint8_t contents[16] = {
+      0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+      0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+  };
+  std::memcpy(span.data, contents, sizeof(contents));
+  IREE_ASSERT_OK(iree_hal_buffer_unmap_range(&mapping));
+
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      wrapped_device, IREE_HAL_QUEUE_AFFINITY_ANY,
+      iree_hal_semaphore_list_empty(), semaphore_list,
+      /*command_buffer=*/nullptr, iree_hal_buffer_binding_table_empty(),
+      IREE_HAL_EXECUTE_FLAG_NONE));
+  IREE_ASSERT_OK(
+      iree_hal_device_queue_flush(wrapped_device, IREE_HAL_QUEUE_AFFINITY_ANY));
+  IREE_ASSERT_OK(iree_hal_semaphore_list_wait(
+      semaphore_list, iree_infinite_timeout(), IREE_ASYNC_WAIT_FLAG_NONE));
+
+  iree_hal_semaphore_release(semaphore);
+  iree_hal_buffer_release(buffer);
+  IREE_ASSERT_OK(iree_hal_replay_recorder_close(recorder));
+  iree_hal_device_group_release(wrapped_group);
+  iree_hal_device_group_release(source_group);
+
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+  IREE_EXPECT_OK(iree_hal_replay_execute_file(GetCapturedFileContents(storage),
+                                              replay_group, nullptr,
                                               iree_allocator_system()));
   iree_hal_device_group_release(replay_group);
   iree_hal_replay_recorder_release(recorder);

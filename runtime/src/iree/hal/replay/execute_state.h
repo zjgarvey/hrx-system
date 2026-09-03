@@ -75,6 +75,18 @@ typedef struct iree_hal_replay_virtual_memory_mapping_t {
   iree_device_size_t size;
 } iree_hal_replay_virtual_memory_mapping_t;
 
+// Executor-owned completion signal attached to one accepted queue operation.
+typedef struct iree_hal_replay_queue_completion_t {
+  // Retained device that accepted the queue operation.
+  iree_hal_device_t* device;
+  // Affinity used for the accepted queue operation.
+  iree_hal_queue_affinity_t queue_affinity;
+  // Retained semaphore signaled by the accepted queue operation.
+  iree_hal_semaphore_t* semaphore;
+  // True when the capture exposed operation completion via a signal.
+  bool wait_immediately;
+} iree_hal_replay_queue_completion_t;
+
 // Mutable state owned by one prepared-plan execution.
 typedef struct iree_hal_replay_executor_t {
   // Original replay file bytes.
@@ -95,6 +107,14 @@ typedef struct iree_hal_replay_executor_t {
   iree_host_size_t virtual_memory_mapping_count;
   // Allocated entry capacity of |virtual_memory_mappings|.
   iree_host_size_t virtual_memory_mapping_capacity;
+  // Completion timelines for queues that received replay submissions.
+  iree_hal_replay_queue_completion_t* queue_completions;
+  // Number of entries in |queue_completions|.
+  iree_host_size_t queue_completion_count;
+  // Allocated entry capacity of |queue_completions|.
+  iree_host_size_t queue_completion_capacity;
+  // True after all submitted queue completion values have been reached.
+  bool queue_completions_drained;
   // Next caller-provided device consumed by a device object record.
   iree_host_size_t next_device_index;
 } iree_hal_replay_executor_t;
@@ -243,7 +263,7 @@ void iree_hal_replay_semaphore_list_storage_deinitialize(
 
 iree_status_t iree_hal_replay_executor_make_semaphore_list(
     iree_hal_replay_executor_t* executor, iree_const_byte_span_t payloads,
-    iree_host_size_t count,
+    iree_host_size_t count, iree_host_size_t additional_capacity,
     iree_hal_replay_semaphore_list_storage_t* out_storage);
 
 iree_status_t iree_hal_replay_executor_make_queue_semaphore_lists(
@@ -271,9 +291,25 @@ iree_status_t iree_hal_replay_buffer_binding_table_storage_initialize(
     iree_hal_replay_executor_t* executor, iree_host_size_t count,
     iree_hal_replay_buffer_binding_table_storage_t* out_storage);
 
-iree_status_t iree_hal_replay_executor_flush_and_wait(
-    iree_hal_device_t* device, iree_hal_queue_affinity_t queue_affinity,
-    const iree_hal_semaphore_list_t signal_list);
+// Appends a fresh replay-private completion signal to a queue submission.
+// Must be called before the backend can accept the submission.
+iree_status_t iree_hal_replay_executor_prepare_queue_completion(
+    iree_hal_replay_executor_t* executor, iree_hal_device_t* device,
+    iree_hal_queue_affinity_t queue_affinity,
+    iree_hal_replay_semaphore_list_storage_t* signal_storage,
+    iree_hal_replay_queue_completion_t** out_completion);
+
+// Consumes |operation_status|, committing and flushing an accepted submission
+// or releasing its unused private completion after rejection.
+iree_status_t iree_hal_replay_executor_finalize_queue_completion(
+    iree_hal_replay_executor_t* executor,
+    iree_hal_replay_queue_completion_t* completion,
+    iree_status_t operation_status);
+
+// Waits for every queue submission tracked since the previous drain. This must
+// complete before replay mutates or tears down virtual memory.
+iree_status_t iree_hal_replay_executor_drain_queue_completions(
+    iree_hal_replay_executor_t* executor);
 
 iree_status_t iree_hal_replay_executor_dispatch_layout(
     const iree_hal_replay_file_record_t* record,

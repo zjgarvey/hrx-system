@@ -33,6 +33,9 @@ typedef struct iree_hal_replay_recorder_buffer_t {
   iree_hal_replay_object_id_t device_id;
   // Session-local object id assigned to this buffer.
   iree_hal_replay_object_id_t buffer_id;
+  // Recorder allocator id for virtual reservations, or NONE for ordinary
+  // buffers.
+  iree_hal_replay_object_id_t virtual_memory_allocator_id;
   // Mutex guarding active write mappings.
   iree_slim_mutex_t mutex;
   // Active write mappings whose flush/unmap bytes may need capture.
@@ -109,9 +112,10 @@ void iree_hal_replay_recorder_buffer_ref_make_payload(
 
 iree_status_t iree_hal_replay_recorder_buffer_create_proxy(
     iree_hal_replay_recorder_t* recorder, iree_hal_replay_object_id_t device_id,
-    iree_hal_replay_object_id_t buffer_id, iree_hal_device_t* placement_device,
-    iree_hal_buffer_t* base_buffer, iree_allocator_t host_allocator,
-    iree_hal_buffer_t** out_buffer) {
+    iree_hal_replay_object_id_t buffer_id,
+    iree_hal_replay_object_id_t virtual_memory_allocator_id,
+    iree_hal_device_t* placement_device, iree_hal_buffer_t* base_buffer,
+    iree_allocator_t host_allocator, iree_hal_buffer_t** out_buffer) {
   IREE_ASSERT_ARGUMENT(recorder);
   IREE_ASSERT_ARGUMENT(base_buffer);
   IREE_ASSERT_ARGUMENT(out_buffer);
@@ -146,9 +150,41 @@ iree_status_t iree_hal_replay_recorder_buffer_create_proxy(
   iree_hal_buffer_retain(buffer->base_buffer);
   buffer->device_id = device_id;
   buffer->buffer_id = buffer_id;
+  buffer->virtual_memory_allocator_id = virtual_memory_allocator_id;
   iree_slim_mutex_initialize(&buffer->mutex);
 
   *out_buffer = &buffer->base;
+  return iree_ok_status();
+}
+
+iree_status_t iree_hal_replay_recorder_buffer_resolve_virtual_memory(
+    iree_hal_buffer_t* buffer, iree_hal_replay_recorder_t* expected_recorder,
+    iree_hal_replay_object_id_t expected_allocator_id,
+    iree_hal_replay_object_id_t* out_buffer_id,
+    iree_hal_buffer_t** out_base_buffer) {
+  IREE_ASSERT_ARGUMENT(out_buffer_id);
+  IREE_ASSERT_ARGUMENT(out_base_buffer);
+  *out_buffer_id = IREE_HAL_REPLAY_OBJECT_ID_NONE;
+  *out_base_buffer = NULL;
+  if (IREE_UNLIKELY(!buffer || !iree_hal_replay_recorder_buffer_isa(buffer))) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "virtual memory reservation was not created by this replay recorder "
+        "allocator");
+  }
+  iree_hal_replay_recorder_buffer_t* replay_buffer =
+      iree_hal_replay_recorder_buffer_cast(buffer);
+  if (IREE_UNLIKELY(replay_buffer->recorder != expected_recorder ||
+                    replay_buffer->virtual_memory_allocator_id !=
+                        expected_allocator_id ||
+                    !replay_buffer->base_buffer)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "virtual memory reservation belongs to another replay recorder "
+        "allocator or was already released");
+  }
+  *out_buffer_id = replay_buffer->buffer_id;
+  *out_base_buffer = replay_buffer->base_buffer;
   return iree_ok_status();
 }
 

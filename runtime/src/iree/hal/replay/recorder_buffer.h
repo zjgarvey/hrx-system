@@ -29,9 +29,19 @@ iree_hal_replay_object_id_t iree_hal_replay_recorder_buffer_id_or_none(
 
 iree_status_t iree_hal_replay_recorder_buffer_create_proxy(
     iree_hal_replay_recorder_t* recorder, iree_hal_replay_object_id_t device_id,
-    iree_hal_replay_object_id_t buffer_id, iree_hal_device_t* placement_device,
-    iree_hal_buffer_t* base_buffer, iree_allocator_t host_allocator,
-    iree_hal_buffer_t** out_buffer);
+    iree_hal_replay_object_id_t buffer_id,
+    iree_hal_replay_object_id_t virtual_memory_allocator_id,
+    iree_hal_device_t* placement_device, iree_hal_buffer_t* base_buffer,
+    iree_allocator_t host_allocator, iree_hal_buffer_t** out_buffer);
+
+// Resolves a virtual memory reservation created by |expected_recorder| and
+// |expected_allocator_id|. Foreign, ordinary, subspan, and consumed buffers
+// are rejected without exposing a backend handle.
+iree_status_t iree_hal_replay_recorder_buffer_resolve_virtual_memory(
+    iree_hal_buffer_t* buffer, iree_hal_replay_recorder_t* expected_recorder,
+    iree_hal_replay_object_id_t expected_allocator_id,
+    iree_hal_replay_object_id_t* out_buffer_id,
+    iree_hal_buffer_t** out_base_buffer);
 
 iree_hal_buffer_t* iree_hal_replay_recorder_buffer_base_or_self(
     iree_hal_buffer_t* buffer);

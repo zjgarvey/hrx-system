@@ -85,6 +85,17 @@ iree_status_t iree_hal_replay_recorder_end_operation_with_payload(
     iree_status_t operation_status, iree_host_size_t iovec_count,
     const iree_const_byte_span_t* iovecs);
 
+// Completes a forwarded stateful operation without allowing capture I/O to
+// change the status observed by the caller. Capture failures remain latched on
+// the recorder and are reported by iree_hal_replay_recorder_close.
+//
+// A zero-initialized |pending_record| is accepted and skips recording. This is
+// used to keep teardown forwarding after the recorder has become terminal.
+iree_status_t iree_hal_replay_recorder_end_passthrough_operation_with_payload(
+    iree_hal_replay_pending_record_t* pending_record,
+    iree_status_t operation_status, iree_host_size_t iovec_count,
+    const iree_const_byte_span_t* iovecs);
+
 iree_status_t iree_hal_replay_recorder_end_creation_operation(
     iree_hal_replay_pending_record_t* pending_record,
     iree_status_t operation_status, iree_host_size_t operation_iovec_count,
