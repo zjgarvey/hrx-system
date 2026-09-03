@@ -138,27 +138,35 @@ static void AppendReplayRecord(
       /*out_payload_range=*/nullptr));
 }
 
-static void AppendQueueBarrierRecord(iree_hal_replay_file_writer_t* writer,
-                                     uint64_t sequence_ordinal, bool is_wait) {
-  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
-  constexpr iree_hal_replay_object_id_t kSemaphoreId = 2;
+static void AppendQueueBarrierDependencyRecord(
+    iree_hal_replay_file_writer_t* writer, uint64_t sequence_ordinal,
+    iree_hal_replay_object_id_t device_id,
+    iree_hal_queue_affinity_t queue_affinity,
+    iree_hal_replay_object_id_t wait_semaphore_id,
+    iree_hal_replay_object_id_t signal_semaphore_id) {
   const iree_hal_replay_device_queue_execute_payload_t payload = {
       /*.command_buffer_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
-      /*.queue_affinity=*/1,
+      /*.queue_affinity=*/queue_affinity,
       /*.flags=*/IREE_HAL_EXECUTE_FLAG_NONE,
-      /*.wait_semaphore_count=*/is_wait ? 1u : 0u,
-      /*.signal_semaphore_count=*/is_wait ? 0u : 1u,
+      /*.wait_semaphore_count=*/
+      wait_semaphore_id == IREE_HAL_REPLAY_OBJECT_ID_NONE ? 0u : 1u,
+      /*.signal_semaphore_count=*/
+      signal_semaphore_id == IREE_HAL_REPLAY_OBJECT_ID_NONE ? 0u : 1u,
       /*.binding_count=*/0,
   };
-  const iree_hal_replay_semaphore_timepoint_payload_t timepoint = {
-      /*.semaphore_id=*/kSemaphoreId,
+  const iree_hal_replay_semaphore_timepoint_payload_t wait_timepoint = {
+      /*.semaphore_id=*/wait_semaphore_id,
+      /*.value=*/1,
+  };
+  const iree_hal_replay_semaphore_timepoint_payload_t signal_timepoint = {
+      /*.semaphore_id=*/signal_semaphore_id,
       /*.value=*/1,
   };
   const iree_hal_replay_file_record_metadata_t metadata = {
       /*.sequence_ordinal=*/sequence_ordinal,
       /*.thread_id=*/0,
-      /*.device_id=*/kDeviceId,
-      /*.object_id=*/kDeviceId,
+      /*.device_id=*/device_id,
+      /*.object_id=*/device_id,
       /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
       /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
       /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
@@ -169,10 +177,91 @@ static void AppendQueueBarrierRecord(iree_hal_replay_file_writer_t* writer,
       IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_EXECUTE,
       /*.status_code=*/IREE_STATUS_OK,
   };
+  iree_const_byte_span_t payload_iovecs[3];
+  iree_host_size_t payload_iovec_count = 0;
+  payload_iovecs[payload_iovec_count++] =
+      iree_make_const_byte_span(&payload, sizeof(payload));
+  if (payload.wait_semaphore_count != 0) {
+    payload_iovecs[payload_iovec_count++] =
+        iree_make_const_byte_span(&wait_timepoint, sizeof(wait_timepoint));
+  }
+  if (payload.signal_semaphore_count != 0) {
+    payload_iovecs[payload_iovec_count++] =
+        iree_make_const_byte_span(&signal_timepoint, sizeof(signal_timepoint));
+  }
+  IREE_CHECK_OK(iree_hal_replay_file_writer_append_record(
+      writer, &metadata, payload_iovec_count, payload_iovecs,
+      /*out_payload_range=*/nullptr));
+}
+
+static void AppendQueueAllocaDependencyRecord(
+    iree_hal_replay_file_writer_t* writer, uint64_t sequence_ordinal,
+    iree_hal_replay_object_id_t device_id,
+    iree_hal_queue_affinity_t queue_affinity,
+    iree_hal_replay_object_id_t buffer_id) {
+  iree_hal_replay_device_queue_alloca_payload_t payload = {};
+  payload.allocation.allocation_size = 4;
+  payload.queue_affinity = queue_affinity;
+  const iree_hal_replay_file_record_metadata_t metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal,
+      /*.thread_id=*/0,
+      /*.device_id=*/device_id,
+      /*.object_id=*/device_id,
+      /*.related_object_id=*/buffer_id,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_ALLOCA,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_DEVICE,
+      /*.operation_code=*/IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_ALLOCA,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(writer, metadata,
+                     {iree_make_const_byte_span(&payload, sizeof(payload))});
+}
+
+static void AppendPreferOriginDeallocaDependencyRecord(
+    iree_hal_replay_file_writer_t* writer, uint64_t sequence_ordinal,
+    iree_hal_replay_object_id_t device_id,
+    iree_hal_queue_affinity_t queue_affinity,
+    iree_hal_replay_object_id_t buffer_id,
+    iree_hal_replay_object_id_t signal_semaphore_id) {
+  iree_hal_replay_device_queue_dealloca_payload_t payload = {};
+  payload.buffer_ref.buffer_id = buffer_id;
+  payload.buffer_ref.length = 4;
+  payload.queue_affinity = queue_affinity;
+  payload.flags = IREE_HAL_DEALLOCA_FLAG_PREFER_ORIGIN;
+  payload.signal_semaphore_count = 1;
+  const iree_hal_replay_semaphore_timepoint_payload_t signal_timepoint = {
+      /*.semaphore_id=*/signal_semaphore_id,
+      /*.value=*/1,
+  };
+  const iree_hal_replay_file_record_metadata_t metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal,
+      /*.thread_id=*/0,
+      /*.device_id=*/device_id,
+      /*.object_id=*/device_id,
+      /*.related_object_id=*/buffer_id,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_DEVICE_QUEUE_DEALLOCA,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_DEVICE,
+      /*.operation_code=*/IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_QUEUE_DEALLOCA,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
   AppendReplayRecord(
       writer, metadata,
       {iree_make_const_byte_span(&payload, sizeof(payload)),
-       iree_make_const_byte_span(&timepoint, sizeof(timepoint))});
+       iree_make_const_byte_span(&signal_timepoint, sizeof(signal_timepoint))});
+}
+
+static void AppendQueueBarrierRecord(iree_hal_replay_file_writer_t* writer,
+                                     uint64_t sequence_ordinal, bool is_wait) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kSemaphoreId = 2;
+  AppendQueueBarrierDependencyRecord(
+      writer, sequence_ordinal, kDeviceId, /*queue_affinity=*/1,
+      is_wait ? kSemaphoreId : IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      is_wait ? IREE_HAL_REPLAY_OBJECT_ID_NONE : kSemaphoreId);
 }
 
 static void AppendQueueAtomicWaitRecord(iree_hal_replay_file_writer_t* writer,
@@ -325,6 +414,118 @@ static std::vector<uint8_t> MakeVmmDependencyReplay(
 
   if (!signal_before_wait && signal_after_wait && !atomic_wait) {
     AppendQueueBarrierRecord(writer, sequence_ordinal++, /*is_wait=*/false);
+  }
+  IREE_CHECK_OK(iree_hal_replay_file_writer_close(writer));
+  iree_hal_replay_file_writer_free(writer);
+  return storage;
+}
+
+enum class QueueDependencyOperation {
+  kExecute,
+  kAlloca,
+  kPreferOriginDealloca,
+};
+
+struct QueueDependencyRecord {
+  // Captured device object id receiving the queue operation.
+  iree_hal_replay_object_id_t device_id;
+  // Captured affinity selecting possible queues.
+  iree_hal_queue_affinity_t queue_affinity;
+  // Optional semaphore waited on by the queue operation.
+  iree_hal_replay_object_id_t wait_semaphore_id;
+  // Optional semaphore signaled by the queue operation.
+  iree_hal_replay_object_id_t signal_semaphore_id;
+  // Queue operation kind; execute is the default for compact test graphs.
+  QueueDependencyOperation operation = QueueDependencyOperation::kExecute;
+  // Buffer produced or consumed by allocation operations.
+  iree_hal_replay_object_id_t buffer_id = IREE_HAL_REPLAY_OBJECT_ID_NONE;
+};
+
+static std::vector<uint8_t> MakeQueueCompletionDependencyReplay(
+    std::initializer_list<QueueDependencyRecord> dependencies) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kFirstSemaphoreId = 2;
+  constexpr iree_hal_replay_object_id_t kSemaphoreCount = 3;
+  std::vector<uint8_t> storage(32768, 0);
+  iree_io_file_handle_t* file_handle = nullptr;
+  IREE_CHECK_OK(iree_io_file_handle_wrap_host_allocation(
+      IREE_IO_FILE_ACCESS_READ | IREE_IO_FILE_ACCESS_WRITE,
+      iree_make_byte_span(storage.data(), storage.size()),
+      iree_io_file_handle_release_callback_null(), iree_allocator_system(),
+      &file_handle));
+  iree_hal_replay_file_writer_t* writer = nullptr;
+  IREE_CHECK_OK(iree_hal_replay_file_writer_allocate(
+      file_handle, iree_allocator_system(), &writer));
+  iree_io_file_handle_release(file_handle);
+
+  uint64_t sequence_ordinal = 0;
+  const iree_hal_replay_scope_payload_t scope_payload = {
+      /*.name_length=*/7,
+      /*.flags=*/IREE_HAL_REPLAY_SCOPE_FLAG_NONE,
+  };
+  const iree_hal_replay_file_record_metadata_t scope_metadata = {
+      /*.sequence_ordinal=*/sequence_ordinal++,
+      /*.thread_id=*/0,
+      /*.device_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.related_object_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+      /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+      /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+      /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_REPLAY_SCOPE,
+      /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+      /*.operation_code=*/IREE_HAL_REPLAY_OPERATION_CODE_REPLAY_SCOPE_BEGIN,
+      /*.status_code=*/IREE_STATUS_OK,
+  };
+  AppendReplayRecord(
+      writer, scope_metadata,
+      {iree_make_const_byte_span(&scope_payload, sizeof(scope_payload)),
+       iree_make_const_byte_span("started", 7)});
+
+  const iree_hal_replay_semaphore_object_payload_t semaphore_payload = {
+      /*.queue_affinity=*/IREE_HAL_QUEUE_AFFINITY_ANY,
+      /*.initial_value=*/0,
+      /*.flags=*/IREE_HAL_SEMAPHORE_FLAG_DEFAULT,
+  };
+  for (iree_hal_replay_object_id_t i = 0; i < kSemaphoreCount; ++i) {
+    const iree_hal_replay_object_id_t semaphore_id = kFirstSemaphoreId + i;
+    const iree_hal_replay_file_record_metadata_t semaphore_metadata = {
+        /*.sequence_ordinal=*/sequence_ordinal++,
+        /*.thread_id=*/0,
+        /*.device_id=*/kDeviceId,
+        /*.object_id=*/kDeviceId,
+        /*.related_object_id=*/semaphore_id,
+        /*.record_type=*/IREE_HAL_REPLAY_FILE_RECORD_TYPE_OPERATION,
+        /*.record_flags=*/IREE_HAL_REPLAY_FILE_RECORD_FLAG_NONE,
+        /*.payload_type=*/IREE_HAL_REPLAY_PAYLOAD_TYPE_SEMAPHORE_OBJECT,
+        /*.object_type=*/IREE_HAL_REPLAY_OBJECT_TYPE_NONE,
+        /*.operation_code=*/
+        IREE_HAL_REPLAY_OPERATION_CODE_DEVICE_CREATE_SEMAPHORE,
+        /*.status_code=*/IREE_STATUS_OK,
+    };
+    AppendReplayRecord(writer, semaphore_metadata,
+                       {iree_make_const_byte_span(&semaphore_payload,
+                                                  sizeof(semaphore_payload))});
+  }
+  for (const QueueDependencyRecord& dependency : dependencies) {
+    switch (dependency.operation) {
+      case QueueDependencyOperation::kExecute:
+        AppendQueueBarrierDependencyRecord(
+            writer, sequence_ordinal++, dependency.device_id,
+            dependency.queue_affinity, dependency.wait_semaphore_id,
+            dependency.signal_semaphore_id);
+        break;
+      case QueueDependencyOperation::kAlloca:
+        AppendQueueAllocaDependencyRecord(
+            writer, sequence_ordinal++, dependency.device_id,
+            dependency.queue_affinity, dependency.buffer_id);
+        break;
+      case QueueDependencyOperation::kPreferOriginDealloca:
+        AppendPreferOriginDeallocaDependencyRecord(
+            writer, sequence_ordinal++, dependency.device_id,
+            dependency.queue_affinity, dependency.buffer_id,
+            dependency.signal_semaphore_id);
+        break;
+    }
   }
   IREE_CHECK_OK(iree_hal_replay_file_writer_close(writer));
   iree_hal_replay_file_writer_free(writer);
@@ -497,6 +698,151 @@ static iree_status_t RecordReplayScopeEvent(
   return iree_ok_status();
 }
 
+static std::vector<std::string> ExecuteQueueDependencyPreflight(
+    const std::vector<uint8_t>& storage) {
+  std::vector<std::string> events;
+  ReplayScopeCallbackState callback_state = {
+      /*.events=*/&events,
+  };
+  iree_hal_replay_execute_options_t options =
+      iree_hal_replay_execute_options_default();
+  options.scope_event_callback.fn = RecordReplayScopeEvent;
+  options.scope_event_callback.user_data = &callback_state;
+  iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            &options, iree_allocator_system()));
+  iree_hal_device_group_release(replay_group);
+  return events;
+}
+
+TEST(ReplayExecuteTest, RejectsSignalBehindPossibleSameQueuePredecessor) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kSemaphoreS = 2;
+  constexpr iree_hal_replay_object_id_t kSemaphoreT = 3;
+  std::vector<uint8_t> storage = MakeQueueCompletionDependencyReplay({
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/kSemaphoreS,
+       /*.signal_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreT},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/2,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreS},
+  });
+
+  EXPECT_TRUE(ExecuteQueueDependencyPreflight(storage).empty());
+}
+
+TEST(ReplayExecuteTest, RejectsDistinctAffinitiesThatMayAlias) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kSemaphoreS = 2;
+  constexpr iree_hal_replay_object_id_t kSemaphoreT = 3;
+  std::vector<uint8_t> storage = MakeQueueCompletionDependencyReplay({
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/kSemaphoreS,
+       /*.signal_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/2,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreT},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/2,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreS},
+  });
+
+  EXPECT_TRUE(ExecuteQueueDependencyPreflight(storage).empty());
+}
+
+TEST(ReplayExecuteTest, RejectsSignalBehindDifferentDeviceIdPredecessor) {
+  constexpr iree_hal_replay_object_id_t kDeviceA = 1;
+  constexpr iree_hal_replay_object_id_t kDeviceB = 5;
+  constexpr iree_hal_replay_object_id_t kSemaphoreS = 2;
+  constexpr iree_hal_replay_object_id_t kSemaphoreT = 3;
+  std::vector<uint8_t> storage = MakeQueueCompletionDependencyReplay({
+      {/*.device_id=*/kDeviceA, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/kSemaphoreS,
+       /*.signal_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE},
+      {/*.device_id=*/kDeviceB, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreT},
+      {/*.device_id=*/kDeviceB, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreS},
+  });
+
+  EXPECT_TRUE(ExecuteQueueDependencyPreflight(storage).empty());
+}
+
+TEST(ReplayExecuteTest, RejectsUnknownQueueAffinityAsPossiblePredecessor) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kSemaphoreS = 2;
+  constexpr iree_hal_replay_object_id_t kSemaphoreT = 3;
+  std::vector<uint8_t> storage = MakeQueueCompletionDependencyReplay({
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/0,
+       /*.wait_semaphore_id=*/kSemaphoreS,
+       /*.signal_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/2,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreT},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/2,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreS},
+  });
+
+  EXPECT_TRUE(ExecuteQueueDependencyPreflight(storage).empty());
+}
+
+TEST(ReplayExecuteTest, RejectsPreferOriginDeallocaWithPendingOriginQueue) {
+  constexpr iree_hal_replay_object_id_t kCallsiteDevice = 1;
+  constexpr iree_hal_replay_object_id_t kOriginDevice = 5;
+  constexpr iree_hal_replay_object_id_t kBufferId = 6;
+  constexpr iree_hal_replay_object_id_t kSemaphoreS = 2;
+  constexpr iree_hal_replay_object_id_t kSemaphoreT = 3;
+  std::vector<uint8_t> storage = MakeQueueCompletionDependencyReplay({
+      {/*.device_id=*/kOriginDevice, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.operation=*/QueueDependencyOperation::kAlloca,
+       /*.buffer_id=*/kBufferId},
+      {/*.device_id=*/kOriginDevice, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/kSemaphoreS,
+       /*.signal_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE},
+      {/*.device_id=*/kCallsiteDevice, /*.queue_affinity=*/2,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreT,
+       /*.operation=*/QueueDependencyOperation::kPreferOriginDealloca,
+       /*.buffer_id=*/kBufferId},
+      {/*.device_id=*/kCallsiteDevice, /*.queue_affinity=*/4,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreS},
+  });
+
+  EXPECT_TRUE(ExecuteQueueDependencyPreflight(storage).empty());
+}
+
+TEST(ReplayExecuteTest, AllowsSignalAfterResolvedSubmission) {
+  constexpr iree_hal_replay_object_id_t kDeviceId = 1;
+  constexpr iree_hal_replay_object_id_t kSemaphoreS = 2;
+  constexpr iree_hal_replay_object_id_t kSemaphoreT = 3;
+  std::vector<uint8_t> storage = MakeQueueCompletionDependencyReplay({
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreS},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/kSemaphoreS,
+       /*.signal_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE},
+      {/*.device_id=*/kDeviceId, /*.queue_affinity=*/1,
+       /*.wait_semaphore_id=*/IREE_HAL_REPLAY_OBJECT_ID_NONE,
+       /*.signal_semaphore_id=*/kSemaphoreT},
+  });
+
+  std::vector<std::string> events = ExecuteQueueDependencyPreflight(storage);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0], "begin:started");
+}
+
 TEST(ReplayExecuteTest, RejectsForwardQueueDependencyBeforeVmmBoundary) {
   std::vector<uint8_t> storage =
       MakeVmmDependencyReplay(/*signal_before_wait=*/false);
@@ -543,14 +889,15 @@ TEST(ReplayExecuteTest, AllowsSatisfiedQueueDependencyBeforeVmmBoundary) {
   ASSERT_EQ(events.size(), 1u);
   EXPECT_EQ(events[0], "begin:started");
 }
-TEST(ReplayExecuteTest, AllowsForwardQueueDependencyAtEndOfFile) {
+TEST(ReplayExecuteTest, RejectsSameQueueForwardDependencyAtEndOfFile) {
   std::vector<uint8_t> storage = MakeVmmDependencyReplay(
       /*signal_before_wait=*/false, /*include_vmm_boundary=*/false);
   iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
 
-  IREE_EXPECT_OK(iree_hal_replay_execute_file(GetCapturedFileContents(storage),
-                                              replay_group, nullptr,
-                                              iree_allocator_system()));
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            nullptr, iree_allocator_system()));
 
   iree_hal_device_group_release(replay_group);
 }
@@ -1316,7 +1663,7 @@ TEST(ReplayExecuteTest, ExecutesRecordedMappedBufferWrite) {
   iree_hal_replay_recorder_release(recorder);
 }
 
-TEST(ReplayExecuteTest, ExecutesForwardQueueDependencyAcrossCapturedHostData) {
+TEST(ReplayExecuteTest, RejectsAmbiguousQueueDependencyAcrossCapturedHostData) {
   std::vector<uint8_t> storage(32768, 0);
   iree_hal_replay_recorder_t* recorder = CreateHostAllocationRecorder(&storage);
 
@@ -1383,9 +1730,10 @@ TEST(ReplayExecuteTest, ExecutesForwardQueueDependencyAcrossCapturedHostData) {
   iree_hal_device_group_release(source_group);
 
   iree_hal_device_group_t* replay_group = CreateTaskDeviceGroup();
-  IREE_EXPECT_OK(iree_hal_replay_execute_file(GetCapturedFileContents(storage),
-                                              replay_group, nullptr,
-                                              iree_allocator_system()));
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_FAILED_PRECONDITION,
+                        iree_hal_replay_execute_file(
+                            GetCapturedFileContents(storage), replay_group,
+                            nullptr, iree_allocator_system()));
   iree_hal_device_group_release(replay_group);
   iree_hal_replay_recorder_release(recorder);
 }

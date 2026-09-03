@@ -96,16 +96,23 @@ typedef struct iree_hal_replay_plan_queue_execute_t {
   const iree_hal_replay_buffer_ref_payload_t* binding_payloads;
 } iree_hal_replay_plan_queue_execute_t;
 
-// Static dependency information for one queue submission. This is used to
-// prove that replay can safely wait at a mid-stream VMM synchronization point
-// before any backend operation is issued.
+// Static completion information for one queue submission. This
+// proves that replay completion waits and VMM synchronization points are
+// reachable before any backend operation is issued.
 typedef struct iree_hal_replay_plan_queue_dependency_t {
+  // True when the record submits work to a device queue.
   bool is_submission;
+  // True when completion can depend on a device-memory predicate.
   bool may_wait_on_device_memory;
+  // Captured command buffer, or NONE for direct queue operations.
   iree_hal_replay_object_id_t command_buffer_id;
+  // Number of captured wait semaphore timepoints.
   iree_host_size_t wait_semaphore_count;
+  // Captured wait semaphore timepoints borrowed from the replay file.
   const iree_hal_replay_semaphore_timepoint_payload_t* wait_semaphore_payloads;
+  // Number of captured signal semaphore timepoints.
   iree_host_size_t signal_semaphore_count;
+  // Captured signal semaphore timepoints borrowed from the replay file.
   const iree_hal_replay_semaphore_timepoint_payload_t*
       signal_semaphore_payloads;
 } iree_hal_replay_plan_queue_dependency_t;
@@ -734,7 +741,10 @@ static iree_status_t iree_hal_replay_plan_verify_completion_dependencies(
       }
       if (!iree_status_is_ok(status)) break;
 
+      // Device identities and affinities do not establish independent queue
+      // domains, so every unresolved submission is a possible predecessor.
       const bool can_complete =
+          pending_dependency_count == 0 &&
           iree_hal_replay_plan_queue_dependency_can_complete(
               &dependency, semaphore_states, plan->object_capacity,
               command_buffer_may_wait_on_device_memory);
@@ -745,19 +755,24 @@ static iree_status_t iree_hal_replay_plan_verify_completion_dependencies(
         status = iree_make_status(
             IREE_STATUS_FAILED_PRECONDITION,
             "replay signaled queue operation at sequence %" PRIu64
-            " has an unresolved forward or device-memory dependency",
+            " has an unresolved completion dependency or FIFO predecessor",
             record->header.sequence_ordinal);
         break;
       } else {
         pending_dependencies[pending_dependency_count++] = dependency;
       }
 
+      // Compact oldest-first. Once an unresolved submission is retained, all
+      // later submissions remain behind that possible FIFO predecessor.
       iree_host_size_t retained_dependency_count = 0;
       for (iree_host_size_t j = 0; j < pending_dependency_count; ++j) {
-        if (!iree_hal_replay_plan_queue_dependency_can_complete(
+        const bool pending_can_complete =
+            retained_dependency_count == 0 &&
+            iree_hal_replay_plan_queue_dependency_can_complete(
                 &pending_dependencies[j], semaphore_states,
                 plan->object_capacity,
-                command_buffer_may_wait_on_device_memory)) {
+                command_buffer_may_wait_on_device_memory);
+        if (!pending_can_complete) {
           pending_dependencies[retained_dependency_count++] =
               pending_dependencies[j];
         }
@@ -770,8 +785,7 @@ static iree_status_t iree_hal_replay_plan_verify_completion_dependencies(
         status = iree_make_status(
             IREE_STATUS_FAILED_PRECONDITION,
             "replay completion synchronization at sequence %" PRIu64
-            " follows queue work with unresolved forward or device-memory "
-            "dependencies",
+            " follows queue work with unresolved completion dependencies",
             record->header.sequence_ordinal);
       }
     }
@@ -779,8 +793,8 @@ static iree_status_t iree_hal_replay_plan_verify_completion_dependencies(
   if (iree_status_is_ok(status) && pending_dependency_count != 0) {
     status = iree_make_status(
         IREE_STATUS_FAILED_PRECONDITION,
-        "replay end-of-file follows queue work with unresolved forward or "
-        "device-memory dependencies");
+        "replay end-of-file follows queue work with unresolved completion "
+        "dependencies");
   }
 
   iree_allocator_free(host_allocator, command_buffer_may_wait_on_device_memory);
