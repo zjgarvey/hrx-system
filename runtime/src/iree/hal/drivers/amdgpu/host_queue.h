@@ -12,6 +12,7 @@
 #include "iree/async/semaphore.h"
 #include "iree/base/api.h"
 #include "iree/base/internal/arena.h"
+#include "iree/base/threading/notification.h"
 #include "iree/base/threading/thread.h"
 #include "iree/hal/api.h"
 #include "iree/hal/drivers/amdgpu/abi/profile.h"
@@ -54,7 +55,12 @@ typedef struct iree_hal_amdgpu_profile_trace_slot_t
     iree_hal_amdgpu_profile_trace_slot_t;
 typedef struct iree_hal_amdgpu_feedback_state_t
     iree_hal_amdgpu_feedback_state_t;
+typedef struct iree_hal_amdgpu_file_action_state_t
+    iree_hal_amdgpu_file_action_state_t;
+typedef struct iree_hal_amdgpu_host_queue_t iree_hal_amdgpu_host_queue_t;
 typedef struct iree_hal_amdgpu_staging_pool_t iree_hal_amdgpu_staging_pool_t;
+typedef struct iree_hal_amdgpu_staging_transfer_t
+    iree_hal_amdgpu_staging_transfer_t;
 typedef struct iree_hal_amdgpu_system_event_agent_target_t
     iree_hal_amdgpu_system_event_agent_target_t;
 typedef struct iree_hal_amdgpu_tsan_memory_policy_t
@@ -85,6 +91,21 @@ typedef struct iree_hal_amdgpu_profile_queue_device_event_reservation_t {
 
 typedef struct iree_hal_amdgpu_host_queue_post_drain_action_t
     iree_hal_amdgpu_host_queue_post_drain_action_t;
+
+// Non-resurrecting lifetime claim used by callback-capable queue scopes.
+//
+// The caller must already have an independent guarantee that |queue| storage
+// remains addressable while acquiring the claim. A successful claim pins both
+// the logical device and queue until release. A failed claim means a queue or
+// device destructor already owns lifetime and is responsible for joining the
+// caller before reclaiming storage; callers must still complete their borrowed
+// cleanup but must not attempt to resurrect either resource.
+typedef struct iree_hal_amdgpu_host_queue_lifetime_claim_t {
+  iree_hal_amdgpu_host_queue_t* queue;
+  iree_hal_device_t* device;
+  bool queue_retained;
+  bool device_retained;
+} iree_hal_amdgpu_host_queue_lifetime_claim_t;
 
 // Memory policy used for queue profiling records.
 typedef struct iree_hal_amdgpu_host_queue_profiling_memory_t {
@@ -176,6 +197,11 @@ typedef struct iree_hal_amdgpu_host_queue_storage_t {
   // Allocator used to reclaim the queue after it has quiesced.
   iree_allocator_t allocator;
 
+  // Parent device retained only by independently releasable dedicated queues.
+  // Provisioned inline queues and device-cached cooperative queues leave this
+  // NULL to avoid a device-owned queue -> device retain cycle.
+  iree_hal_device_t* parent_device;
+
   // Fault-delivery target retired before queue-owned HSA resources.
   iree_hal_amdgpu_system_event_agent_target_t* system_event_target;
 
@@ -235,6 +261,9 @@ typedef struct iree_hal_amdgpu_host_queue_params_t {
   struct {
     // Logical HAL device owning the queue.
     iree_hal_device_t* logical_device;
+    // Exact process-wide fault-delivery target for this physical device.
+    // Borrowed until the queue retires itself during permanent seal.
+    iree_hal_amdgpu_system_event_agent_target_t* system_event_target;
     // Proactor used to arm asynchronous semaphore and timepoint waits.
     iree_async_proactor_t* proactor;
     // Frontier tracker owning |identity.axis|.
@@ -292,6 +321,14 @@ typedef struct iree_hal_amdgpu_host_queue_params_t {
   iree_allocator_t host_allocator;
 } iree_hal_amdgpu_host_queue_params_t;
 
+typedef enum iree_hal_amdgpu_completion_runner_state_e {
+  // Normal completion-thread and waiter-assisted claims are admitted.
+  IREE_HAL_AMDGPU_COMPLETION_RUNNER_STATE_RUNNING = 0,
+  // Seal permanently closed claim admission. Only the sealer-owned terminal
+  // claim may run after this transition.
+  IREE_HAL_AMDGPU_COMPLETION_RUNNER_STATE_CLOSED = 1,
+} iree_hal_amdgpu_completion_runner_state_t;
+
 // Host-driven queue with per-queue epoch signal and wait-backed
 // notification ring. Embeds iree_hal_queue_t at offset zero.
 //
@@ -315,6 +352,9 @@ typedef struct iree_hal_amdgpu_host_queue_t {
   const iree_hal_amdgpu_libhsa_t* libhsa;
   // Logical device owning this queue. Not retained.
   iree_hal_device_t* logical_device;
+  // Exact process-wide fault-delivery target retired by the sole sealer after
+  // final hardware progress and before destroying native queue state.
+  iree_hal_amdgpu_system_event_agent_target_t* system_event_target;
   // Physical-device execution-resource topology. Borrowed for the queue
   // lifetime.
   const iree_hal_amdgpu_queue_execution_resource_topology_t*
@@ -401,6 +441,23 @@ typedef struct iree_hal_amdgpu_host_queue_t {
     // continue waiting for completions; any other value requests exit after a
     // final drain.
     hsa_signal_t stop_signal;
+    // HSA signal used to wake the completion service for queue-owned safe
+    // epilogues that do not publish a hardware epoch (for example, async file
+    // callback tails). Value 0 means no wake is pending; producers store 1.
+    hsa_signal_t work_signal;
+    // True while one thread owns the notification ring's private consumer
+    // cursors. Protected by completion_drain_mutex; the owner drops the mutex
+    // before every callback-capable lane.
+    bool runner_active;
+    // Permanent claim-admission state. Protected by completion_drain_mutex.
+    iree_hal_amdgpu_completion_runner_state_t runner_state;
+    // Number of seal-joined unlocked tails: completion-runner wrappers plus
+    // submission and pending-operation callback/resource/arena cleanup. All
+    // admissions and releases are protected by completion_drain_mutex.
+    uint32_t epilogue_count;
+    // Wakes competing drainers and the sealer after the sole runner publishes
+    // its complete cursor commit and reaches quiescence.
+    iree_notification_t runner_notification;
   } completion;
 
   //--- Submission pipeline state -------------------------------------------//
@@ -419,19 +476,22 @@ typedef struct iree_hal_amdgpu_host_queue_t {
   //     entered by a direct host waiter after it independently observes a
   //     producer epoch. Drains completed entries, checks error_status, reclaims
   //     kernargs, and advances the queue frontier tracker. Reads the
-  //     notification ring and the atomic error_status under
-  //     completion_drain_mutex, preserving the ring's single-consumer
-  //     representation even though there are multiple possible callers. The
-  //     queue-owned completion thread also runs post-drain continuations after
-  //     the serialized drain; direct host waiters do not. Never writes to
-  //     submission-path fields.
+  //     notification ring and the atomic error_status through one serialized
+  //     runner. completion_drain_mutex protects runner ownership only and is
+  //     never held while transitions, callbacks, or resource releases run.
+  //     Both the queue-owned completion thread and waiter-assisted drains run
+  //     post-drain continuations after the serialized claim. Never writes to
+  //     submission-path fields except the final producer-serialized cursor
+  //     commit.
   //
   //   Terminal failure (any thread that can prove the queue is initialized):
-  //     Writes error_status via atomic CAS and signals completion.stop_signal
-  //     so the completion thread wakes, closes admission and fails outstanding
-  //     notifications. Reached from the queue's own HSA error callback, from
-  //     the process-wide HSA system event callback, and from this driver's own
-  //     wait paths, so the writer is not always an HSA runtime thread.
+  //     Takes submission_mutex, installs the first error_status and closes
+  //     submission admission in the same critical section, then signals
+  //     completion.stop_signal after unlock. Reached from the queue's own HSA
+  //     error callback, from the process-wide HSA system event callback, and
+  //     from this driver's own wait paths. No caller may already hold
+  //     submission_mutex; system-event delivery orders registry before
+  //     submission.
   //
   // Wait-resolution fast-path contract:
   //   - Same-queue signal-before-wait is elided directly from the semaphore's
@@ -483,7 +543,17 @@ typedef struct iree_hal_amdgpu_host_queue_t {
     iree_hal_amdgpu_host_queue_post_drain_action_t* head;
     // Tail pointer for appending post-drain continuations.
     iree_hal_amdgpu_host_queue_post_drain_action_t* tail;
+    // True while one thread owns a detached batch and is invoking callbacks.
+    // Protected by |post_drain_mutex|. Other ordinary drainers leave that one
+    // batch with its owner; appended work remains queued for a later
+    // completion pass. The sealer repeatedly joins/claims batches to exact
+    // quiescence after normal service stops.
+    bool runner_active;
   } post_drain;
+
+  // Wakes the sealer whenever a post-drain runner yields after one detached
+  // batch. Initialized before fallible queue initialization.
+  iree_notification_t post_drain_notification;
 
   // Queue-local scratch used by queue_dispatch under submission_mutex.
   struct {
@@ -502,14 +572,38 @@ typedef struct iree_hal_amdgpu_host_queue_t {
 
   // Set under submission_mutex when the queue permanently closes admission,
   // either for teardown or after a fatal queue failure. Never cleared. Every
-  // submission entry point rejects work with CANCELLED once it is set, and
-  // deferred ops whose waits race to completion after this point are failed
-  // with CANCELLED instead of issuing new AQL packets.
+  // submission entry point rejects work with the recorded sticky failure when
+  // present, or with CANCELLED for ordinary teardown. Deferred ops whose waits
+  // race to completion after this point use the same precedence instead of
+  // issuing new AQL packets.
   //
   // Because notification epochs are published under submission_mutex, closing
   // admission under that mutex also establishes that no epoch published later
   // can escape the failure drain that follows.
   bool is_shutting_down;
+
+  // True when |idle_certificate_epoch| certifies the exact closed submission
+  // frontier. Protected by |submission_mutex|.
+  bool idle_certificate_valid;
+
+  // True after the sole sealer has destroyed (or proven absent) the native
+  // HSA queue. Once set, an idle certificate may never be reconstructed.
+  // Protected by |submission_mutex|.
+  bool hardware_queue_retired;
+
+  // True while the single seal owner is cancelling publishers, draining
+  // callbacks, waiting for hardware, and publishing the idle certificate.
+  // Concurrent seal callers await |seal_notification| instead of repeating
+  // any destructive phase. Protected by |submission_mutex|.
+  bool seal_in_progress;
+
+  // Wakes concurrent seal callers after |idle_certificate_valid| is
+  // published. Initialized before any fallible queue initialization step.
+  iree_notification_t seal_notification;
+
+  // Exact |next_submission| observed complete or terminally failed after
+  // admission closed. Protected by |submission_mutex|.
+  uint64_t idle_certificate_epoch;
 
   // Profiling data-family state for this queue. Mutated only by device
   // profiling begin/end while the profiling API's idle-device precondition is
@@ -715,6 +809,27 @@ typedef struct iree_hal_amdgpu_host_queue_t {
   // non-mappable file transfers.
   iree_hal_amdgpu_staging_pool_t* staging_pool;
 
+  // Queue-owned registry edge for every staged/proactor transfer that can
+  // still publish work or run an owner-sensitive callback against this queue.
+  // Entries register under submission_mutex before asynchronous work starts
+  // and unregister only after their terminal callback has returned. Queue
+  // sealing detaches this exact list after admission closes, cancels and joins
+  // every publisher, and releases the registry edges before publishing the
+  // idle certificate. Protected by submission_mutex.
+  iree_hal_amdgpu_staging_transfer_t* active_staging_transfer_head;
+
+  // Active publisher set detached after admission closes. Seal first requests
+  // cancellation for the entire set, then lets hardware/post-drain callbacks
+  // run, and finally joins terminal callbacks before certification. Owned by
+  // the single teardown thread after detachment.
+  iree_hal_amdgpu_staging_transfer_t* shutdown_staging_transfer_head;
+
+  // Direct host-visible file operations have the same lifetime contract as
+  // staged transfers but do not use the staging pool. These exact queue-owned
+  // registry edges are detached/cancelled and then joined during seal.
+  iree_hal_amdgpu_file_action_state_t* active_file_action_head;
+  iree_hal_amdgpu_file_action_state_t* shutdown_file_action_head;
+
   // Intrusive singly-linked list of pending (deferred) operations. Used for
   // cleanup on shutdown and GPU fault propagation. Operations add themselves
   // on deferral and remove themselves on issue/fail/cancel. Protected by
@@ -736,6 +851,125 @@ typedef struct iree_hal_amdgpu_host_queue_t {
   // Fixed-capacity storage for the accumulated frontier.
   iree_hal_amdgpu_host_queue_frontier_t frontier;
 } iree_hal_amdgpu_host_queue_t;
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+// Test-only queue lifecycle subjects. These values and their observer API are
+// compiled only into the explicitly instrumented companion library.
+typedef enum iree_hal_amdgpu_host_queue_test_subject_e {
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER = 0,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_POST_DRAIN_RUNNER = 1,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_SAFE_EPILOGUE = 2,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_PENDING_WAIT_CALLBACK = 3,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_PENDING_ALLOCA_CALLBACK = 4,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_PENDING_CANCELLING_LOSER = 5,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_STAGING_WAITER_CALLBACK = 6,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_DIRECT_FILE_CALLBACK = 7,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_STAGED_TRANSFER_CALLBACK = 8,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_DIRECT_READ_SUBMIT = 9,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_DIRECT_WRITE_SUBMIT = 10,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_STAGED_READ_SUBMIT = 11,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_STAGED_WRITE_SUBMIT = 12,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_FAILURE_ADMISSION = 13,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_SUBMISSION_PUBLICATION = 14,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMMAND_BUFFER_OWNER_CAPTURE = 15,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_PENDING_START_HANDOFF = 16,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_SEAL = 17,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_PUBLISHER_SUBMISSION_REVALIDATION =
+      18,
+} iree_hal_amdgpu_host_queue_test_subject_t;
+
+// Command-buffer submission paths whose cleanup ownership has been captured
+// before validation that may fail. Reported as value0 for
+// OWNER_CAPTURED_BEFORE_VALIDATION; value1 is the command-buffer mode.
+typedef enum iree_hal_amdgpu_host_queue_test_command_buffer_owner_path_e {
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_COMMAND_BUFFER_OWNER_PATH_DIRECT_AQL = 0,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_COMMAND_BUFFER_OWNER_PATH_AQL_REPLAY = 1,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_COMMAND_BUFFER_OWNER_PATH_PM4_DYNAMIC_FIXUP =
+      2,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_COMMAND_BUFFER_OWNER_PATH_PM4_PROFILED = 3,
+} iree_hal_amdgpu_host_queue_test_command_buffer_owner_path_t;
+
+// Publisher paths paused immediately before acquiring submission_mutex for
+// terminal admission revalidation. Reported as value0 for
+// BEFORE_PUBLISHER_SUBMISSION_LOCK.
+typedef enum iree_hal_amdgpu_host_queue_test_publisher_path_e {
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PUBLISHER_PATH_STAGING_SIGNAL_BARRIER = 0,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PUBLISHER_PATH_STAGING_COPY = 1,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PUBLISHER_PATH_DIRECT_FILE_SIGNAL_BARRIER = 2,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PUBLISHER_PATH_TRANSFER_SIGNAL_BARRIER = 3,
+} iree_hal_amdgpu_host_queue_test_publisher_path_t;
+
+typedef enum iree_hal_amdgpu_host_queue_test_phase_e {
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_COMPLETION_CLAIMED = 0,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_TRANSITIONS_DONE = 1,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_VALUES_PREPARED = 2,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_FEEDBACK_TARGET_CLOSED = 3,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_TIMEPOINTS_DISPATCHED = 4,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_RELEASES_DONE = 5,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_PUBLIC_CURSORS_FINALIZED = 6,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_POST_DRAIN_IDLE_BEFORE_WAKE = 7,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_SAFE_HANDOFF_INSTALLED = 8,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_NO_MORE_STATE_TOUCHES = 9,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_SAFE_EPILOGUE_BEGIN = 10,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_SAFE_EPILOGUE_END = 11,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_TERMINAL_PUBLISHED = 12,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_TAIL_ZERO_BEFORE_WAKE = 13,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_TAIL_LEFT = 14,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_SUBMIT_TAIL_ZERO_BEFORE_WAKE = 15,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_SUBMIT_TAIL_LEFT = 16,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_RUNNER_CLAIM = 17,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_AFTER_RUNNER_CLAIM = 18,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_FAILURE_ADMISSION_LOCK = 19,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_SUBMISSION_PUBLICATION = 20,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_AFTER_RUNNER_RELEASE_BEFORE_EPILOGUE =
+      21,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_EPILOGUE_TOKEN_DROP = 22,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_ARMING_WAITS_PARTIAL_REGISTERED = 23,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_OWNER_CAPTURED_BEFORE_VALIDATION = 24,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_POST_DRAIN_BATCH_DETACHED_BEFORE_CALLBACK =
+      25,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_CAPACITY_COMPLETING_BEFORE_ENQUEUE = 26,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_SEAL_OWNER_ACQUIRED = 27,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_PENDING_CALLBACK_MUTEX = 28,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_PENDING_CANCELLING_CLAIMED = 29,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_COMPLETION_RUNNER_CLOSED_INSTALLED = 30,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_STAGING_WAITER_QUEUED = 31,
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_PUBLISHER_SUBMISSION_LOCK = 32,
+  // Emitted after one detached post-drain batch publishes runner inactivity
+  // and before waking waiters. value0 is 1 when another batch is queued.
+  IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_POST_DRAIN_BATCH_YIELDED_BEFORE_WAKE =
+      33,
+} iree_hal_amdgpu_host_queue_test_phase_t;
+
+typedef void(IREE_API_PTR* iree_hal_amdgpu_host_queue_test_phase_observer_t)(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_host_queue_test_subject_t subject,
+    iree_hal_amdgpu_host_queue_test_phase_t phase, uint64_t value0,
+    uint64_t value1, void* user_data);
+
+void iree_hal_amdgpu_host_queue_test_set_phase_observer(
+    iree_hal_amdgpu_host_queue_test_phase_observer_t observer, void* user_data);
+void iree_hal_amdgpu_host_queue_test_notify_phase(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_host_queue_test_subject_t subject,
+    iree_hal_amdgpu_host_queue_test_phase_t phase, uint64_t value0,
+    uint64_t value1);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+// Publishes one fully initialized submission epoch while the caller owns
+// submission_mutex. All doorbell-producing paths use this exact helper so the
+// deterministic boundary covers every admitted publisher.
+static inline void iree_hal_amdgpu_host_queue_publish_submission_epoch(
+    iree_hal_amdgpu_host_queue_t* queue, uint64_t epoch) {
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_SUBMISSION_PUBLICATION,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_SUBMISSION_PUBLICATION,
+      epoch, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+  iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
+                                                  epoch);
+}
 
 // Loads the queue-owned terminal error as an opaque raw value. Zero means the
 // queue has not failed. A nonzero value remains owned by |queue| and must be
@@ -760,6 +994,31 @@ static inline iree_status_t iree_hal_amdgpu_host_queue_clone_error_status(
   return IREE_LIKELY(error_status == 0)
              ? iree_ok_status()
              : iree_status_clone((iree_status_t)error_status);
+}
+
+// Returns an owned status for work retired by queue shutdown. A recorded
+// terminal failure outranks ordinary closure; otherwise the operation is
+// cancelled by the seal itself.
+static inline iree_status_t iree_hal_amdgpu_host_queue_clone_shutdown_status(
+    const iree_hal_amdgpu_host_queue_t* queue) {
+  iree_status_t status = iree_hal_amdgpu_host_queue_clone_error_status(queue);
+  return IREE_LIKELY(iree_status_is_ok(status))
+             ? iree_status_from_code(IREE_STATUS_CANCELLED)
+             : status;
+}
+
+// Returns the terminal status observed while the caller owns
+// |submission_mutex|. A recorded failure always outranks ordinary closed
+// admission so a publisher racing the fatal writer reports the same cause as
+// every other operation settled by that transition.
+static inline iree_status_t
+iree_hal_amdgpu_host_queue_revalidate_submission_locked(
+    const iree_hal_amdgpu_host_queue_t* queue) {
+  iree_status_t status = iree_hal_amdgpu_host_queue_clone_error_status(queue);
+  if (iree_status_is_ok(status) && IREE_UNLIKELY(queue->is_shutting_down)) {
+    status = iree_status_from_code(IREE_STATUS_CANCELLED);
+  }
+  return status;
 }
 
 // Returns a pointer to the queue's accumulated frontier. The returned pointer
@@ -802,12 +1061,51 @@ iree_status_t iree_hal_amdgpu_host_queue_enqueue_host_action(
     iree_host_size_t operation_resource_count);
 
 // Enqueues |action| to run after the current or next notification-ring drain
-// has fully published completed entries. The action storage must remain valid
-// until |action->fn| is invoked.
+// has fully published completed entries. Normal runners execute one detached
+// snapshot and leave callback-enqueued actions for a later service turn. The
+// action storage must remain valid until |action->fn| is invoked.
 void iree_hal_amdgpu_host_queue_enqueue_post_drain_action(
     iree_hal_amdgpu_host_queue_t* queue,
     iree_hal_amdgpu_host_queue_post_drain_action_t* action,
     iree_hal_amdgpu_host_queue_post_drain_fn_t fn, void* user_data);
+
+// Enqueues a post-drain action and posts |enqueued_notification| before the
+// action can be dequeued. This is used by proactor callback tails: enqueue is
+// their final queue/state operation, while a stopped completion service can
+// observe the notification and execute the action from the external sealer.
+void iree_hal_amdgpu_host_queue_enqueue_post_drain_action_and_notify(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_host_queue_post_drain_action_t* action,
+    iree_hal_amdgpu_host_queue_post_drain_fn_t fn, void* user_data,
+    iree_notification_t* enqueued_notification);
+
+// Acquires an exact queue+device lifetime claim without resurrecting either
+// resource. The queue storage must already be stable for the duration of this
+// call. Returns false when a destructor has already claimed ownership.
+bool iree_hal_amdgpu_host_queue_lifetime_try_acquire(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_host_queue_lifetime_claim_t* out_claim);
+
+// Releases a prior lifetime claim in storage-aware order. This may
+// synchronously destroy the queue and/or logical device; no caller may touch
+// either after the call. Returns true only when that destruction finalized the
+// current queue completion service and its entry point must return immediately.
+bool iree_hal_amdgpu_host_queue_lifetime_release(
+    iree_hal_amdgpu_host_queue_lifetime_claim_t* claim);
+
+// Registers callback/resource/arena cleanup that may outlive submission_mutex.
+// Admission must occur while submission is still serialized and before the
+// first unlocked queue-storage access. This is a scalar seal-join token, not a
+// resource retain, and therefore does not keep an unresolved operation alive.
+void iree_hal_amdgpu_host_queue_enter_submission_epilogue(
+    iree_hal_amdgpu_host_queue_t* queue);
+
+// Consumes one submission epilogue token. Callers must finish every queue-owned
+// cleanup, including arena deinitialization, before this call. Unlocking the
+// internal completion mutex is the final queue access owned by the token scope;
+// asynchronous terminal callers may only release a lifetime claim afterward.
+void iree_hal_amdgpu_host_queue_leave_submission_epilogue(
+    iree_hal_amdgpu_host_queue_t* queue);
 
 // Initializes a host queue in caller-provided memory.
 // The caller must allocate at least sizeof(iree_hal_amdgpu_host_queue_t).
@@ -828,13 +1126,14 @@ iree_status_t iree_hal_amdgpu_host_queue_initialize(
 // Execution-resource ordinals in |params| are copied into queue-owned storage.
 // The queue is published to |system_event_target| only after initialization is
 // complete. |release_slot| is captured only on success; callers retain
-// responsibility for returning the slot when allocation fails. |out_queue| is
-// unchanged on failure.
+// responsibility for returning the slot when allocation fails.
+// |retain_parent_device| must be true only for a dedicated queue that is not
+// retained by the logical device. |out_queue| is unchanged on failure.
 iree_status_t iree_hal_amdgpu_host_queue_allocate(
     const iree_hal_amdgpu_host_queue_params_t* params,
     iree_hal_amdgpu_system_event_agent_target_t* system_event_target,
     iree_hal_amdgpu_host_queue_release_slot_callback_t release_slot,
-    iree_hal_amdgpu_host_queue_t** out_queue);
+    bool retain_parent_device, iree_hal_amdgpu_host_queue_t** out_queue);
 
 // Trims transient resources retained by |queue|.
 void iree_hal_amdgpu_host_queue_trim(iree_hal_amdgpu_host_queue_t* queue);
@@ -911,9 +1210,31 @@ void iree_hal_amdgpu_host_queue_deinitialize_tsan_state(
 void iree_hal_amdgpu_host_queue_begin_deinitialize(
     iree_hal_amdgpu_host_queue_t* queue);
 
+// Permanently closes submission admission and waits until the exact final
+// notification epoch has completed or the queue has terminally failed.
+//
+// Returns only after recording an idle certificate for the unchanged closed
+// submission frontier. The wait can be unbounded, so callers must keep queue
+// failure delivery live until this returns. Once it returns, final queue
+// release can prove the certificate and avoid another hardware wait.
+//
+// This is the irreversible commit operation for teardown that will retire
+// external failure delivery or otherwise make an unbounded wait unsafe. The
+// caller must complete all retryable preparation first and keep every failure
+// delivery/ownership ledger published until this returns. Calling it commits
+// even when the queue was already idle because admission remains permanently
+// closed.
+void iree_hal_amdgpu_host_queue_seal(iree_hal_amdgpu_host_queue_t* queue);
+
+// Returns true if |base_queue| is an AMDGPU host queue. Driver interop uses
+// this during retryable opaque queue-set preparation; bindings must not use it
+// to recover the concrete queue type.
+bool iree_hal_amdgpu_host_queue_isa(iree_hal_queue_t* base_queue);
+
 // Waits until no queue work remains that can depend on GPU progress: either
-// hardware retires the last submitted epoch or the queue records a failure.
-// Requires that admission has already been closed.
+// hardware retires the last submitted epoch or the queue records a failure,
+// then records an idle certificate for that exact closed frontier. Requires
+// that admission has already been closed.
 //
 // Returns immediately when the queue already failed or never submitted
 // anything. A failure recorded while this is waiting wakes it through the queue
@@ -979,10 +1300,9 @@ iree_host_size_t iree_hal_amdgpu_host_queue_drain_completions(
 // Drains completed notification entries and retires queue-owned resources after
 // a direct host waiter has independently observed a producer epoch.
 //
-// This intentionally does not run post-drain continuations. Those continuations
-// may submit more AQL, resume command-buffer replay, or drive capacity retries;
-// they belong on the queue-owned completion service thread where device/NUMA
-// affinity policy can be controlled.
+// Runs post-drain continuations only after releasing completion_drain_mutex.
+// A serialized runner preserves queue order when completion and waiter drains
+// race, and teardown joins any detached callback batch before certification.
 iree_host_size_t iree_hal_amdgpu_host_queue_drain_completions_for_waiter(
     iree_hal_amdgpu_host_queue_t* queue);
 

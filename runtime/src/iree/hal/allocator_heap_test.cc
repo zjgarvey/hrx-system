@@ -12,6 +12,120 @@
 
 namespace {
 
+struct LegacyVmmAllocator {
+  // HAL resource header carrying the fake allocator vtable.
+  iree_hal_resource_t resource;
+  // Number of calls dispatched through the legacy reservation slot.
+  int reserve_call_count = 0;
+  // Queue-family affinity received by the legacy reservation slot.
+  iree_hal_queue_family_affinity_t last_queue_family_affinity = 0;
+  // Reservation size received by the legacy reservation slot.
+  iree_device_size_t last_size = 0;
+  // Sentinel buffer returned by the legacy reservation slot.
+  iree_hal_buffer_t* reserve_result = nullptr;
+};
+
+static LegacyVmmAllocator* LegacyVmmAllocatorCast(
+    iree_hal_allocator_t* allocator) {
+  return reinterpret_cast<LegacyVmmAllocator*>(allocator);
+}
+
+static void LegacyVmmAllocatorDestroy(iree_hal_allocator_t* allocator) {
+  (void)allocator;
+}
+
+static iree_status_t LegacyVmmAllocatorReserve(
+    iree_hal_allocator_t* base_allocator,
+    iree_hal_queue_family_affinity_t queue_family_affinity,
+    iree_device_size_t size, iree_hal_buffer_t** out_virtual_buffer) {
+  LegacyVmmAllocator* allocator = LegacyVmmAllocatorCast(base_allocator);
+  ++allocator->reserve_call_count;
+  allocator->last_queue_family_affinity = queue_family_affinity;
+  allocator->last_size = size;
+  *out_virtual_buffer = allocator->reserve_result;
+  return iree_ok_status();
+}
+
+static const iree_hal_allocator_vtable_t kLegacyVmmAllocatorVTable = {
+    /*.destroy=*/LegacyVmmAllocatorDestroy,
+    /*.host_allocator=*/nullptr,
+    /*.trim=*/nullptr,
+    /*.query_statistics=*/nullptr,
+    /*.query_memory_heaps=*/nullptr,
+    /*.query_buffer_compatibility=*/nullptr,
+    /*.allocate_buffer=*/nullptr,
+    /*.deallocate_buffer=*/nullptr,
+    /*.import_buffer=*/nullptr,
+    /*.export_buffer=*/nullptr,
+    /*.supports_virtual_memory=*/nullptr,
+    /*.virtual_memory_query_granularity=*/nullptr,
+    /*.virtual_memory_reserve=*/LegacyVmmAllocatorReserve,
+    /*.virtual_memory_release=*/nullptr,
+    /*.physical_memory_allocate=*/nullptr,
+    /*.physical_memory_free=*/nullptr,
+    /*.virtual_memory_map=*/nullptr,
+    /*.virtual_memory_unmap=*/nullptr,
+    /*.virtual_memory_protect=*/nullptr,
+    /*.virtual_memory_advise=*/nullptr,
+    /*.virtual_memory_reserve_at=*/nullptr,
+};
+
+static iree_hal_allocator_t* LegacyVmmAllocatorAsBase(
+    LegacyVmmAllocator* allocator) {
+  iree_hal_resource_initialize(&kLegacyVmmAllocatorVTable,
+                               &allocator->resource);
+  return reinterpret_cast<iree_hal_allocator_t*>(allocator);
+}
+
+TEST(AllocatorTest, ReserveAtWithoutHintsUsesLegacyVtableSlot) {
+  LegacyVmmAllocator allocator;
+  iree_hal_buffer_t sentinel_buffer = {};
+  allocator.reserve_result = &sentinel_buffer;
+  iree_hal_allocator_t* base_allocator = LegacyVmmAllocatorAsBase(&allocator);
+  const iree_hal_queue_family_affinity_t queue_family_affinity =
+      IREE_HAL_QUEUE_FAMILY_AFFINITY_ANY;
+  const iree_device_size_t size = 4096;
+
+  iree_hal_buffer_t* virtual_buffer = nullptr;
+  IREE_EXPECT_OK(iree_hal_allocator_virtual_memory_reserve_at(
+      base_allocator, queue_family_affinity, size, /*minimum_alignment=*/0,
+      /*requested_address=*/0, &virtual_buffer));
+
+  EXPECT_EQ(1, allocator.reserve_call_count);
+  EXPECT_EQ(queue_family_affinity, allocator.last_queue_family_affinity);
+  EXPECT_EQ(size, allocator.last_size);
+  EXPECT_EQ(&sentinel_buffer, virtual_buffer);
+  iree_hal_allocator_release(base_allocator);
+}
+
+TEST(AllocatorTest, ReserveAtRejectsHintsWhenOptionalVtableSlotIsNull) {
+  LegacyVmmAllocator allocator;
+  iree_hal_buffer_t sentinel_buffer = {};
+  allocator.reserve_result = &sentinel_buffer;
+  iree_hal_allocator_t* base_allocator = LegacyVmmAllocatorAsBase(&allocator);
+  ASSERT_EQ(nullptr, kLegacyVmmAllocatorVTable.virtual_memory_reserve_at);
+
+  iree_hal_buffer_t* virtual_buffer = &sentinel_buffer;
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_UNIMPLEMENTED,
+      iree_hal_allocator_virtual_memory_reserve_at(
+          base_allocator, IREE_HAL_QUEUE_FAMILY_AFFINITY_ANY, 4096,
+          /*minimum_alignment=*/4096, /*requested_address=*/0,
+          &virtual_buffer));
+  EXPECT_EQ(nullptr, virtual_buffer);
+
+  virtual_buffer = &sentinel_buffer;
+  IREE_EXPECT_STATUS_IS(
+      IREE_STATUS_UNIMPLEMENTED,
+      iree_hal_allocator_virtual_memory_reserve_at(
+          base_allocator, IREE_HAL_QUEUE_FAMILY_AFFINITY_ANY, 4096,
+          /*minimum_alignment=*/0, /*requested_address=*/0x10000,
+          &virtual_buffer));
+  EXPECT_EQ(nullptr, virtual_buffer);
+  EXPECT_EQ(0, allocator.reserve_call_count);
+  iree_hal_allocator_release(base_allocator);
+}
+
 TEST(HeapAllocatorTest, ProvidesCoherentUnifiedMemory) {
   iree_hal_allocator_t* allocator = nullptr;
   IREE_ASSERT_OK(

@@ -184,20 +184,39 @@ IREE_API_EXPORT uint8_t iree_async_semaphore_query_frontier(
 
 IREE_API_EXPORT void iree_async_semaphore_fail(
     iree_async_semaphore_t* semaphore, iree_status_t status) {
+  if (iree_async_semaphore_prepare_failure(semaphore, status)) {
+    iree_async_semaphore_dispatch_prepared_failure(semaphore);
+  }
+}
+
+IREE_API_EXPORT bool iree_async_semaphore_prepare_failure(
+    iree_async_semaphore_t* semaphore, iree_status_t status) {
   // First failure wins. Store the original directly — no clone needed.
   // Release semantics ensure the status payload is visible to any thread
-  // that loads the pointer with acquire.
+  // that loads the pointer with acquire. Serialize with normal prepared
+  // dispatch so a callback is never detached with OK after failure wins.
+  iree_slim_mutex_lock(&semaphore->mutex);
   intptr_t expected = 0;
   if (!iree_atomic_compare_exchange_strong(
           &semaphore->failure_status, &expected, (intptr_t)status,
           iree_memory_order_release, iree_memory_order_acquire)) {
+    iree_slim_mutex_unlock(&semaphore->mutex);
     iree_status_free(status);
-    return;
+    return false;
   }
+  iree_slim_mutex_unlock(&semaphore->mutex);
+  return true;
+}
 
+IREE_API_EXPORT void iree_async_semaphore_dispatch_prepared_failure(
+    iree_async_semaphore_t* semaphore) {
   // |status| is now stored in failure_status (owned by the semaphore, freed
   // at deinitialize). dispatch_timepoints_failed borrows it as a template
   // for per-timepoint clones without taking ownership.
+  iree_status_t status = (iree_status_t)iree_atomic_load(
+      &semaphore->failure_status, iree_memory_order_acquire);
+  IREE_ASSERT(!iree_status_is_ok(status),
+              "dispatch requires a previously prepared failure");
   iree_status_code_t status_code = iree_status_code(status);
   iree_async_semaphore_dispatch_timepoints_failed(semaphore, status);
 
@@ -243,24 +262,9 @@ IREE_API_EXPORT iree_status_t iree_async_semaphore_acquire_timepoint(
 
   // Re-check after insertion (handles signal-during-insertion race).
   // This matches the pattern used in frontier_tracker.c.
-  current_value = (uint64_t)iree_atomic_load(&semaphore->timeline_value,
-                                             iree_memory_order_acquire);
-  if (current_value >= minimum_value) {
-    // Unlink and dispatch immediately.
-    if (timepoint->next != NULL) {
-      timepoint->next->prev = timepoint->prev;
-    }
-    if (timepoint->prev != NULL) {
-      timepoint->prev->next = timepoint->next;
-    } else {
-      semaphore->timepoints_head = timepoint->next;
-    }
-    iree_slim_mutex_unlock(&semaphore->mutex);
-    timepoint->callback(timepoint->user_data, timepoint, iree_ok_status());
-    return iree_ok_status();
-  }
-
-  // Also re-check failure status (set via CAS outside the mutex).
+  // Failure preparation and this recheck serialize through |mutex|. Test
+  // failure first so a registrar whose lock-free load was stale cannot report
+  // OK merely because the timeline also satisfies its value.
   failure = (iree_status_t)iree_atomic_load(&semaphore->failure_status,
                                             iree_memory_order_acquire);
   if (!iree_status_is_ok(failure)) {
@@ -276,6 +280,23 @@ IREE_API_EXPORT iree_status_t iree_async_semaphore_acquire_timepoint(
     iree_slim_mutex_unlock(&semaphore->mutex);
     timepoint->callback(timepoint->user_data, timepoint,
                         iree_status_clone(failure));
+    return iree_ok_status();
+  }
+
+  current_value = (uint64_t)iree_atomic_load(&semaphore->timeline_value,
+                                             iree_memory_order_acquire);
+  if (current_value >= minimum_value) {
+    // Unlink and dispatch immediately.
+    if (timepoint->next != NULL) {
+      timepoint->next->prev = timepoint->prev;
+    }
+    if (timepoint->prev != NULL) {
+      timepoint->prev->next = timepoint->next;
+    } else {
+      semaphore->timepoints_head = timepoint->next;
+    }
+    iree_slim_mutex_unlock(&semaphore->mutex);
+    timepoint->callback(timepoint->user_data, timepoint, iree_ok_status());
     return iree_ok_status();
   }
 
@@ -506,10 +527,31 @@ IREE_API_EXPORT iree_status_t iree_async_semaphore_signal_untainted(
 IREE_API_EXPORT iree_status_t iree_async_semaphore_publish_untainted(
     iree_async_semaphore_t* semaphore, uint64_t value,
     const iree_async_frontier_t* frontier) {
+  IREE_RETURN_IF_ERROR(
+      iree_async_semaphore_prepare_untainted(semaphore, value, frontier));
+  iree_async_semaphore_dispatch_prepared_untainted(semaphore, value);
+  return iree_ok_status();
+}
+
+IREE_API_EXPORT iree_status_t iree_async_semaphore_prepare_untainted(
+    iree_async_semaphore_t* semaphore, uint64_t value,
+    const iree_async_frontier_t* frontier) {
+  const iree_status_code_t status_code =
+      iree_async_semaphore_prepare_untainted_code(semaphore, value, frontier);
+  if (IREE_LIKELY(status_code == IREE_STATUS_OK)) return iree_ok_status();
+  iree_status_t failure = (iree_status_t)iree_atomic_load(
+      &semaphore->failure_status, iree_memory_order_acquire);
+  return iree_status_is_ok(failure) ? iree_status_from_code(status_code)
+                                    : iree_status_clone(failure);
+}
+
+IREE_API_EXPORT iree_status_code_t iree_async_semaphore_prepare_untainted_code(
+    iree_async_semaphore_t* semaphore, uint64_t value,
+    const iree_async_frontier_t* frontier) {
   iree_status_t failure = (iree_status_t)iree_atomic_load(
       &semaphore->failure_status, iree_memory_order_acquire);
   if (IREE_UNLIKELY(!iree_status_is_ok(failure))) {
-    return iree_status_clone(failure);
+    return iree_status_code(failure);
   }
 
   // CAS loop to advance the timeline value monotonically. Unlike strict
@@ -518,25 +560,29 @@ IREE_API_EXPORT iree_status_t iree_async_semaphore_publish_untainted(
   do {
     current_raw =
         iree_atomic_load(&semaphore->timeline_value, iree_memory_order_acquire);
-    if (value <= (uint64_t)current_raw) return iree_ok_status();
+    if (value <= (uint64_t)current_raw) return IREE_STATUS_OK;
   } while (!iree_atomic_compare_exchange_weak(
       &semaphore->timeline_value, &current_raw, (int64_t)value,
       iree_memory_order_release, iree_memory_order_relaxed));
 
+  // Serialize the final failure check and frontier merge with failure
+  // preparation. A failure may win after the timeline CAS; query semantics
+  // remain failed and the failure owner will dispatch the pending timepoints.
+  iree_slim_mutex_lock(&semaphore->mutex);
   failure = (iree_status_t)iree_atomic_load(&semaphore->failure_status,
                                             iree_memory_order_acquire);
   if (IREE_UNLIKELY(!iree_status_is_ok(failure))) {
-    return iree_status_clone(failure);
+    iree_slim_mutex_unlock(&semaphore->mutex);
+    return iree_status_code(failure);
   }
 
   // Merge frontier and conditionally advance the untainted watermark.
   bool frontier_merged = true;
   if (frontier != NULL && frontier->entry_count > 0) {
-    iree_slim_mutex_lock(&semaphore->mutex);
     frontier_merged = iree_async_frontier_merge(
         semaphore->frontier, semaphore->frontier_capacity, frontier);
-    iree_slim_mutex_unlock(&semaphore->mutex);
   }
+  iree_slim_mutex_unlock(&semaphore->mutex);
   if (frontier_merged) {
     int64_t watermark_raw = 0;
     do {
@@ -548,9 +594,12 @@ IREE_API_EXPORT iree_status_t iree_async_semaphore_publish_untainted(
         iree_memory_order_release, iree_memory_order_relaxed));
   }
 
-  iree_async_semaphore_dispatch_timepoints(semaphore, value);
+  return IREE_STATUS_OK;
+}
 
-  return iree_ok_status();
+IREE_API_EXPORT void iree_async_semaphore_dispatch_prepared_untainted(
+    iree_async_semaphore_t* semaphore, uint64_t value) {
+  iree_async_semaphore_dispatch_timepoints(semaphore, value);
 }
 
 IREE_API_EXPORT bool iree_async_semaphore_merge_frontier(
@@ -621,6 +670,15 @@ IREE_API_EXPORT void iree_async_semaphore_dispatch_timepoints(
   iree_async_semaphore_timepoint_t** satisfied_tail = &satisfied_head;
 
   iree_slim_mutex_lock(&semaphore->mutex);
+
+  // Failure preparation serializes on this mutex. If failure won before this
+  // point, its successful owner dispatches every pending timepoint with the
+  // failure and this normal publication must leave the list untouched.
+  if (IREE_UNLIKELY(iree_atomic_load(&semaphore->failure_status,
+                                     iree_memory_order_acquire) != 0)) {
+    iree_slim_mutex_unlock(&semaphore->mutex);
+    return;
+  }
 
   iree_async_semaphore_timepoint_t** prev_ptr = &semaphore->timepoints_head;
   iree_async_semaphore_timepoint_t* timepoint = semaphore->timepoints_head;

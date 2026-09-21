@@ -105,16 +105,25 @@ void iree_hal_streaming_event_release_recorded_point(
 iree_hal_streaming_graph_t* iree_hal_streaming_event_commit_recorded_point(
     iree_hal_streaming_event_t* event,
     iree_hal_streaming_recorded_point_t point) {
+  iree_hal_streaming_recorded_point_t previous = {0};
+  iree_hal_streaming_graph_t* dropped_capture_graph =
+      iree_hal_streaming_event_commit_recorded_point_deferred(event, point,
+                                                              &previous);
+  iree_hal_streaming_event_release_recorded_point(&previous);
+  return dropped_capture_graph;
+}
+
+iree_hal_streaming_graph_t*
+iree_hal_streaming_event_commit_recorded_point_deferred(
+    iree_hal_streaming_event_t* event,
+    iree_hal_streaming_recorded_point_t point,
+    iree_hal_streaming_recorded_point_t* out_previous_point) {
   iree_slim_mutex_lock(&event->mutex);
-  iree_hal_streaming_recorded_point_t previous = event->recorded_point;
+  *out_previous_point = event->recorded_point;
   event->recorded_point = point;
   iree_hal_streaming_graph_t* dropped_capture_graph = event->capture_graph;
   event->capture_graph = NULL;
   iree_slim_mutex_unlock(&event->mutex);
-  // Dropped outside the lock: returning a tick slot to its pool takes the pool
-  // mutex, and that mutex and this one are both leaves that no path holds at
-  // the same time.
-  iree_hal_streaming_event_release_recorded_point(&previous);
   return dropped_capture_graph;
 }
 

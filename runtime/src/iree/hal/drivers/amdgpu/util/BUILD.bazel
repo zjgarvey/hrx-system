@@ -25,10 +25,7 @@ package(
 ##----------------------------------------------------------------------------##
 
 iree_runtime_cc_library(
-    name = "libhsa",
-    srcs = [
-        "libhsa.c",
-    ],
+    name = "libhsa_headers",
     hdrs = [
         "libhsa.h",
     ],
@@ -37,11 +34,44 @@ iree_runtime_cc_library(
     ],
     deps = [
         "//runtime/src/iree/base",
+        "//third_party:hsa_runtime_headers",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "libhsa",
+    srcs = [
+        "libhsa.c",
+    ],
+    deps = [
+        ":libhsa_headers",
+        "//runtime/src/iree/base",
         "//runtime/src/iree/base/internal",
         "//runtime/src/iree/base/internal:dynamic_library",
         "//runtime/src/iree/base/internal:path",
-        "//third_party:hsa_runtime_headers",
     ],
+)
+
+iree_runtime_cc_library(
+    name = "libhsa_test_instrumented",
+    testonly = True,
+    srcs = [
+        "libhsa.c",
+    ],
+    defines = ["IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION"],
+    visibility = [
+        "//libhrx/src/binding/hip:__pkg__",
+        "//runtime/src/iree/hal/drivers/amdgpu:__pkg__",
+    ],
+    deps = [
+        ":libhsa_headers",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/internal:dynamic_library",
+        "//runtime/src/iree/base/internal:path",
+        "//runtime/src/iree/base/threading",
+    ],
+    alwayslink = True,
 )
 
 iree_runtime_cc_library(
@@ -53,7 +83,7 @@ iree_runtime_cc_library(
         "libaqlprofile.h",
     ],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         "//runtime/src/iree/base",
         "//runtime/src/iree/base/internal",
         "//runtime/src/iree/base/internal:dynamic_library",
@@ -69,6 +99,20 @@ iree_runtime_cc_test(
     srcs = ["libhsa_test.cc"],
     deps = [
         ":libhsa",
+        ":libhsa_headers",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "libhsa_test_instrumented_test",
+    srcs = ["libhsa_test.cc"],
+    defines = ["IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION"],
+    deps = [
+        ":libhsa_headers",
+        ":libhsa_test_instrumented",
         "//runtime/src/iree/base",
         "//runtime/src/iree/testing:gtest",
         "//runtime/src/iree/testing:gtest_main",
@@ -95,7 +139,7 @@ iree_runtime_cc_library(
         "topology.h",
     ],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
     ],
@@ -106,7 +150,7 @@ iree_runtime_cc_library(
     srcs = ["agent_target.c"],
     hdrs = ["agent_target.h"],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal/drivers/amdgpu/target:identity",
     ],
@@ -128,6 +172,7 @@ iree_runtime_cc_test(
     srcs = ["topology_test.cc"],
     deps = [
         ":libhsa",
+        ":libhsa_headers",
         ":topology",
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
@@ -254,7 +299,7 @@ iree_runtime_cc_library(
     srcs = ["info.c"],
     hdrs = ["info.h"],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         "//runtime/src/iree/base",
     ],
 )
@@ -283,7 +328,7 @@ iree_runtime_cc_library(
         "pm4_program.h",
     ],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         ":packet",
         "//runtime/src/iree/base",
     ],
@@ -319,7 +364,7 @@ iree_runtime_cc_library(
         "signal_pool.h",
     ],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         "//runtime/src/iree/async",
         "//runtime/src/iree/base",
         "//runtime/src/iree/base/internal",
@@ -336,7 +381,7 @@ iree_runtime_cc_library(
     srcs = ["vmem.c"],
     hdrs = ["vmem.h"],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         ":topology",
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
@@ -348,7 +393,7 @@ iree_runtime_cc_library(
     srcs = ["feedback_channel.c"],
     hdrs = ["feedback_channel.h"],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         ":topology",
         ":vmem",
         "//runtime/src/iree/base",
@@ -363,7 +408,7 @@ iree_runtime_cc_library(
     srcs = ["shadow_map.c"],
     hdrs = ["shadow_map.h"],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         ":vmem",
         "//runtime/src/iree/base",
         "//runtime/src/iree/base/internal",
@@ -376,7 +421,7 @@ iree_runtime_cc_library(
     srcs = ["block_pool.c"],
     hdrs = ["block_pool.h"],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         "//runtime/src/iree/base",
         "//runtime/src/iree/base/threading",
         "//runtime/src/iree/hal/memory:tracing",
@@ -390,7 +435,7 @@ iree_runtime_cc_library(
     deps = [
         ":agent_target",
         ":device_library_target",
-        ":libhsa",
+        ":libhsa_headers",
         ":loaded_code_object",
         ":topology",
         "//runtime/src/iree/base",
@@ -405,7 +450,7 @@ iree_runtime_cc_library(
     srcs = ["loaded_code_object.c"],
     hdrs = ["loaded_code_object.h"],
     deps = [
-        ":libhsa",
+        ":libhsa_headers",
         "//runtime/src/iree/base",
     ],
 )
@@ -550,6 +595,7 @@ iree_runtime_cc_test(
     srcs = ["aql_ring_test.cc"],
     deps = [
         ":libhsa",
+        ":libhsa_headers",
         ":packet",
         ":queue_primitives",
         "//runtime/src/iree/base",
@@ -587,6 +633,7 @@ iree_runtime_cc_test(
     deps = [
         ":kfd",
         ":libhsa",
+        ":libhsa_headers",
         ":topology",
         "//runtime/src/iree/base",
         "//runtime/src/iree/testing:gtest",
@@ -599,6 +646,7 @@ iree_runtime_cc_test(
     srcs = ["notification_ring_test.cc"],
     deps = [
         ":libhsa",
+        ":libhsa_headers",
         ":queue_primitives",
         "//runtime/src/iree/async",
         "//runtime/src/iree/async:platform",
@@ -679,6 +727,7 @@ iree_runtime_cc_test(
     srcs = ["pm4_dispatch_live_test.cc"],
     deps = [
         ":libhsa",
+        ":libhsa_headers",
         ":packet",
         ":pm4_atomic",
         ":pm4_dispatch",
@@ -829,6 +878,7 @@ iree_runtime_cc_test(
         ":feedback_channel",
         ":feedback_channel_test_kernels",
         ":libhsa",
+        ":libhsa_headers",
         ":packet",
         ":queue_primitives",
         ":topology",

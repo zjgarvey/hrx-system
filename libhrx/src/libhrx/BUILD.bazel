@@ -79,6 +79,7 @@ HRX_DEPS = [
     "//runtime/src/iree/task:api",
 ] + iree_select({
     "//runtime/config/hal:driver_amdgpu": [
+        "//runtime/src/iree/hal/drivers/amdgpu",
         "//runtime/src/iree/hal/drivers/amdgpu/registration",
         "//runtime/src/iree/hal/drivers/amdgpu/target:selection",
     ],
@@ -102,6 +103,45 @@ hrx_cc_library(
     defines = ["HRX_STATIC"],
     includes = HRX_INCLUDES,
     deps = HRX_DEPS,
+)
+
+hrx_cc_library(
+    name = "hrx_static_vmm_test_instrumented",
+    testonly = True,
+    srcs = HRX_SRCS,
+    hdrs = HRX_HDRS,
+    copts = HRX_AMDGPU_COPTS,
+    defines = ["HRX_STATIC"],
+    includes = HRX_INCLUDES,
+    visibility = ["//libhrx/src/binding/common:__pkg__"],
+    deps = [
+        "//build_tools/bazel:dl",
+        "//runtime/src/iree/async",
+        "//runtime/src/iree/async/util:proactor_pool",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base:core_headers",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/internal:arena",
+        "//runtime/src/iree/base/threading",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/drivers/task:driver",
+        "//runtime/src/iree/hal/drivers/task/executable/loaders/registration",
+        "//runtime/src/iree/hal/memory:asan",
+        "//runtime/src/iree/hal/memory:passthrough_pool",
+        "//runtime/src/iree/hal/memory:slab_provider",
+        "//runtime/src/iree/hal/memory:tlsf_pool",
+        "//runtime/src/iree/hal/utils:profile_file",
+        "//runtime/src/iree/hal/utils:resource_set",
+        "//runtime/src/iree/io:file_handle",
+        "//runtime/src/iree/task:api",
+    ] + iree_select({
+        "//runtime/config/hal:driver_amdgpu": [
+            "//runtime/src/iree/hal/drivers/amdgpu:amdgpu_test_instrumented",
+            "//runtime/src/iree/hal/drivers/amdgpu/registration:registration_vmm_test_instrumented",
+            "//runtime/src/iree/hal/drivers/amdgpu/target:selection",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 hrx_cc_shared_library(

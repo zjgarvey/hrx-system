@@ -28,4 +28,24 @@ iree_cc_library(
 )
 endif()
 
+if(IREE_HAL_DRIVER_AMDGPU)
+iree_cc_library(
+  NAME
+    registration_vmm_test_instrumented
+  HDRS
+    "driver_module.h"
+  SRCS
+    "driver_module.c"
+  DEPS
+    iree::base
+    iree::base::tooling::flags
+    iree::hal
+    iree::hal::drivers::amdgpu::amdgpu_test_instrumented
+  DEFINES
+    "IREE_HAVE_HAL_AMDGPU_DRIVER_MODULE=1"
+  TESTONLY
+  PUBLIC
+)
+endif()
+
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###

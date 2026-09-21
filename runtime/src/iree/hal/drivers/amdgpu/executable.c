@@ -2066,6 +2066,14 @@ uint64_t iree_hal_amdgpu_executable_id(iree_hal_executable_t* base_executable) {
   return executable->executable_id;
 }
 
+const iree_hal_amdgpu_source_context_t*
+iree_hal_amdgpu_executable_source_context(
+    iree_hal_executable_t* base_executable) {
+  iree_hal_amdgpu_executable_t* executable =
+      iree_hal_amdgpu_executable_cast(base_executable);
+  return &executable->source_context;
+}
+
 static void iree_hal_amdgpu_executable_destroy(
     iree_hal_executable_t* base_executable) {
   iree_hal_amdgpu_executable_t* executable =

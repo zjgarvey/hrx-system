@@ -99,4 +99,23 @@ TEST(AtomicRefCount, IncDec) {
   EXPECT_EQ(1, iree_atomic_ref_count_dec(&count));
 }
 
+TEST(AtomicRefCount, TryIncDoesNotResurrectZero) {
+  iree_atomic_ref_count_t count;
+  iree_atomic_ref_count_init(&count);
+
+  EXPECT_TRUE(iree_atomic_ref_count_try_inc(&count));
+  EXPECT_EQ(2, iree_atomic_ref_count_load(&count));
+  EXPECT_EQ(2, iree_atomic_ref_count_dec(&count));
+  EXPECT_EQ(1, iree_atomic_ref_count_dec(&count));
+
+  EXPECT_FALSE(iree_atomic_ref_count_try_inc(&count));
+  EXPECT_EQ(0, iree_atomic_ref_count_load(&count));
+
+  // Corrupt negative counts must not be made less obviously invalid by a
+  // retain attempt. Only a strictly positive count owns live references.
+  iree_atomic_store(&count, -1, iree_memory_order_relaxed);
+  EXPECT_FALSE(iree_atomic_ref_count_try_inc(&count));
+  EXPECT_EQ(-1, iree_atomic_load(&count, iree_memory_order_relaxed));
+}
+
 }  // namespace

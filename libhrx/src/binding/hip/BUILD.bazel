@@ -27,12 +27,24 @@ package(
 # its loader and symbol-export mechanisms before relaxing this constraint.
 _LINUX_COMPATIBILITY = ["@platforms//os:linux"]
 
-# HIP GPU tests require a compiled AMDGPU backend before runtime device
-# discovery.
+# The HIP DSO and GPU tests require a compiled AMDGPU backend before runtime
+# device discovery.
 _HIP_GPU_COMPATIBILITY = _LINUX_COMPATIBILITY + select({
     "//runtime/config/hal:driver_amdgpu": [],
     "//conditions:default": ["@platforms//:incompatible"],
 })
+
+hrx_cc_library(
+    name = "vmm_test_api_headers",
+    testonly = True,
+    hdrs = ["api.h"],
+    includes = [
+        "../..",
+        "../../../include",
+        "../../libhrx",
+    ],
+    visibility = ["//libhrx/src/binding/hip:__pkg__"],
+)
 
 hrx_cc_library(
     name = "printf_format",
@@ -115,6 +127,28 @@ hrx_cc_library(
 )
 
 hrx_cc_library(
+    name = "execution_resource_vmm_test_instrumented",
+    testonly = True,
+    srcs = ["execution_resource.c"],
+    hdrs = [
+        "api.h",
+        "execution_resource.h",
+    ],
+    includes = [
+        "../..",
+        "../../../include",
+        "../../libhrx",
+    ],
+    visibility = ["//libhrx/src/binding/hip:__pkg__"],
+    deps = [
+        "//libhrx/src/binding/common:common_vmm_test_instrumented",
+        "//libhrx/src/binding/common:execution_resource",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+hrx_cc_library(
     name = "launch_params",
     srcs = ["launch_params.c"],
     hdrs = [
@@ -128,6 +162,27 @@ hrx_cc_library(
     ],
     deps = [
         "//libhrx/src/binding/common",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+hrx_cc_library(
+    name = "launch_params_vmm_test_instrumented",
+    testonly = True,
+    srcs = ["launch_params.c"],
+    hdrs = [
+        "api.h",
+        "launch_params.h",
+    ],
+    includes = [
+        "../..",
+        "../../../include",
+        "../../libhrx",
+    ],
+    visibility = ["//libhrx/src/binding/hip:__pkg__"],
+    deps = [
+        "//libhrx/src/binding/common:common_vmm_test_instrumented",
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
     ],
@@ -165,9 +220,34 @@ hrx_cc_library(
 )
 
 hrx_cc_library(
+    name = "execution_resource_descriptor_vmm_test_instrumented",
+    testonly = True,
+    srcs = ["execution_resource_descriptor.c"],
+    hdrs = ["execution_resource_descriptor.h"],
+    includes = [
+        "../..",
+        "../../../include",
+        "../../libhrx",
+    ],
+    visibility = ["//libhrx/src/binding/hip:__pkg__"],
+    deps = [
+        ":execution_resource_vmm_test_instrumented",
+        ":handle_registry",
+        "//libhrx/src/binding/common:common_vmm_test_instrumented",
+        "//libhrx/src/binding/common:execution_resource",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/threading",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+hrx_cc_library(
     name = "execution_context",
     srcs = ["execution_context.c"],
-    hdrs = ["execution_context.h"],
+    hdrs = [
+        "execution_context.h",
+        "vmm.h",
+    ],
     includes = [
         "../..",
         "../../../include",
@@ -178,6 +258,31 @@ hrx_cc_library(
         ":execution_resource_descriptor",
         ":stream",
         "//libhrx/src/binding/common",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/threading",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+hrx_cc_library(
+    name = "execution_context_vmm_test_instrumented",
+    testonly = True,
+    srcs = ["execution_context.c"],
+    hdrs = [
+        "execution_context.h",
+        "vmm.h",
+    ],
+    copts = ["-DIREE_HIP_VMM_TESTING"],
+    includes = [
+        "../..",
+        "../../../include",
+        "../../libhrx",
+    ],
+    deps = [
+        ":execution_resource_descriptor_vmm_test_instrumented",
+        ":execution_resource_vmm_test_instrumented",
+        ":stream_vmm_test_instrumented",
+        "//libhrx/src/binding/common:common_vmm_test_instrumented",
         "//runtime/src/iree/base",
         "//runtime/src/iree/base/threading",
         "//runtime/src/iree/hal",
@@ -199,6 +304,30 @@ hrx_cc_library(
     deps = [
         ":handle_registry",
         "//libhrx/src/binding/common",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/threading",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+hrx_cc_library(
+    name = "stream_vmm_test_instrumented",
+    testonly = True,
+    srcs = ["stream.c"],
+    hdrs = [
+        "api.h",
+        "stream.h",
+    ],
+    includes = [
+        "../..",
+        "../../../include",
+        "../../libhrx",
+    ],
+    visibility = ["//libhrx/src/binding/hip:__pkg__"],
+    deps = [
+        ":handle_registry",
+        "//libhrx/src/binding/common:common_vmm_test_instrumented",
         "//runtime/src/iree/base",
         "//runtime/src/iree/base/internal",
         "//runtime/src/iree/base/threading",
@@ -233,7 +362,7 @@ hrx_cc_shared_library(
         "-Wl,--undefined-version",
         "-Wl,--version-script=$(location :amdhip64.map)",
     ],
-    target_compatible_with = _LINUX_COMPATIBILITY,
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
     deps = [
         ":blocking_printf_provider",
         ":execution_context",
@@ -246,6 +375,53 @@ hrx_cc_shared_library(
         "//runtime/src/iree/base",
         "//runtime/src/iree/base/threading",
         "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/drivers/amdgpu",
+        "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa",
+        "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa_headers",
+    ],
+)
+
+hrx_cc_shared_library(
+    name = "amdhip64_vmm_test_instrumented",
+    testonly = True,
+    srcs = [
+        "abi_stubs.c",
+        "api.c",
+        "api_metadata.c",
+        "vmm.c",
+    ],
+    hdrs = [
+        "api.h",
+        "binding_internal.h",
+        "vmm.h",
+    ],
+    copts = [
+        "-DIREE_HAL_STREAMING_HIP_EXPORTS",
+        "-DIREE_HIP_VMM_TESTING",
+        "-Wno-unused-variable",
+    ],
+    includes = [
+        "../..",
+        "../../../include",
+        "../../libhrx",
+    ],
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
+    visibility = ["//libhrx/src/binding/hip:__pkg__"],
+    deps = [
+        ":blocking_printf_provider",
+        ":execution_context_vmm_test_instrumented",
+        ":execution_resource_descriptor_vmm_test_instrumented",
+        ":execution_resource_vmm_test_instrumented",
+        ":handle_registry",
+        ":launch_params_vmm_test_instrumented",
+        ":stream_vmm_test_instrumented",
+        "//libhrx/src/binding/common:common_vmm_test_instrumented",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/threading",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/drivers/amdgpu:amdgpu_test_instrumented",
+        "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa_headers",
+        "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa_test_instrumented",
     ],
 )
 
@@ -314,7 +490,7 @@ hrx_cc_test(
     env = {
         "HRX_TEST_LIBAMDHIP64": "$(location :amdhip64)",
     },
-    target_compatible_with = _LINUX_COMPATIBILITY,
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
     deps = [
         "//build_tools/bazel:dl",
         "//runtime/src/iree/testing:gtest",
@@ -353,7 +529,7 @@ hrx_cc_test(
     env = {
         "HRX_TEST_LIBAMDHIP64": "$(location :amdhip64)",
     },
-    target_compatible_with = _LINUX_COMPATIBILITY,
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
     deps = [
         # The test itself calls dlopen()/dlsym()/dlclose(); link libdl so the
         # executable resolves them (glibc that ships dl separately, ld.lld).
@@ -365,20 +541,30 @@ hrx_cc_test(
 
 hrx_cc_test(
     name = "hip_launch_validation_api_test",
-    srcs = ["hip_launch_validation_api_test.cc"],
-    # The test loads the built runtime through its public ABI and supplies a
-    # tagged function handle that reaches argument validation before dispatch.
+    srcs = [
+        "hip_launch_validation_api_test.cc",
+        "//libhrx/cts:core/amdgpu_executable_test_data.hpp",
+        "//libhrx/cts:core/amdgpu_test_data.hpp",
+    ],
+    copts = ["-Wno-attributes"],
+    # The test loads the built runtime through its public ABI and resolves real
+    # functions from an architecture-matched embedded module.
     data = [":amdhip64"],
     env = {
         "HRX_TEST_LIBAMDHIP64": "$(location :amdhip64)",
     },
     sanitizer_suppressions = rocm_suppressions,
-    target_compatible_with = _LINUX_COMPATIBILITY,
+    tags = [
+        "iree-run-requirement=runtime.resource.amd_gpu",
+        "runtime-resource=amd-gpu",
+    ],
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
     deps = [
-        ":launch_params",
+        ":vmm_test_api_headers",
+        "//build_tools/amdgpu:target_map_h",
         "//build_tools/bazel:dl",
         "//build_tools/bazel:pthreads",
-        "//libhrx/src/binding/common",
+        "//libhrx/cts:amdgpu_executable_test_kernels",
         "//runtime/src/iree/testing:gtest",
         "//runtime/src/iree/testing:gtest_main",
     ],
@@ -394,10 +580,94 @@ hrx_cc_test(
         "HRX_TEST_LIBAMDHIP64": "$(location :amdhip64)",
     },
     sanitizer_suppressions = hsa_suppressions,
-    target_compatible_with = _LINUX_COMPATIBILITY,
+    tags = [
+        "iree-run-requirement=runtime.resource.amd_gpu",
+        "runtime-resource=amd-gpu",
+    ],
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
     deps = [
         ":launch_params",
         "//build_tools/bazel:dl",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+hrx_cc_test(
+    name = "hip_memory_pool_admission_test",
+    srcs = ["hip_memory_pool_api_test.cc"],
+    # This separately compiled test loads only the test-only runtime closure and
+    # observes lifecycle admission through its instrumented ABI.
+    data = [":amdhip64_vmm_test_instrumented"],
+    defines = ["IREE_HIP_POOL_ADMISSION_TEST=1"],
+    env = {
+        "HRX_TEST_LIBAMDHIP64_PHASE": "$(location :amdhip64_vmm_test_instrumented)",
+    },
+    sanitizer_suppressions = hsa_suppressions,
+    tags = [
+        "iree-run-requirement=runtime.resource.amd_gpu",
+        "runtime-resource=amd-gpu",
+    ],
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
+    deps = [
+        ":launch_params",
+        "//build_tools/bazel:dl",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+hrx_cc_test(
+    name = "hip_virtual_memory_api_test",
+    srcs = [
+        "hip_virtual_memory_api_test.cc",
+        "//libhrx/cts:core/amdgpu_executable_test_data.hpp",
+        "//libhrx/cts:core/amdgpu_test_data.hpp",
+    ],
+    copts = ["-Wno-attributes"],
+    # The test resolves every HIP call from the built DSO and verifies the
+    # resolved VMM symbol's loader path is exactly that artifact.
+    data = [":amdhip64"],
+    env = {
+        "HRX_TEST_LIBAMDHIP64": "$(location :amdhip64)",
+    },
+    sanitizer_suppressions = hsa_suppressions,
+    tags = [
+        "iree-run-requirement=runtime.resource.amd_gpu",
+        "runtime-resource=amd-gpu",
+    ],
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
+    deps = [
+        ":launch_params",
+        "//build_tools/amdgpu:target_map_h",
+        "//build_tools/bazel:dl",
+        "//libhrx/cts:amdgpu_executable_test_kernels",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+hrx_cc_test(
+    name = "hip_vmm_lifecycle_phase_test",
+    timeout = "long",
+    srcs = ["hip_vmm_lifecycle_phase_test.cc"],
+    copts = ["-Wno-attributes"],
+    data = [":amdhip64_vmm_test_instrumented"],
+    env = {
+        "HRX_TEST_LIBAMDHIP64_PHASE": "$(location :amdhip64_vmm_test_instrumented)",
+    },
+    sanitizer_suppressions = hsa_suppressions,
+    tags = [
+        "iree-run-requirement=runtime.resource.amd_gpu",
+        "runtime-resource=amd-gpu",
+    ],
+    target_compatible_with = _HIP_GPU_COMPATIBILITY,
+    deps = [
+        ":vmm_test_api_headers",
+        "//build_tools/bazel:dl",
+        "//runtime/src/iree/base",
         "//runtime/src/iree/testing:gtest",
         "//runtime/src/iree/testing:gtest_main",
     ],

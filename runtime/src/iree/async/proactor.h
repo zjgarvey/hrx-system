@@ -327,6 +327,11 @@ enum iree_async_proactor_capability_bits_e {
   //   n/a     | n/a      | Win 8.1+ | n/a
   IREE_ASYNC_PROACTOR_CAPABILITY_WAIT_COMPLETION_PACKET = 1u << 10,
 
+  // Supports asynchronous cancellation of FILE_READ and FILE_WRITE with a
+  // terminal callback. Backends without this capability may still complete
+  // blocking file operations naturally; callers must join their callbacks.
+  IREE_ASYNC_PROACTOR_CAPABILITY_FILE_OPERATION_CANCELLATION = 1u << 11,
+
   // All capabilities enabled (for allowed_capabilities default).
   IREE_ASYNC_PROACTOR_CAPABILITY_ALL = ~0u,
 };

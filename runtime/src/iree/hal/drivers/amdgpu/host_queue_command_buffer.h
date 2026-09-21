@@ -20,6 +20,8 @@ iree_status_t iree_hal_amdgpu_host_queue_validate_execute_flags(
 
 // Creates a resource set retaining the binding table prefix required by
 // |command_buffer| unless |execute_flags| explicitly borrows buffer lifetimes.
+// On return, including failure after allocation, |out_resource_set| owns any
+// partially built set and must be freed without submission_mutex held.
 iree_status_t iree_hal_amdgpu_host_queue_create_binding_table_resource_set(
     iree_hal_amdgpu_host_queue_t* queue,
     iree_hal_command_buffer_t* command_buffer,
@@ -29,6 +31,10 @@ iree_status_t iree_hal_amdgpu_host_queue_create_binding_table_resource_set(
 
 // Replays an AMDGPU AQL command buffer program onto the host queue.
 // Caller must hold submission_mutex.
+//
+// |out_cleanup_resource| receives an optional owner whose final release may
+// invoke arbitrary resource destructors. The caller must release it only after
+// dropping submission_mutex, regardless of the returned status.
 iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer(
     iree_hal_amdgpu_host_queue_t* queue,
     const iree_hal_amdgpu_wait_resolution_t* resolution,
@@ -36,7 +42,8 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer(
     iree_hal_command_buffer_t* command_buffer,
     iree_hal_buffer_binding_table_t binding_table,
     iree_hal_queue_execute_flags_t execute_flags,
-    iree_hal_resource_set_t** inout_binding_resource_set, bool* out_ready);
+    iree_hal_resource_set_t** inout_binding_resource_set,
+    iree_hal_resource_t** out_cleanup_resource, bool* out_ready);
 
 #ifdef __cplusplus
 }  // extern "C"

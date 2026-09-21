@@ -9,6 +9,217 @@
 #include "iree/base/internal/debugging.h"
 #include "iree/base/internal/dynamic_library.h"
 #include "iree/base/internal/path.h"
+#if defined(IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION)
+#include "iree/base/threading/call_once.h"
+#include "iree/base/threading/mutex.h"
+#include "iree/base/threading/notification.h"
+#endif  // IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION
+
+// The depth guard is linked-image-local. In supported Bazel and CMake
+// compositions, HIP's query and every HIP-owned raw address-free path resolve
+// to this same libhsa target, whether that target is static or shared.
+static IREE_THREAD_LOCAL uint32_t
+    iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth;
+
+#if defined(IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION)
+typedef enum iree_hal_amdgpu_libhsa_observer_state_e {
+  IREE_HAL_AMDGPU_LIBHSA_OBSERVER_EMPTY = 0,
+  IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACTIVE = 1,
+  IREE_HAL_AMDGPU_LIBHSA_OBSERVER_CLOSING = 2,
+} iree_hal_amdgpu_libhsa_observer_state_t;
+
+typedef struct iree_hal_amdgpu_libhsa_observer_registry_t {
+  // Serializes registration state and callback acquisition.
+  iree_slim_mutex_t mutex;
+  // Wakes clear after the final acquired callback completes.
+  iree_notification_t notification;
+  // Registration state controlling whether new callbacks may be acquired.
+  iree_hal_amdgpu_libhsa_observer_state_t state;
+  // Callback published while |state| is ACTIVE or CLOSING.
+  iree_hal_amdgpu_libhsa_vmem_address_free_observer_t observer;
+  // User data whose lifetime is protected by |in_flight|.
+  void* user_data;
+  // Number of raw address-free calls holding a callback snapshot.
+  size_t in_flight;
+} iree_hal_amdgpu_libhsa_observer_registry_t;
+
+typedef struct iree_hal_amdgpu_libhsa_observer_snapshot_t {
+  // Acquired callback, or NULL when observation is inactive.
+  iree_hal_amdgpu_libhsa_vmem_address_free_observer_t observer;
+  // User data paired atomically with |observer|.
+  void* user_data;
+} iree_hal_amdgpu_libhsa_observer_snapshot_t;
+
+static iree_once_flag iree_hal_amdgpu_libhsa_observer_registry_once =
+    IREE_ONCE_FLAG_INIT;
+static iree_hal_amdgpu_libhsa_observer_registry_t
+    iree_hal_amdgpu_libhsa_observer_registry;
+static iree_atomic_int32_t iree_hal_amdgpu_libhsa_test_fail_observer_clear =
+    IREE_ATOMIC_VAR_INIT(0);
+static iree_atomic_uint64_t
+    iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_address_value =
+        IREE_ATOMIC_VAR_INIT(0);
+static iree_atomic_uint64_t
+    iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_alignment_value =
+        IREE_ATOMIC_VAR_INIT(0);
+
+static void iree_hal_amdgpu_libhsa_observer_registry_initialize(void) {
+  iree_slim_mutex_initialize(&iree_hal_amdgpu_libhsa_observer_registry.mutex);
+  iree_notification_initialize(
+      &iree_hal_amdgpu_libhsa_observer_registry.notification);
+}
+
+static bool iree_hal_amdgpu_libhsa_observer_registry_is_drained(
+    void* user_data) {
+  iree_hal_amdgpu_libhsa_observer_registry_t* registry =
+      (iree_hal_amdgpu_libhsa_observer_registry_t*)user_data;
+  iree_slim_mutex_lock(&registry->mutex);
+  const bool is_drained = registry->in_flight == 0;
+  iree_slim_mutex_unlock(&registry->mutex);
+  return is_drained;
+}
+
+static iree_hal_amdgpu_libhsa_observer_snapshot_t
+iree_hal_amdgpu_libhsa_observer_acquire(void) {
+  iree_call_once(&iree_hal_amdgpu_libhsa_observer_registry_once,
+                 iree_hal_amdgpu_libhsa_observer_registry_initialize);
+  iree_hal_amdgpu_libhsa_observer_registry_t* registry =
+      &iree_hal_amdgpu_libhsa_observer_registry;
+  iree_hal_amdgpu_libhsa_observer_snapshot_t snapshot = {0};
+  iree_slim_mutex_lock(&registry->mutex);
+  if (registry->state == IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACTIVE) {
+    snapshot.observer = registry->observer;
+    snapshot.user_data = registry->user_data;
+    ++registry->in_flight;
+  }
+  iree_slim_mutex_unlock(&registry->mutex);
+  return snapshot;
+}
+
+static void iree_hal_amdgpu_libhsa_observer_release(
+    iree_hal_amdgpu_libhsa_observer_snapshot_t snapshot) {
+  if (!snapshot.observer) return;
+  iree_hal_amdgpu_libhsa_observer_registry_t* registry =
+      &iree_hal_amdgpu_libhsa_observer_registry;
+  iree_slim_mutex_lock(&registry->mutex);
+  IREE_ASSERT(registry->in_flight > 0);
+  --registry->in_flight;
+  const bool notify =
+      registry->state == IREE_HAL_AMDGPU_LIBHSA_OBSERVER_CLOSING &&
+      registry->in_flight == 0;
+  iree_slim_mutex_unlock(&registry->mutex);
+  if (notify) {
+    iree_notification_post(&registry->notification, IREE_ALL_WAITERS);
+  }
+}
+
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_libhsa_set_vmem_address_free_observer(
+    iree_hal_amdgpu_libhsa_vmem_address_free_observer_t observer,
+    void* user_data) {
+  if (iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth != 0) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "cannot set vmem address-free observer inside its callback window");
+  }
+  if (!observer) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "vmem address-free observer must be non-NULL");
+  }
+  iree_call_once(&iree_hal_amdgpu_libhsa_observer_registry_once,
+                 iree_hal_amdgpu_libhsa_observer_registry_initialize);
+  iree_hal_amdgpu_libhsa_observer_registry_t* registry =
+      &iree_hal_amdgpu_libhsa_observer_registry;
+  iree_slim_mutex_lock(&registry->mutex);
+  if (registry->state != IREE_HAL_AMDGPU_LIBHSA_OBSERVER_EMPTY) {
+    iree_slim_mutex_unlock(&registry->mutex);
+    return iree_make_status(IREE_STATUS_ALREADY_EXISTS,
+                            "a vmem address-free observer is already active");
+  }
+  registry->observer = observer;
+  registry->user_data = user_data;
+  registry->state = IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACTIVE;
+  iree_slim_mutex_unlock(&registry->mutex);
+  return iree_ok_status();
+}
+
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_libhsa_clear_vmem_address_free_observer(
+    iree_hal_amdgpu_libhsa_vmem_address_free_observer_t observer,
+    void* user_data) {
+  if (iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth != 0) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "cannot clear vmem address-free observer inside its callback window");
+  }
+  if (iree_atomic_exchange(&iree_hal_amdgpu_libhsa_test_fail_observer_clear, 0,
+                           iree_memory_order_acq_rel) != 0) {
+    return iree_make_status(IREE_STATUS_UNAVAILABLE,
+                            "injected observer clear failure");
+  }
+  iree_call_once(&iree_hal_amdgpu_libhsa_observer_registry_once,
+                 iree_hal_amdgpu_libhsa_observer_registry_initialize);
+  iree_hal_amdgpu_libhsa_observer_registry_t* registry =
+      &iree_hal_amdgpu_libhsa_observer_registry;
+  iree_slim_mutex_lock(&registry->mutex);
+  if (!observer || registry->state != IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACTIVE ||
+      registry->observer != observer || registry->user_data != user_data) {
+    iree_slim_mutex_unlock(&registry->mutex);
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "vmem address-free observer mismatch");
+  }
+  registry->state = IREE_HAL_AMDGPU_LIBHSA_OBSERVER_CLOSING;
+  iree_slim_mutex_unlock(&registry->mutex);
+
+  iree_notification_await(&registry->notification,
+                          iree_hal_amdgpu_libhsa_observer_registry_is_drained,
+                          registry, iree_infinite_timeout());
+
+  iree_slim_mutex_lock(&registry->mutex);
+  IREE_ASSERT(registry->state == IREE_HAL_AMDGPU_LIBHSA_OBSERVER_CLOSING);
+  IREE_ASSERT(registry->in_flight == 0);
+  registry->observer = NULL;
+  registry->user_data = NULL;
+  registry->state = IREE_HAL_AMDGPU_LIBHSA_OBSERVER_EMPTY;
+  iree_slim_mutex_unlock(&registry->mutex);
+  return iree_ok_status();
+}
+
+IREE_API_EXPORT void iree_hal_amdgpu_libhsa_test_fail_next_observer_clear(
+    void) {
+  iree_atomic_store(&iree_hal_amdgpu_libhsa_test_fail_observer_clear, 1,
+                    iree_memory_order_release);
+}
+
+IREE_API_EXPORT void
+iree_hal_amdgpu_libhsa_test_reset_vmem_address_reserve_observability(void) {
+  iree_atomic_store(
+      &iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_address_value, 0,
+      iree_memory_order_release);
+  iree_atomic_store(
+      &iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_alignment_value, 0,
+      iree_memory_order_release);
+}
+
+IREE_API_EXPORT uint64_t
+iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_address(void) {
+  return iree_atomic_load(
+      &iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_address_value,
+      iree_memory_order_acquire);
+}
+
+IREE_API_EXPORT uint64_t
+iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_alignment(void) {
+  return iree_atomic_load(
+      &iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_alignment_value,
+      iree_memory_order_acquire);
+}
+#endif  // IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION
+
+IREE_API_EXPORT bool
+iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_is_active(void) {
+  return iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth != 0;
+}
 
 //===----------------------------------------------------------------------===//
 // hsa_status_t interop
@@ -244,7 +455,12 @@ static iree_status_t iree_hal_amdgpu_libhsa_load_symbols(
 #define IREE_HAL_AMDGPU_LIBHSA_PFN(trace_category, result_type, symbol, ...) \
   IREE_RETURN_IF_ERROR(iree_dynamic_library_lookup_symbol(                   \
       library, #symbol, (void**)&out_libhsa->symbol));
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN \
+  IREE_HAL_AMDGPU_LIBHSA_PFN
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN IREE_HAL_AMDGPU_LIBHSA_PFN
 #include "iree/hal/drivers/amdgpu/util/libhsa_tables.h"  // IWYU pragma: keep
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN
   return iree_ok_status();
 }
 
@@ -710,11 +926,92 @@ IREE_API_EXPORT iree_status_t iree_status_from_hsa_status(
   IREE_HAL_AMDGPU_LIBHSA_LEAK_CHECK_DISABLED_PFN_##result_type( \
       trace_category, result_type, symbol, DECL(decl), ARGS(args))
 
+#if defined(IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION)
+#define IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACQUIRE()                \
+  iree_hal_amdgpu_libhsa_observer_snapshot_t observer_snapshot = \
+      iree_hal_amdgpu_libhsa_observer_acquire()
+#define IREE_HAL_AMDGPU_LIBHSA_OBSERVER_NOTIFY(entering, address, length) \
+  do {                                                                    \
+    if (observer_snapshot.observer) {                                     \
+      observer_snapshot.observer(entering, address, length,               \
+                                 observer_snapshot.user_data);            \
+    }                                                                     \
+  } while (0)
+#define IREE_HAL_AMDGPU_LIBHSA_OBSERVER_RELEASE() \
+  iree_hal_amdgpu_libhsa_observer_release(observer_snapshot)
+#else
+#define IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACQUIRE() ((void)0)
+#define IREE_HAL_AMDGPU_LIBHSA_OBSERVER_NOTIFY(entering, address, length) \
+  ((void)0)
+#define IREE_HAL_AMDGPU_LIBHSA_OBSERVER_RELEASE() ((void)0)
+#endif  // IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION
+
+#if defined(IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION)
+#define IREE_HAL_AMDGPU_LIBHSA_RECORD_VMEM_ADDRESS_RESERVE(dispatch_address,    \
+                                                           dispatch_alignment)  \
+  do {                                                                          \
+    iree_atomic_store(                                                          \
+        &iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_address_value,   \
+        dispatch_address, iree_memory_order_release);                           \
+    iree_atomic_store(                                                          \
+        &iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_alignment_value, \
+        dispatch_alignment, iree_memory_order_release);                         \
+  } while (0)
+#else
+#define IREE_HAL_AMDGPU_LIBHSA_RECORD_VMEM_ADDRESS_RESERVE(dispatch_address,   \
+                                                           dispatch_alignment) \
+  ((void)0)
+#endif  // IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION
+
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN(              \
+    trace_category, result_type, symbol, decl, args)                        \
+  hsa_status_t iree_##symbol##_raw(                                         \
+      const iree_hal_amdgpu_libhsa_t* IREE_RESTRICT libhsa _COMMA_DECL(     \
+          decl)) {                                                          \
+    const uint64_t dispatch_address = address;                              \
+    const uint64_t dispatch_alignment = alignment;                          \
+    IREE_HAL_AMDGPU_LIBHSA_RECORD_VMEM_ADDRESS_RESERVE(dispatch_address,    \
+                                                       dispatch_alignment); \
+    return IREE_HAL_AMDGPU_LIBHSA_LIBPTR(libhsa)                            \
+        symbol(va, size, dispatch_address, dispatch_alignment, flags);      \
+  }                                                                         \
+  IREE_HAL_AMDGPU_LIBHSA_STATUS_WRAPPER(trace_category, symbol, DECL(decl), \
+                                        ARGS(args))
+
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN(                        \
+    trace_category, result_type, symbol, decl, args)                         \
+  hsa_status_t iree_##symbol##_raw(                                          \
+      const iree_hal_amdgpu_libhsa_t* IREE_RESTRICT libhsa _COMMA_DECL(      \
+          decl)) {                                                           \
+    IREE_ASSERT(                                                             \
+        iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth !=    \
+        UINT32_MAX);                                                         \
+    ++iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth;        \
+    IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACQUIRE();                               \
+    IREE_HAL_AMDGPU_LIBHSA_OBSERVER_NOTIFY(true, va, size);                  \
+    hsa_status_t hsa_status =                                                \
+        IREE_HAL_AMDGPU_LIBHSA_LIBPTR(libhsa) symbol(ARGS(args));            \
+    IREE_HAL_AMDGPU_LIBHSA_OBSERVER_NOTIFY(false, va, size);                 \
+    IREE_HAL_AMDGPU_LIBHSA_OBSERVER_RELEASE();                               \
+    IREE_ASSERT(                                                             \
+        iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth > 0); \
+    --iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_depth;        \
+    return hsa_status;                                                       \
+  }                                                                          \
+  IREE_HAL_AMDGPU_LIBHSA_STATUS_WRAPPER(trace_category, symbol, DECL(decl),  \
+                                        ARGS(args))
+
 #define DECL(...) __VA_ARGS__
 #define ARGS(...) __VA_ARGS__
 #define _COMMA_DECL(...) __VA_OPT__(, ) __VA_ARGS__
 #define _COMMA_ARGS(...) __VA_OPT__(, ) __VA_ARGS__
 #include "iree/hal/drivers/amdgpu/util/libhsa_tables.h"  // IWYU pragma: export
+#undef IREE_HAL_AMDGPU_LIBHSA_OBSERVER_RELEASE
+#undef IREE_HAL_AMDGPU_LIBHSA_OBSERVER_NOTIFY
+#undef IREE_HAL_AMDGPU_LIBHSA_OBSERVER_ACQUIRE
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN
+#undef IREE_HAL_AMDGPU_LIBHSA_RECORD_VMEM_ADDRESS_RESERVE
 #undef _COMMA_ARGS
 #undef _COMMA_DECL
 #undef IREE_HAL_AMDGPU_LIBHSA_LEAK_CHECK_DISABLED_PFN_hsa_status_t

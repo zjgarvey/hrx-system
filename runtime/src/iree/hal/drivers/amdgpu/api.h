@@ -390,6 +390,176 @@ IREE_API_EXPORT iree_status_t iree_hal_amdgpu_logical_device_create(
     const iree_hal_device_create_params_t* create_params,
     iree_allocator_t host_allocator, iree_hal_device_t** out_device);
 
+// Scope of queues included in a prepared teardown seal set.
+typedef enum iree_hal_amdgpu_queue_seal_scope_e {
+  // Includes only the binding-owned queues supplied by the caller.
+  IREE_HAL_AMDGPU_QUEUE_SEAL_SCOPE_BINDING = 0,
+  // Also includes every provisioned queue and cached cooperative queue owned by
+  // |device|. This scope is reserved for final logical-device teardown.
+  IREE_HAL_AMDGPU_QUEUE_SEAL_SCOPE_DEVICE = 1,
+} iree_hal_amdgpu_queue_seal_scope_t;
+
+// Opaque, retryably prepared set of exact AMDGPU host queues.
+typedef struct iree_hal_amdgpu_queue_seal_set_t
+    iree_hal_amdgpu_queue_seal_set_t;
+
+// Validates, retains, and exact-pointer deduplicates |binding_queues|. DEVICE
+// scope additionally snapshots the driver-owned provisioned and cooperative
+// queues while their owning device is still published. No queue is closed by
+// this function; on failure all retained queues are released.
+IREE_API_EXPORT iree_status_t iree_hal_amdgpu_queue_seal_set_prepare(
+    iree_hal_device_t* device, iree_host_size_t binding_queue_count,
+    iree_hal_queue_t* const* binding_queues,
+    iree_hal_amdgpu_queue_seal_scope_t scope, iree_allocator_t host_allocator,
+    iree_hal_amdgpu_queue_seal_set_t** out_seal_set);
+
+// Permanently closes admission on every queue in |seal_set| without waiting.
+// This is the irreversible teardown boundary. Callers with several sets must
+// begin every set before finishing any set so the complete queue union is
+// closed before the first wait.
+IREE_API_EXPORT void iree_hal_amdgpu_queue_seal_set_begin(
+    iree_hal_amdgpu_queue_seal_set_t* seal_set);
+
+// Drains deferred work, waits for and certifies every final hardware epoch,
+// then releases and destroys a begun |seal_set|. The failure-delivery and
+// object-ownership ledgers for every queue must remain published until all
+// sets in the transaction have finished.
+IREE_API_EXPORT void iree_hal_amdgpu_queue_seal_set_finish(
+    iree_hal_amdgpu_queue_seal_set_t* seal_set);
+
+// Releases and destroys an unbegun prepared seal set.
+IREE_API_EXPORT void iree_hal_amdgpu_queue_seal_set_cancel(
+    iree_hal_amdgpu_queue_seal_set_t* seal_set);
+
+// Creates a target-placement HAL buffer alias over a mapped subrange of an
+// AMDGPU virtual-memory reservation.
+//
+// |allocator| selects the device and HAL placement carried by the alias and
+// must share a native virtual-memory domain with |virtual_buffer|. The alias
+// retains |virtual_buffer| and must be released by the caller. Releasing the
+// alias does not alter the native mapping or permissions, and |allowed_access|
+// does not grant native access that the caller has not established.
+IREE_API_EXPORT iree_status_t iree_hal_amdgpu_allocator_virtual_memory_alias(
+    iree_hal_allocator_t* allocator, iree_hal_buffer_t* virtual_buffer,
+    iree_device_size_t virtual_offset, iree_device_size_t size,
+    iree_hal_memory_access_t allowed_access,
+    iree_hal_buffer_t** out_alias_buffer);
+
+// Applies |protection| to the exact GPU agent group represented by
+// |access_allocator| while resolving and mutating the reservation through
+// |reservation_allocator|. Both allocators must belong to the same retained
+// native HSA domain. All ownership, topology, and range checks complete before
+// the single native access mutation.
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_virtual_memory_protect_peer(
+    iree_hal_allocator_t* reservation_allocator,
+    iree_hal_allocator_t* access_allocator, iree_hal_buffer_t* virtual_buffer,
+    iree_device_size_t virtual_offset, iree_device_size_t size,
+    iree_hal_memory_protection_t protection);
+
+// Opaque allocation-free native VMM journal entry. Preparation validates and
+// owns every raw value needed by apply; apply performs exactly one mutation.
+typedef struct iree_hal_amdgpu_vmm_native_operation_t
+    iree_hal_amdgpu_vmm_native_operation_t;
+
+// Prepares an exact access operation and validates every mapped physical pool
+// against the exact access-agent group before any native mutation.
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_vmm_native_operation_prepare_access(
+    iree_hal_allocator_t* reservation_allocator,
+    iree_hal_allocator_t* access_allocator, iree_hal_buffer_t* virtual_buffer,
+    iree_device_size_t virtual_offset, iree_device_size_t size,
+    iree_hal_queue_family_affinity_t queue_family_affinity,
+    iree_hal_virtual_memory_access_scope_t access_scope,
+    iree_hal_memory_protection_t protection,
+    iree_host_size_t physical_memory_count,
+    iree_hal_physical_memory_t* const* physical_memories,
+    iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation);
+
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_vmm_native_operation_prepare_unmap(
+    iree_hal_allocator_t* reservation_allocator,
+    iree_hal_buffer_t* virtual_buffer, iree_device_size_t virtual_offset,
+    iree_device_size_t size, iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation);
+
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_vmm_native_operation_prepare_release_reservation(
+    iree_hal_allocator_t* reservation_allocator,
+    iree_hal_buffer_t* virtual_buffer, iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation);
+
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_vmm_native_operation_prepare_free_physical(
+    iree_hal_allocator_t* creator_allocator,
+    iree_hal_physical_memory_t* physical_memory,
+    iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation);
+
+IREE_API_EXPORT hsa_status_t iree_hal_amdgpu_vmm_native_operation_apply(
+    iree_hal_amdgpu_vmm_native_operation_t* operation);
+IREE_API_EXPORT bool iree_hal_amdgpu_vmm_native_operation_may_invoke_callbacks(
+    const iree_hal_amdgpu_vmm_native_operation_t* operation);
+IREE_API_EXPORT void iree_hal_amdgpu_vmm_native_operation_destroy(
+    iree_hal_amdgpu_vmm_native_operation_t* operation);
+
+// Finalizes wrappers after successful ownership-consuming native operations.
+// These functions issue no native VMM call.
+IREE_API_EXPORT void
+iree_hal_amdgpu_allocator_virtual_memory_dispose_consumed_reservation(
+    iree_hal_allocator_t* reservation_allocator,
+    iree_hal_buffer_t* virtual_buffer);
+IREE_API_EXPORT void iree_hal_amdgpu_allocator_physical_memory_dispose_consumed(
+    iree_hal_allocator_t* creator_allocator,
+    iree_hal_physical_memory_t* physical_memory);
+
+// Cleanup paths that have already committed to abandoning their public
+// wrapper transfer its exact native owner into an allocation-free retry
+// quarantine when HSA cleanup fails. Both calls consume the supplied owner for
+// either a successful cleanup or a quarantined retry.
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_virtual_memory_release_or_quarantine(
+    iree_hal_allocator_t* reservation_allocator,
+    iree_hal_buffer_t* virtual_buffer);
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_physical_memory_free_or_quarantine(
+    iree_hal_allocator_t* creator_allocator,
+    iree_hal_physical_memory_t* physical_memory);
+
+// Retries detached quarantine owners outside the domain lock. Persistent
+// failure leaves the exact owner queued and returns an error so lifecycle
+// teardown can abort before destroying allocator/device state.
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_allocator_vmm_quarantine_drain(iree_hal_allocator_t* allocator);
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+// Deterministic owner-transfer failures and observations compiled only into
+// the explicitly instrumented companion closure.
+IREE_API_EXPORT void
+iree_hal_amdgpu_vmm_test_fail_virtual_reserve_after_native_once(void);
+IREE_API_EXPORT uint64_t
+iree_hal_amdgpu_vmm_test_last_virtual_reserve_address(void);
+IREE_API_EXPORT uint64_t
+iree_hal_amdgpu_vmm_test_last_virtual_reserve_alignment(void);
+IREE_API_EXPORT void iree_hal_amdgpu_vmm_test_fail_cleanup_count(
+    bool physical_memory, int failure_count);
+IREE_API_EXPORT uint64_t iree_hal_amdgpu_vmm_test_quarantine_count(void);
+IREE_API_EXPORT uint64_t
+iree_hal_amdgpu_vmm_test_cleanup_attempt_count(bool physical_memory);
+IREE_API_EXPORT uint32_t
+iree_hal_amdgpu_vmm_test_last_cleanup_status(bool physical_memory);
+IREE_API_EXPORT void iree_hal_amdgpu_vmm_test_reset_quarantine_observability(
+    void);
+IREE_API_EXPORT void iree_hal_amdgpu_vmm_test_arm_quarantine_drain_pause(void);
+IREE_API_EXPORT void iree_hal_amdgpu_vmm_test_wait_quarantine_drain_paused(
+    void);
+IREE_API_EXPORT void iree_hal_amdgpu_vmm_test_release_quarantine_drain_pause(
+    void);
+IREE_API_EXPORT int iree_hal_amdgpu_vmm_test_drain_attempt_kind(
+    int attempt_ordinal);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
 //===----------------------------------------------------------------------===//
 // iree_hal_amdgpu_driver_t
 //===----------------------------------------------------------------------===//

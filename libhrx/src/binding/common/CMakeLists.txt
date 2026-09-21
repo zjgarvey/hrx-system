@@ -115,6 +115,76 @@ iree_cc_library(
   PUBLIC
 )
 
+iree_cc_library(
+  NAME
+    common_vmm_test_instrumented
+  HDRS
+    "context.h"
+    "direct_transfer.h"
+    "event_timestamp_pool.h"
+    "fat_binary.h"
+    "graph.h"
+    "hrx_bridge.h"
+    "internal.h"
+    "kernel_arguments.h"
+    "kpack.h"
+    "memory.h"
+    "module.h"
+    "occupancy.h"
+    "stream.h"
+    "tls.h"
+  TEXTUAL_HDRS
+    "${IREE_ROOT_DIR}/build_tools/amdgpu/elf_machine_map.inl"
+  SRCS
+    "context.c"
+    "device.c"
+    "direct_transfer.c"
+    "event.c"
+    "event_timestamp_pool.c"
+    "fat_binary.c"
+    "graph.c"
+    "graph_analysis.c"
+    "graph_exec.c"
+    "init.c"
+    "kernel_arguments.c"
+    "kpack.c"
+    "mem_pool.c"
+    "memory.c"
+    "module.c"
+    "occupancy.c"
+    "peer.c"
+    "registry.c"
+    "stream.c"
+    "stream_host_call.c"
+    "tls.c"
+  DEPS
+    ::execution_resource
+    ::function_attributes
+    iree::async
+    iree::async::util::proactor_pool
+    iree::base
+    iree::base::internal
+    iree::base::internal::arena
+    iree::base::threading
+    iree::hal
+    iree::hal::utils::resource_set
+    iree::io::file_handle
+    iree::third_party::zstd
+    libhrx::src::libhrx::hrx_static_vmm_test_instrumented
+    libhrx_defs
+  DEFINES
+    "IREE_HAL_STREAMING_TEST_INSTRUMENTATION"
+  TESTONLY
+  INCLUDES
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/..>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../include>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../../../include>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../libhrx>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../../libhrx>"
+  PUBLIC
+)
+
 iree_cc_test(
   NAME
     execution_resource_test
@@ -150,7 +220,7 @@ iree_cc_test(
   SRCS
     "tls_test.cc"
   DEPS
-    ::common
+    ::common_vmm_test_instrumented
     iree::base
     iree::testing::gtest
     iree::testing::gtest_main
@@ -193,7 +263,7 @@ iree_cc_test(
   SRCS
     "graph_exec_test.cc"
   DEPS
-    ::common
+    ::common_vmm_test_instrumented
     iree::base
     iree::base::internal
     iree::testing::gtest

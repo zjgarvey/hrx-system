@@ -26,3 +26,20 @@ iree_runtime_cc_library(
         "//runtime/src/iree/hal/drivers/amdgpu",
     ],
 )
+
+iree_runtime_cc_library(
+    name = "registration_vmm_test_instrumented",
+    testonly = True,
+    srcs = ["driver_module.c"],
+    hdrs = ["driver_module.h"],
+    defines = [
+        "IREE_HAVE_HAL_AMDGPU_DRIVER_MODULE=1",
+    ],
+    visibility = ["//libhrx/src/libhrx:__pkg__"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/tooling:flags",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/drivers/amdgpu:amdgpu_test_instrumented",
+    ],
+)

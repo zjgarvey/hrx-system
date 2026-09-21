@@ -79,6 +79,15 @@ static inline void iree_hal_resource_retain(const void* any_resource) {
   }
 }
 
+// Attempts to retain a resource only if another owner still holds it. The
+// resource storage must remain addressable for the duration of this call via
+// an independent lifetime guarantee. Returns false after the final release has
+// claimed destruction and never resurrects a zero reference count.
+static inline bool iree_hal_resource_try_retain(const void* any_resource) {
+  iree_hal_resource_t* resource = (iree_hal_resource_t*)any_resource;
+  return resource && iree_atomic_ref_count_try_inc(&resource->ref_count);
+}
+
 // Releases a resource and destroys it if there are no more references.
 // This routes through the vtable and can disable optimizations; always prefer
 // to use the type-specific release functions (such as iree_hal_buffer_release)

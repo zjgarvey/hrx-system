@@ -50,6 +50,7 @@ iree_status_t iree_hal_amdgpu_reclaim_entry_prepare(
   IREE_ASSERT_ARGUMENT(out_resources);
   entry->pre_signal_action.fn = NULL;
   entry->pre_signal_action.user_data = NULL;
+  entry->feedback_source_batch = NULL;
   entry->profile_event_first_position = 0;
   entry->profile_event_count = 0;
   entry->queue_device_event_first_position = 0;
@@ -104,6 +105,8 @@ static void iree_hal_amdgpu_reclaim_entry_release_operation_resources(
 void iree_hal_amdgpu_reclaim_entry_release(
     iree_hal_amdgpu_reclaim_entry_t* entry,
     iree_arena_block_pool_t* block_pool) {
+  IREE_ASSERT(!entry->feedback_source_batch,
+              "feedback source batch must transfer before reclaim release");
   for (uint16_t i = 0; i < entry->count; ++i) {
     iree_hal_resource_release(entry->resources[i]);
   }
@@ -118,6 +121,7 @@ void iree_hal_amdgpu_reclaim_entry_release(
   entry->resources = NULL;
   entry->pre_signal_action.fn = NULL;
   entry->pre_signal_action.user_data = NULL;
+  entry->feedback_source_batch = NULL;
   entry->profile_event_first_position = 0;
   entry->profile_event_count = 0;
   entry->queue_device_event_first_position = 0;
@@ -569,6 +573,322 @@ iree_hal_amdgpu_notification_ring_read_span_frontier(
   }
   return iree_hal_amdgpu_notification_ring_read_frontier_snapshot(ring,
                                                                   fallback);
+}
+
+enum {
+  IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_NONE = 0u,
+  IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_NORMAL = 1u,
+  IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_FAILURE = 2u,
+  IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_FAILURE_WINNER = 3u,
+};
+
+// Claim-local frontier reader. Unlike the ordinary drain helper this advances
+// only |inout_read|; producer-visible storage is not reusable until commit.
+static const iree_async_frontier_t*
+iree_hal_amdgpu_notification_ring_claim_read_frontier_snapshot(
+    iree_hal_amdgpu_notification_ring_t* ring, uint64_t* inout_read,
+    const iree_async_frontier_t* fallback) {
+  const uint64_t write = iree_hal_amdgpu_notification_ring_load_position(
+      &ring->frontier_ring.write, iree_memory_order_acquire);
+  if (*inout_read == write) return fallback;
+
+  iree_host_size_t read = (iree_host_size_t)*inout_read;
+  const iree_hal_amdgpu_frontier_snapshot_t* snapshot =
+      iree_hal_amdgpu_notification_ring_frontier_snapshot_at(ring, &read);
+  read += iree_hal_amdgpu_notification_ring_frontier_snapshot_size(snapshot);
+  *inout_read = (uint64_t)read;
+  return (const iree_async_frontier_t*)&snapshot->frontier;
+}
+
+static const iree_async_frontier_t*
+iree_hal_amdgpu_notification_ring_claim_read_span_frontier(
+    iree_hal_amdgpu_notification_ring_t* ring, uint64_t* inout_read,
+    iree_hal_amdgpu_notification_entry_flags_t flags,
+    bool has_transition_snapshot, const iree_async_frontier_t* fallback) {
+  if (!has_transition_snapshot ||
+      iree_any_bit_set(
+          flags,
+          IREE_HAL_AMDGPU_NOTIFICATION_ENTRY_FLAG_OMIT_FRONTIER_SNAPSHOT)) {
+    return fallback;
+  }
+  return iree_hal_amdgpu_notification_ring_claim_read_frontier_snapshot(
+      ring, inout_read, fallback);
+}
+
+void iree_hal_amdgpu_notification_ring_claim_initialize(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* out_claim) {
+  IREE_ASSERT_ARGUMENT(ring);
+  IREE_ASSERT_ARGUMENT(out_claim);
+  memset(out_claim, 0, sizeof(*out_claim));
+
+  const uint64_t last_drained = (uint64_t)iree_atomic_load(
+      &ring->epoch.last_drained, iree_memory_order_acquire);
+  const uint64_t read = iree_hal_amdgpu_notification_ring_load_position(
+      &ring->read, iree_memory_order_acquire);
+  const uint64_t frontier_read =
+      iree_hal_amdgpu_notification_ring_load_position(
+          &ring->frontier_ring.read, iree_memory_order_acquire);
+  out_claim->initial_epoch = last_drained;
+  out_claim->claimed_epoch = last_drained;
+  out_claim->transitioned_epoch = last_drained;
+  out_claim->retired_epoch = last_drained;
+  out_claim->retire_completed_epoch = last_drained;
+  out_claim->released_epoch = last_drained;
+  out_claim->initial_read = read;
+  out_claim->prepared_read = read;
+  out_claim->dispatched_read = read;
+  out_claim->initial_frontier_read = frontier_read;
+  out_claim->prepared_frontier_read = frontier_read;
+
+  // Skip snapshots whose spans were fully drained by a prior claim. Keep this
+  // cursor private until the complete outer claim commits.
+  const uint64_t frontier_write =
+      iree_hal_amdgpu_notification_ring_load_position(
+          &ring->frontier_ring.write, iree_memory_order_acquire);
+  while (out_claim->prepared_frontier_read < frontier_write) {
+    iree_host_size_t candidate_read =
+        (iree_host_size_t)out_claim->prepared_frontier_read;
+    const iree_hal_amdgpu_frontier_snapshot_t* snapshot =
+        iree_hal_amdgpu_notification_ring_frontier_snapshot_at(ring,
+                                                               &candidate_read);
+    if (snapshot->epoch > last_drained) break;
+    out_claim->prepared_frontier_read =
+        (uint64_t)(candidate_read +
+                   iree_hal_amdgpu_notification_ring_frontier_snapshot_size(
+                       snapshot));
+  }
+}
+
+uint64_t iree_hal_amdgpu_notification_ring_claim_query_target(
+    iree_hal_amdgpu_notification_ring_t* ring, bool force_failure) {
+  IREE_ASSERT_ARGUMENT(ring);
+  const uint64_t last_published = (uint64_t)iree_atomic_load(
+      &ring->epoch.last_published, iree_memory_order_acquire);
+  if (force_failure) return last_published;
+  if (!ring->epoch.signal.handle) {
+    return (uint64_t)iree_atomic_load(&ring->epoch.last_drained,
+                                      iree_memory_order_acquire);
+  }
+  const hsa_signal_value_t signal_value = iree_hsa_signal_load_scacquire(
+      IREE_LIBHSA(ring->libhsa), ring->epoch.signal);
+  uint64_t current_epoch =
+      (uint64_t)(IREE_HAL_AMDGPU_EPOCH_INITIAL_VALUE - signal_value);
+  return iree_min(current_epoch, last_published);
+}
+
+void iree_hal_amdgpu_notification_ring_claim_transition(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim, uint64_t target_epoch,
+    const iree_status_t status) {
+  IREE_ASSERT_ARGUMENT(ring);
+  IREE_ASSERT_ARGUMENT(claim);
+  IREE_ASSERT(target_epoch >= claim->transitioned_epoch);
+  if (target_epoch > claim->claimed_epoch) claim->claimed_epoch = target_epoch;
+  while (claim->transitioned_epoch < target_epoch) {
+    const uint64_t epoch = claim->transitioned_epoch++;
+    const uint32_t reclaim_index = (uint32_t)(epoch & (ring->capacity - 1));
+    iree_hal_amdgpu_reclaim_entry_execute_pre_signal_action(
+        &ring->reclaim_entries[reclaim_index], status);
+  }
+}
+
+void iree_hal_amdgpu_notification_ring_claim_prepare(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim, uint64_t target_epoch,
+    bool force_failure, iree_status_code_t failure_code,
+    const iree_async_frontier_t* fallback_frontier) {
+  IREE_ASSERT_ARGUMENT(ring);
+  IREE_ASSERT_ARGUMENT(claim);
+  IREE_ASSERT(claim->transitioned_epoch >= target_epoch);
+  if (force_failure) {
+    IREE_ASSERT(failure_code != IREE_STATUS_OK);
+  }
+
+  const uint64_t write = iree_hal_amdgpu_notification_ring_load_position(
+      &ring->write, iree_memory_order_acquire);
+  uint64_t read = claim->prepared_read;
+  while (read < write) {
+    iree_hal_amdgpu_notification_entry_t* first_entry =
+        &ring->entries[(uint32_t)(read & (ring->capacity - 1))];
+    if (first_entry->submission_epoch > target_epoch) break;
+
+    iree_async_semaphore_t* semaphore = first_entry->semaphore;
+    uint64_t span_end = read;
+    uint64_t timeline_value = first_entry->timeline_value;
+    iree_hal_amdgpu_notification_entry_flags_t span_flags = first_entry->flags;
+    while (span_end < write) {
+      iree_hal_amdgpu_notification_entry_t* entry =
+          &ring->entries[(uint32_t)(span_end & (ring->capacity - 1))];
+      if (entry->submission_epoch > target_epoch ||
+          entry->semaphore != semaphore) {
+        break;
+      }
+      timeline_value = entry->timeline_value;
+      span_flags |= entry->flags;
+      ++span_end;
+    }
+
+    if (force_failure) {
+      const bool won_failure = iree_async_semaphore_prepare_failure(
+          semaphore, iree_status_from_code(failure_code));
+      for (uint64_t i = read; i < span_end; ++i) {
+        iree_hal_amdgpu_notification_entry_t* entry =
+            &ring->entries[(uint32_t)(i & (ring->capacity - 1))];
+        entry->reserved0 = IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_FAILURE;
+      }
+      if (won_failure) {
+        first_entry->reserved0 =
+            IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_FAILURE_WINNER;
+      }
+    } else {
+      bool has_transition_snapshot = false;
+      if (span_end < write) {
+        const iree_hal_amdgpu_notification_entry_t* next_entry =
+            &ring->entries[(uint32_t)(span_end & (ring->capacity - 1))];
+        has_transition_snapshot = next_entry->semaphore != semaphore;
+      }
+      const iree_async_frontier_t* frontier =
+          iree_hal_amdgpu_notification_ring_claim_read_span_frontier(
+              ring, &claim->prepared_frontier_read, span_flags,
+              has_transition_snapshot, fallback_frontier);
+      (void)iree_async_semaphore_prepare_untainted_code(
+          semaphore, timeline_value, frontier);
+      for (uint64_t i = read; i < span_end; ++i) {
+        iree_hal_amdgpu_notification_entry_t* entry =
+            &ring->entries[(uint32_t)(i & (ring->capacity - 1))];
+        entry->reserved0 = IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_NORMAL;
+      }
+    }
+    read = span_end;
+  }
+  claim->prepared_read = read;
+
+  // Terminal failure claims every published entry after admission has closed;
+  // no future drain needs a cold snapshot from the failed generation.
+  if (force_failure &&
+      target_epoch == (uint64_t)iree_atomic_load(&ring->epoch.last_published,
+                                                 iree_memory_order_acquire)) {
+    claim->prepared_frontier_read =
+        iree_hal_amdgpu_notification_ring_load_position(
+            &ring->frontier_ring.write, iree_memory_order_acquire);
+  }
+}
+
+void iree_hal_amdgpu_notification_ring_claim_retire(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim, uint64_t target_epoch,
+    bool force_failure, iree_hal_amdgpu_reclaim_retire_fn_t retire_fn,
+    void* retire_user_data) {
+  IREE_ASSERT_ARGUMENT(ring);
+  IREE_ASSERT_ARGUMENT(claim);
+  IREE_ASSERT(claim->transitioned_epoch >= target_epoch);
+  while (claim->retired_epoch < target_epoch) {
+    const uint64_t epoch = claim->retired_epoch++;
+    if (retire_fn) {
+      const uint32_t reclaim_index = (uint32_t)(epoch & (ring->capacity - 1));
+      retire_fn(&ring->reclaim_entries[reclaim_index], epoch + 1,
+                force_failure ? IREE_HAL_AMDGPU_RECLAIM_RETIRE_FLAG_FAILED
+                              : IREE_HAL_AMDGPU_RECLAIM_RETIRE_FLAG_NONE,
+                retire_user_data);
+    }
+    IREE_ASSERT(claim->retire_completed_epoch == epoch,
+                "retire callbacks must complete in epoch order");
+    claim->retire_completed_epoch = epoch + 1;
+  }
+}
+
+iree_host_size_t iree_hal_amdgpu_notification_ring_claim_dispatch(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim) {
+  IREE_ASSERT_ARGUMENT(ring);
+  IREE_ASSERT_ARGUMENT(claim);
+  iree_host_size_t dispatch_count = 0;
+  while (claim->dispatched_read < claim->prepared_read) {
+    const uint64_t read = claim->dispatched_read;
+    iree_hal_amdgpu_notification_entry_t* first_entry =
+        &ring->entries[(uint32_t)(read & (ring->capacity - 1))];
+    const uint32_t prepared_kind = first_entry->reserved0;
+    IREE_ASSERT(prepared_kind != IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_NONE);
+    iree_async_semaphore_t* semaphore = first_entry->semaphore;
+    uint64_t timeline_value = first_entry->timeline_value;
+    bool won_failure =
+        prepared_kind == IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_FAILURE_WINNER;
+    uint64_t span_end = read + 1;
+    while (span_end < claim->prepared_read) {
+      iree_hal_amdgpu_notification_entry_t* entry =
+          &ring->entries[(uint32_t)(span_end & (ring->capacity - 1))];
+      const bool span_is_failure =
+          prepared_kind != IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_NORMAL;
+      const bool entry_is_failure =
+          entry->reserved0 != IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_NORMAL;
+      if (entry->semaphore != semaphore ||
+          span_is_failure != entry_is_failure) {
+        break;
+      }
+      timeline_value = entry->timeline_value;
+      won_failure |= entry->reserved0 ==
+                     IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_FAILURE_WINNER;
+      ++span_end;
+    }
+
+    // Advance before callbacks: a nested same-thread drain starts after this
+    // span and can safely extend/dispatch the shared private claim.
+    claim->dispatched_read = span_end;
+    dispatch_count += (iree_host_size_t)(span_end - read);
+    if (prepared_kind == IREE_HAL_AMDGPU_NOTIFICATION_PREPARED_NORMAL) {
+      iree_async_semaphore_dispatch_prepared_untainted(semaphore,
+                                                       timeline_value);
+    } else if (won_failure) {
+      iree_async_semaphore_dispatch_prepared_failure(semaphore);
+    }
+  }
+  return dispatch_count;
+}
+
+bool iree_hal_amdgpu_notification_ring_claim_release_one(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim) {
+  IREE_ASSERT_ARGUMENT(ring);
+  IREE_ASSERT_ARGUMENT(claim);
+  if (claim->released_epoch >= claim->retire_completed_epoch) return false;
+
+  const uint64_t epoch = claim->released_epoch++;
+  const uint32_t reclaim_index = (uint32_t)(epoch & (ring->capacity - 1));
+  iree_hal_amdgpu_reclaim_entry_t* reclaim_entry =
+      &ring->reclaim_entries[reclaim_index];
+  claim->reclaim_positions.kernarg_write_position =
+      iree_max(claim->reclaim_positions.kernarg_write_position,
+               reclaim_entry->kernarg_write_position);
+  claim->reclaim_positions.queue_upload_write_position =
+      iree_max(claim->reclaim_positions.queue_upload_write_position,
+               reclaim_entry->queue_upload_write_position);
+  iree_hal_amdgpu_reclaim_entry_release(reclaim_entry, ring->block_pool);
+  return true;
+}
+
+void iree_hal_amdgpu_notification_ring_claim_commit(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    const iree_hal_amdgpu_notification_ring_claim_t* claim) {
+  IREE_ASSERT_ARGUMENT(ring);
+  IREE_ASSERT_ARGUMENT(claim);
+  IREE_ASSERT(claim->released_epoch == claim->claimed_epoch,
+              "all claimed epochs must release before cursor publication");
+  IREE_ASSERT(claim->retire_completed_epoch == claim->claimed_epoch,
+              "all claimed retire callbacks must return before commit");
+  IREE_ASSERT(claim->dispatched_read == claim->prepared_read,
+              "all prepared notifications must dispatch before commit");
+  IREE_ASSERT(claim->reclaim_positions.kernarg_write_position == 0 &&
+                  claim->reclaim_positions.queue_upload_write_position == 0,
+              "queue-owned reclaim positions must retire before commit");
+
+  iree_hal_amdgpu_notification_ring_store_position(
+      &ring->frontier_ring.read, claim->prepared_frontier_read,
+      iree_memory_order_release);
+  iree_hal_amdgpu_notification_ring_store_position(
+      &ring->read, claim->dispatched_read, iree_memory_order_release);
+  iree_atomic_store(&ring->epoch.last_drained, (int64_t)claim->released_epoch,
+                    iree_memory_order_release);
 }
 
 iree_host_size_t iree_hal_amdgpu_notification_ring_drain_reclaim_positions(

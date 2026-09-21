@@ -15,6 +15,16 @@ typedef struct iree_hal_amdgpu_host_queue_t iree_hal_amdgpu_host_queue_t;
 extern "C" {
 #endif  // __cplusplus
 
+// Detaches and requests cancellation of all direct file-action publishers.
+// Queue admission must already be permanently closed. Does not wait.
+void iree_hal_amdgpu_file_action_cancel_all(
+    iree_hal_amdgpu_host_queue_t* queue);
+
+// Joins every direct file-action publisher detached by cancel_all and consumes
+// its queue-owned registry edge. Hardware/post-drain callbacks must already be
+// drained. Returns only after no action can dereference |queue|.
+void iree_hal_amdgpu_file_action_await_all(iree_hal_amdgpu_host_queue_t* queue);
+
 // Implements queue_read for memory-file, direct mappable, and staged fd-backed
 // file transfers.
 iree_status_t iree_hal_amdgpu_host_queue_read_file(

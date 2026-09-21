@@ -1324,6 +1324,10 @@ typedef struct hipGraphNodeParams {
 // Initialization
 HIPAPI hipError_t hipInit(unsigned int flags);
 // Deinitializes the embedded HRX runtime.
+// This HRX extension returns hipErrorInvalidContext without changing the
+// active generation while another thread owns a current/stack or per-thread
+// stream, an explicit context is live, a primary retain is outstanding, or a
+// non-VMM resource still retains a context. Release those resources and retry.
 HIPAPI hipError_t hipHALDeinit(void);
 // Sets the event sink used by the embedded HRX runtime. Must be called before
 // hipInit or after hipHALDeinit; otherwise returns hipErrorSetOnActiveProcess.
@@ -2112,7 +2116,7 @@ HIPAPI hipError_t hipMallocFromPoolAsync(void** ptr, size_t size,
                                          hipMemPool_t pool, hipStream_t stream);
 HIPAPI hipError_t hipFreeAsync(void* ptr, hipStream_t stream);
 
-// Virtual memory management (not supported - return error)
+// Virtual memory management.
 HIPAPI hipError_t hipMemAddressReserve(void** ptr, size_t size,
                                        size_t alignment, void* addr,
                                        unsigned long long flags);

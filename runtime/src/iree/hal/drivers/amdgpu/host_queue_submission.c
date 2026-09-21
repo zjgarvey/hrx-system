@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "iree/hal/drivers/amdgpu/device/timestamp.h"
+#include "iree/hal/drivers/amdgpu/feedback_state.h"
 #include "iree/hal/drivers/amdgpu/host_queue_policy.h"
 #include "iree/hal/drivers/amdgpu/host_queue_profile.h"
 #include "iree/hal/drivers/amdgpu/host_queue_profile_events.h"
@@ -171,8 +172,7 @@ static void iree_hal_amdgpu_host_queue_emit_reclaim_noop_packets(
   reclaim_entry->count = 0;
   const uint64_t epoch = iree_hal_amdgpu_notification_ring_advance_epoch(
       &queue->notification_ring);
-  iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                  epoch);
+  iree_hal_amdgpu_host_queue_publish_submission_epoch(queue, epoch);
   for (uint32_t i = 0; i < packet_count; ++i) {
     iree_hal_amdgpu_aql_packet_t* packet =
         iree_hal_amdgpu_aql_ring_packet(&queue->aql_ring, first_packet_id + i);
@@ -442,7 +442,7 @@ iree_status_t iree_hal_amdgpu_host_queue_try_begin_kernel_submission(
   memset(out_submission, 0, sizeof(*out_submission));
 
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
 
   if (IREE_UNLIKELY(payload_packet_count == 0)) {
@@ -569,7 +569,7 @@ iree_status_t iree_hal_amdgpu_host_queue_try_begin_barrier_submission(
   memset(out_submission, 0, sizeof(*out_submission));
 
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
 
   const bool profile_queue_device_event =
@@ -1087,8 +1087,7 @@ uint64_t iree_hal_amdgpu_host_queue_finish_dispatch_submission(
       submission->profile_queue_device_events);
   iree_hal_amdgpu_host_queue_publish_submission_kernargs(queue,
                                                          &submission->kernel);
-  iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                  submission_epoch);
+  iree_hal_amdgpu_host_queue_publish_submission_epoch(queue, submission_epoch);
   if (queue_device_event) {
     iree_hal_amdgpu_host_queue_commit_queue_device_start_packet(
         queue, resolution,
@@ -1242,8 +1241,7 @@ iree_status_t iree_hal_amdgpu_host_queue_finish_pm4_ib_submission(
                          : iree_hal_amdgpu_notification_ring_epoch_signal(
                                &queue->notification_ring),
       &pm4_ib_setup);
-  iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                  submission_epoch);
+  iree_hal_amdgpu_host_queue_publish_submission_epoch(queue, submission_epoch);
   iree_hal_amdgpu_aql_ring_commit(submission->pm4_ib_packet_slot, pm4_ib_header,
                                   pm4_ib_setup);
   if (queue_device_event) {
@@ -1346,6 +1344,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_ib(
     const uint32_t* ib_dwords, uint32_t ib_dword_count,
     iree_hsa_signal_t publication_signal,
     iree_hal_amdgpu_reclaim_action_t publication_retire_action,
+    iree_hal_amdgpu_feedback_source_batch_t** inout_feedback_source_batch,
     iree_hal_resource_t* const* operation_resources,
     iree_host_size_t operation_resource_count,
     const iree_hal_amdgpu_host_queue_profile_event_info_t*
@@ -1379,6 +1378,12 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_ib(
   submission.kernel.pre_signal_action = publication_retire_action;
   submission.persistent_ib_dwords = ib_dwords;
   submission.ib_dword_count = ib_dword_count;
+  if (inout_feedback_source_batch) {
+    iree_hal_amdgpu_feedback_source_batch_install(*inout_feedback_source_batch);
+    submission.kernel.reclaim_entry->feedback_source_batch =
+        *inout_feedback_source_batch;
+    *inout_feedback_source_batch = NULL;
+  }
   uint64_t submission_epoch = 0;
   IREE_RETURN_IF_ERROR(iree_hal_amdgpu_host_queue_finish_pm4_ib_submission(
       queue, resolution, signal_semaphore_list, operation_resources,
@@ -1399,6 +1404,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_ib_with_binding_table_fixup(
     const uint32_t* ib_dwords, uint32_t ib_dword_count,
     iree_hsa_signal_t publication_signal,
     iree_hal_amdgpu_reclaim_action_t publication_retire_action,
+    iree_hal_amdgpu_feedback_source_batch_t** inout_feedback_source_batch,
     iree_hal_resource_t* const* operation_resources,
     iree_host_size_t operation_resource_count,
     iree_hal_resource_set_t** inout_resource_set,
@@ -1577,6 +1583,13 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_ib_with_binding_table_fixup(
                                      &queue->notification_ring),
             &pm4_setup);
 
+    if (inout_feedback_source_batch) {
+      iree_hal_amdgpu_feedback_source_batch_install(
+          *inout_feedback_source_batch);
+      submission.reclaim_entry->feedback_source_batch =
+          *inout_feedback_source_batch;
+      *inout_feedback_source_batch = NULL;
+    }
     iree_hal_amdgpu_host_queue_emit_kernel_submission_prefix(queue, resolution,
                                                              &submission);
     submission.pre_signal_action = publication_retire_action;
@@ -1609,8 +1622,8 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_ib_with_binding_table_fixup(
     iree_hal_amdgpu_host_queue_publish_submission_kernargs(queue, &submission);
     iree_hal_amdgpu_queue_upload_ring_publish_host_writes(
         &queue->queue_upload_ring);
-    iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                    submission_epoch);
+    iree_hal_amdgpu_host_queue_publish_submission_epoch(queue,
+                                                        submission_epoch);
     if (queue_device_event) {
       iree_hal_amdgpu_host_queue_commit_queue_device_start_packet(
           queue, resolution, start_packet_id, queue_device_event);
@@ -1738,8 +1751,7 @@ uint64_t iree_hal_amdgpu_host_queue_finish_barrier_submission(
                             iree_hal_amdgpu_host_queue_const_frontier(queue),
                             submission_epoch);
   }
-  iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                  submission_epoch);
+  iree_hal_amdgpu_host_queue_publish_submission_epoch(queue, submission_epoch);
   if (complete_with_queue_device_event) {
     iree_hal_amdgpu_pm4_ib_slot_t* pm4_ib_slot =
         &queue->pm4_ib_slots[(first_packet_id + aql_packet_count - 1) &

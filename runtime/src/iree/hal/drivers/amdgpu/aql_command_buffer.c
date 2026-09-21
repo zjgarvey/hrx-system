@@ -18,6 +18,7 @@
 #include "iree/hal/drivers/amdgpu/device/blit.h"
 #include "iree/hal/drivers/amdgpu/device/dispatch.h"
 #include "iree/hal/drivers/amdgpu/executable.h"
+#include "iree/hal/drivers/amdgpu/feedback_state.h"
 #include "iree/hal/drivers/amdgpu/transient_buffer.h"
 #include "iree/hal/drivers/amdgpu/util/aql_emitter.h"
 #include "iree/hal/drivers/amdgpu/util/kernarg_ring.h"
@@ -169,6 +170,9 @@ typedef struct iree_hal_amdgpu_aql_command_buffer_t {
   iree_arena_allocator_t recording_arena;
   // Resource set retaining direct buffers and executables when not unretained.
   iree_hal_resource_set_t* resource_set;
+  // Borrowed distinct executable identities used to retain feedback source
+  // metadata independently at queue admission, including UNRETAINED mode.
+  iree_hal_amdgpu_feedback_source_list_t feedback_sources;
   // Direct buffer ordinal table captured while recording.
   struct {
     // First static buffer page in ordinal order.
@@ -299,6 +303,8 @@ static bool iree_hal_amdgpu_aql_command_buffer_prepublish_enabled(
 
 static void iree_hal_amdgpu_aql_command_buffer_reset_resources(
     iree_hal_amdgpu_aql_command_buffer_t* command_buffer) {
+  iree_hal_amdgpu_feedback_source_list_deinitialize(
+      command_buffer->host_allocator, &command_buffer->feedback_sources);
   iree_hal_resource_set_free(command_buffer->resource_set);
   command_buffer->resource_set = NULL;
   command_buffer->static_buffers.first_page = NULL;
@@ -892,6 +898,8 @@ iree_status_t iree_hal_amdgpu_aql_command_buffer_create(
       binding_capacity, (uint8_t*)command_buffer + validation_state_offset,
       &iree_hal_amdgpu_aql_command_buffer_vtable, &command_buffer->base);
   command_buffer->host_allocator = host_allocator;
+  iree_hal_amdgpu_feedback_source_list_initialize(
+      &command_buffer->feedback_sources);
   command_buffer->device_allocator = device_allocator;
   command_buffer->block_pools.program = program_block_pool;
   command_buffer->block_pools.resource_set = resource_set_block_pool;
@@ -980,6 +988,17 @@ uint64_t iree_hal_amdgpu_aql_command_buffer_profile_id(
   iree_hal_amdgpu_aql_command_buffer_t* command_buffer =
       iree_hal_amdgpu_aql_command_buffer_cast(base_command_buffer);
   return command_buffer->profile.id;
+}
+
+iree_hal_executable_t* const*
+iree_hal_amdgpu_aql_command_buffer_feedback_sources(
+    iree_hal_command_buffer_t* base_command_buffer,
+    iree_host_size_t* out_count) {
+  IREE_ASSERT_ARGUMENT(out_count);
+  iree_hal_amdgpu_aql_command_buffer_t* command_buffer =
+      iree_hal_amdgpu_aql_command_buffer_cast(base_command_buffer);
+  *out_count = command_buffer->feedback_sources.count;
+  return command_buffer->feedback_sources.values;
 }
 
 const iree_hal_amdgpu_aql_command_buffer_dispatch_summary_t*
@@ -2955,6 +2974,13 @@ static iree_status_t iree_hal_amdgpu_aql_command_buffer_dispatch(
   IREE_RETURN_IF_ERROR(
       iree_hal_amdgpu_aql_command_buffer_calculate_dispatch_layout(
           command_buffer, &inputs, &plan, &layout));
+  // This sidecar is deliberately independent of the mode-gated resource set:
+  // UNRETAINED recording still guarantees input resources remain valid for
+  // the command-buffer lifetime, and queue admission takes the real retain
+  // before publishing a block.
+  IREE_RETURN_IF_ERROR(iree_hal_amdgpu_feedback_source_list_insert(
+      command_buffer->host_allocator, &command_buffer->feedback_sources,
+      executable));
 
   iree_hal_amdgpu_command_buffer_dispatch_command_t* dispatch_command = NULL;
   iree_hal_amdgpu_command_buffer_binding_source_t* binding_sources = NULL;

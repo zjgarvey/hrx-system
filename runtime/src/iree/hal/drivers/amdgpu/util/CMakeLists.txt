@@ -12,19 +12,51 @@ iree_add_all_subdirs()
 if(IREE_HAL_DRIVER_AMDGPU)
 iree_cc_library(
   NAME
-    libhsa
+    libhsa_headers
   HDRS
     "libhsa.h"
   TEXTUAL_HDRS
     "libhsa_tables.h"
+  DEPS
+    iree::base
+    iree::third_party::hsa_runtime_headers
+  PUBLIC
+)
+endif()
+
+if(IREE_HAL_DRIVER_AMDGPU)
+iree_cc_library(
+  NAME
+    libhsa
   SRCS
     "libhsa.c"
   DEPS
+    ::libhsa_headers
     iree::base
     iree::base::internal
     iree::base::internal::dynamic_library
     iree::base::internal::path
-    iree::third_party::hsa_runtime_headers
+  PUBLIC
+)
+endif()
+
+if(IREE_HAL_DRIVER_AMDGPU)
+iree_cc_library(
+  NAME
+    libhsa_test_instrumented
+  SRCS
+    "libhsa.c"
+  DEPS
+    ::libhsa_headers
+    iree::base
+    iree::base::internal
+    iree::base::internal::dynamic_library
+    iree::base::internal::path
+    iree::base::threading
+  DEFINES
+    "IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION"
+  TESTONLY
+  ALWAYSLINK
   PUBLIC
 )
 endif()
@@ -38,7 +70,7 @@ iree_cc_library(
   SRCS
     "libaqlprofile.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     iree::base
     iree::base::internal
     iree::base::internal::dynamic_library
@@ -58,6 +90,30 @@ iree_cc_test(
     "libhsa_test.cc"
   DEPS
     ::libhsa
+    ::libhsa_headers
+    iree::base
+    iree::testing::gtest
+    iree::testing::gtest_main
+  LABELS
+    "iree-build-requirement=runtime.hal.amdgpu"
+    "iree-run-requirement=runtime.resource.amd_gpu"
+    "runtime-resource=amd-gpu"
+  RESOURCE_GROUP
+    iree-hal-drivers-amdgpu-tests
+)
+endif()
+
+if(IREE_HAL_DRIVER_AMDGPU)
+iree_cc_test(
+  NAME
+    libhsa_test_instrumented_test
+  SRCS
+    "libhsa_test.cc"
+  DEFINES
+    "IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION"
+  DEPS
+    ::libhsa_headers
+    ::libhsa_test_instrumented
     iree::base
     iree::testing::gtest
     iree::testing::gtest_main
@@ -99,7 +155,7 @@ iree_cc_library(
   SRCS
     "topology.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     iree::base
     iree::hal
   PUBLIC
@@ -115,7 +171,7 @@ iree_cc_library(
   SRCS
     "agent_target.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     iree::base
     iree::hal::drivers::amdgpu::target::identity
   PUBLIC
@@ -150,6 +206,7 @@ iree_cc_test(
     "topology_test.cc"
   DEPS
     ::libhsa
+    ::libhsa_headers
     ::topology
     iree::base
     iree::hal
@@ -345,7 +402,7 @@ iree_cc_library(
   SRCS
     "info.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     iree::base
   PUBLIC
 )
@@ -389,7 +446,7 @@ iree_cc_library(
   SRCS
     "pm4_program.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     ::packet
     iree::base
   PUBLIC
@@ -431,7 +488,7 @@ iree_cc_library(
     "queue_upload_ring.c"
     "signal_pool.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     iree::async
     iree::base
     iree::base::internal
@@ -453,7 +510,7 @@ iree_cc_library(
   SRCS
     "vmem.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     ::topology
     iree::base
     iree::hal
@@ -470,7 +527,7 @@ iree_cc_library(
   SRCS
     "feedback_channel.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     ::topology
     ::vmem
     iree::base
@@ -490,7 +547,7 @@ iree_cc_library(
   SRCS
     "shadow_map.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     ::vmem
     iree::base
     iree::base::internal
@@ -508,7 +565,7 @@ iree_cc_library(
   SRCS
     "block_pool.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     iree::base
     iree::base::threading
     iree::hal::memory::tracing
@@ -527,7 +584,7 @@ iree_cc_library(
   DEPS
     ::agent_target
     ::device_library_target
-    ::libhsa
+    ::libhsa_headers
     ::loaded_code_object
     ::topology
     iree::base
@@ -547,7 +604,7 @@ iree_cc_library(
   SRCS
     "loaded_code_object.c"
   DEPS
-    ::libhsa
+    ::libhsa_headers
     iree::base
   PUBLIC
 )
@@ -769,6 +826,7 @@ iree_cc_test(
     "aql_ring_test.cc"
   DEPS
     ::libhsa
+    ::libhsa_headers
     ::packet
     ::queue_primitives
     iree::base
@@ -833,6 +891,7 @@ iree_cc_test(
   DEPS
     ::kfd
     ::libhsa
+    ::libhsa_headers
     ::topology
     iree::base
     iree::testing::gtest
@@ -854,6 +913,7 @@ iree_cc_test(
     "notification_ring_test.cc"
   DEPS
     ::libhsa
+    ::libhsa_headers
     ::queue_primitives
     iree::async
     iree::async::platform
@@ -999,6 +1059,7 @@ iree_cc_test(
     "pm4_dispatch_live_test.cc"
   DEPS
     ::libhsa
+    ::libhsa_headers
     ::packet
     ::pm4_atomic
     ::pm4_dispatch
@@ -1234,6 +1295,7 @@ iree_cc_test(
     ::feedback_channel
     ::feedback_channel_test_kernels
     ::libhsa
+    ::libhsa_headers
     ::packet
     ::queue_primitives
     ::topology

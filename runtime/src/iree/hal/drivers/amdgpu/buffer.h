@@ -138,6 +138,14 @@ bool iree_hal_amdgpu_buffer_uses_release_callback(
     iree_hal_buffer_t* buffer,
     iree_hal_buffer_release_callback_t release_callback);
 
+// Returns the user data for a direct AMDGPU buffer whose release callback
+// function is exactly |release_fn|. This is used by allocator components that
+// give callback-owned buffers a heap-stable identity independent of the
+// allocator instance that later operates on them.
+bool iree_hal_amdgpu_buffer_query_release_callback(
+    iree_hal_buffer_t* buffer, iree_hal_buffer_release_fn_t release_fn,
+    void** out_user_data);
+
 // Disarms callback-owned storage that has already been released externally.
 //
 // |buffer| must be a direct AMDGPU buffer using exactly |release_callback|.

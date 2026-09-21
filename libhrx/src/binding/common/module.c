@@ -614,6 +614,7 @@ iree_status_t iree_hal_streaming_module_create_from_memory(
       iree_allocator_malloc(host_allocator, sizeof(*module), (void**)&module));
   memset(module, 0, sizeof(*module));
   iree_atomic_ref_count_init(&module->ref_count);
+  iree_atomic_store(&module->public_live, 1, iree_memory_order_relaxed);
   iree_slim_mutex_initialize(&module->global_mutex);
   module->context = context;
   iree_hal_streaming_context_retain(context);
@@ -785,6 +786,17 @@ void iree_hal_streaming_module_release(iree_hal_streaming_module_t* module) {
   if (module && iree_atomic_ref_count_dec(&module->ref_count) == 1) {
     iree_hal_streaming_module_destroy(module);
   }
+}
+
+void iree_hal_streaming_module_invalidate(iree_hal_streaming_module_t* module) {
+  IREE_ASSERT_ARGUMENT(module);
+  iree_atomic_store(&module->public_live, 0, iree_memory_order_release);
+}
+
+bool iree_hal_streaming_module_is_live(
+    const iree_hal_streaming_module_t* module) {
+  return module &&
+         iree_atomic_load(&module->public_live, iree_memory_order_acquire) != 0;
 }
 
 static bool iree_hal_streaming_module_symbol_name_matches(

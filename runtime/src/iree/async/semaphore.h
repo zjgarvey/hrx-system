@@ -446,6 +446,24 @@ IREE_API_EXPORT uint8_t iree_async_semaphore_query_frontier(
 IREE_API_EXPORT void iree_async_semaphore_fail(
     iree_async_semaphore_t* semaphore, iree_status_t status);
 
+// Installs a terminal failure without dispatching timepoints or invoking the
+// backend on_fail hook. Takes ownership of |status|. Returns true only to the
+// first caller that installs the failure; later callers free |status| and
+// return false.
+//
+// The successful caller must later invoke
+// iree_async_semaphore_dispatch_prepared_failure() exactly once. Splitting the
+// operation lets a consumer prepare a batch of semaphore states before any
+// synchronous callback becomes observable.
+IREE_API_EXPORT bool iree_async_semaphore_prepare_failure(
+    iree_async_semaphore_t* semaphore, iree_status_t status);
+
+// Dispatches timepoints and the backend on_fail hook for a failure previously
+// installed by a successful iree_async_semaphore_prepare_failure() call.
+// Must be called exactly once by that successful caller.
+IREE_API_EXPORT void iree_async_semaphore_dispatch_prepared_failure(
+    iree_async_semaphore_t* semaphore);
+
 // Returns the status code of the semaphore's failure, or IREE_STATUS_OK if
 // the semaphore has not failed. Thread-safe with acquire semantics.
 static inline iree_status_code_t iree_async_semaphore_query_status(
@@ -588,6 +606,27 @@ IREE_API_EXPORT iree_status_t iree_async_semaphore_publish_untainted(
     iree_async_semaphore_t* semaphore, uint64_t value,
     const iree_async_frontier_t* frontier);
 
+// Idempotently prepares an untainted timeline publication without dispatching
+// timepoints. The timeline value, frontier, and untainted watermark are made
+// visible before this returns. Callers must later invoke
+// iree_async_semaphore_dispatch_prepared_untainted() for |value|.
+IREE_API_EXPORT iree_status_t iree_async_semaphore_prepare_untainted(
+    iree_async_semaphore_t* semaphore, uint64_t value,
+    const iree_async_frontier_t* frontier);
+
+// Allocation-free variant of iree_async_semaphore_prepare_untainted().
+// Returns only the terminal status code when the semaphore is already failed.
+// Intended for irreversible teardown paths that cannot clone status payloads.
+IREE_API_EXPORT iree_status_code_t iree_async_semaphore_prepare_untainted_code(
+    iree_async_semaphore_t* semaphore, uint64_t value,
+    const iree_async_frontier_t* frontier);
+
+// Dispatches timepoints satisfied by a value previously made visible through
+// iree_async_semaphore_prepare_untainted(). If a failure won before this
+// dispatch linearizes, the failure owner is responsible for dispatch instead.
+IREE_API_EXPORT void iree_async_semaphore_dispatch_prepared_untainted(
+    iree_async_semaphore_t* semaphore, uint64_t value);
+
 // Merges |frontier| into the semaphore's accumulated frontier without
 // advancing the timeline or dispatching timepoints. Used by HAL submission
 // paths to record causal context at submission time so same-queue wait elision
@@ -654,9 +693,8 @@ IREE_API_EXPORT iree_status_t iree_async_semaphore_advance_timeline(
 IREE_API_EXPORT void iree_async_semaphore_dispatch_timepoints(
     iree_async_semaphore_t* semaphore, uint64_t value);
 
-// Dispatches all timepoints with the given failure status.
-// Takes ownership of |status| (clones for each timepoint, frees original).
-// Called by fail() implementations.
+// Dispatches all timepoints with the given borrowed failure status. Clones the
+// status for each callback and does not take ownership of |status|.
 IREE_API_EXPORT void iree_async_semaphore_dispatch_timepoints_failed(
     iree_async_semaphore_t* semaphore, iree_status_t status);
 

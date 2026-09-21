@@ -6,14 +6,22 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <utility>
 
+#include "common/graph.h"
 #include "common/internal.h"
 #include "iree/base/api.h"
 #include "iree/base/internal/atomics.h"
 #include "iree/testing/gtest.h"
 #include "iree/testing/status_matchers.h"
+
+#if !defined(IREE_HAL_STREAMING_TEST_INSTRUMENTATION)
+#error "graph_exec_test requires the instrumented common provider"
+#endif  // IREE_HAL_STREAMING_TEST_INSTRUMENTATION
 
 namespace {
 
@@ -22,6 +30,81 @@ namespace {
 void SetFlag(void* user_data) {
   static_cast<std::atomic<bool>*>(user_data)->store(true,
                                                     std::memory_order_release);
+}
+
+void IncrementSubmissionCount(void* user_data) {
+  ++*static_cast<int*>(user_data);
+}
+
+// A host call that exposes exact accepted/running and release transitions.
+// Tests wait only on predicates and never use a deadline.
+struct HostCallLatch {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool entered = false;
+  bool released = false;
+
+  void WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return entered; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex);
+    released = true;
+    cv.notify_all();
+  }
+};
+
+void BlockingHostCall(void* user_data) {
+  auto* latch = static_cast<HostCallLatch*>(user_data);
+  std::unique_lock<std::mutex> lock(latch->mutex);
+  latch->entered = true;
+  latch->cv.notify_all();
+  latch->cv.wait(lock, [&] { return latch->released; });
+}
+
+// Reports that executable mutation reached its active-launch wait. The
+// callback runs under executable serialization and therefore must not reenter
+// the executable or binding API.
+struct ActiveLaunchWaitLatch {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool reached = false;
+
+  void WaitUntilReached() {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return reached; });
+  }
+};
+
+iree_status_t NotifyActiveLaunchWait(void* user_data) {
+  auto* latch = static_cast<ActiveLaunchWaitLatch*>(user_data);
+  std::lock_guard<std::mutex> lock(latch->mutex);
+  latch->reached = true;
+  latch->cv.notify_all();
+  return iree_ok_status();
+}
+
+struct FailActiveLaunchWaitOnce {
+  bool called = false;
+};
+
+iree_status_t InjectActiveLaunchWaitFailure(void* user_data) {
+  auto* state = static_cast<FailActiveLaunchWaitOnce*>(user_data);
+  EXPECT_FALSE(state->called);
+  state->called = true;
+  return iree_make_status(IREE_STATUS_UNAVAILABLE,
+                          "injected active launch wait failure");
+}
+
+iree_status_t FailDeferredHostCall(void* user_data,
+                                   iree_hal_host_call_context_t* context) {
+  (void)context;
+  auto* call_count = static_cast<std::atomic<int>*>(user_data);
+  call_count->fetch_add(1, std::memory_order_acq_rel);
+  return iree_make_status(IREE_STATUS_PERMISSION_DENIED,
+                          "injected terminal graph execution failure");
 }
 
 // Runs |cleanup| when it leaves scope. A test body builds its handles across a
@@ -47,6 +130,46 @@ class ScopeExit {
 template <typename Cleanup>
 ScopeExit(Cleanup) -> ScopeExit<Cleanup>;
 
+struct FailNthAllocator {
+  iree_allocator_t delegate = iree_allocator_system();
+  std::atomic<int> fail_on_allocation{0};
+  std::atomic<int> allocation_attempt_count{0};
+
+  static iree_status_t Control(void* self, iree_allocator_command_t command,
+                               const void* params, void** inout_ptr) {
+    auto* allocator = static_cast<FailNthAllocator*>(self);
+    if (command == IREE_ALLOCATOR_COMMAND_MALLOC ||
+        command == IREE_ALLOCATOR_COMMAND_CALLOC ||
+        command == IREE_ALLOCATOR_COMMAND_REALLOC) {
+      const int allocation_attempt =
+          allocator->allocation_attempt_count.fetch_add(
+              1, std::memory_order_acq_rel) +
+          1;
+      if (allocation_attempt ==
+          allocator->fail_on_allocation.load(std::memory_order_acquire)) {
+        return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                "injected allocation failure");
+      }
+    }
+    return allocator->delegate.ctl(allocator->delegate.self, command, params,
+                                   inout_ptr);
+  }
+
+  iree_allocator_t AsAllocator() {
+    return iree_allocator_t{this, &FailNthAllocator::Control};
+  }
+};
+
+void ExpectArenaMatchesCheckpoint(const iree_arena_allocator_t& arena,
+                                  const iree_arena_checkpoint_t& checkpoint) {
+  EXPECT_EQ(checkpoint.allocation_head, arena.allocation_head);
+  EXPECT_EQ(checkpoint.block_head, arena.block_head);
+  EXPECT_EQ(checkpoint.block_tail, arena.block_tail);
+  EXPECT_EQ(checkpoint.total_allocation_size, arena.total_allocation_size);
+  EXPECT_EQ(checkpoint.used_allocation_size, arena.used_allocation_size);
+  EXPECT_EQ(checkpoint.block_bytes_remaining, arena.block_bytes_remaining);
+}
+
 // Runs streaming graph launches against the host CPU device. Launches take the
 // same block submit path they take on an accelerator; the event records they
 // enqueue resolve to queue barriers because the device advertises no timestamp
@@ -67,7 +190,7 @@ class GraphExecTest : public ::testing::Test {
     iree_slim_mutex_initialize(&device_entry_.primary_context_mutex);
     iree_slim_mutex_initialize(&device_entry_.graph_memory_mutex);
     iree_arena_block_pool_initialize(/*block_size=*/64 * 1024,
-                                     iree_allocator_system(),
+                                     device_allocator_.AsAllocator(),
                                      &device_entry_.block_pool);
 
     iree_hal_streaming_context_flags_t context_flags = {};
@@ -106,6 +229,8 @@ class GraphExecTest : public ::testing::Test {
     }
   }
 
+  // Host allocator backing the fixture's device block pool.
+  FailNthAllocator device_allocator_;
   // Registry entry backing |context_|; outlives every context created from it.
   iree_hal_streaming_device_t device_entry_ = {};
   // Context owning the graphs, events, and streams each test builds.
@@ -117,13 +242,250 @@ class GraphExecTest : public ::testing::Test {
   // launch left in flight; hrx_cpu_shutdown() above is what drains the workers,
   // so the flag has to outlive the test body it is read in.
   std::atomic<bool> graph_host_node_ran_{false};
-  // Set by the host call a test enqueues behind an aborted launch to give the
-  // blocks that launch may have left in flight their chance to run. A fixture
-  // member for the same reason, and the case is not hypothetical here: the
-  // path that reads this flag false is the path where the callback is still
-  // pending as the test body returns.
-  std::atomic<bool> stream_marker_ran_{false};
 };
+
+TEST_F(GraphExecTest, RootNodeBlockAllocationFailureIsAtomic) {
+  enum class NodeKind { kKernel, kMemcpy, kEvent, kChild };
+  for (NodeKind kind : {NodeKind::kKernel, NodeKind::kMemcpy, NodeKind::kEvent,
+                        NodeKind::kChild}) {
+    iree_hal_streaming_graph_t* graph = nullptr;
+    IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+        context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+        &graph));
+
+    // Make the node, node-list block, and root-list block independent backing
+    // allocations, then reject the third. This targets the only insertion
+    // allocation that occurs after the node attrs have taken their references.
+    FailNthAllocator allocator;
+    allocator.fail_on_allocation = 3;
+    iree_arena_block_pool_t fault_pool;
+    iree_arena_block_pool_initialize(/*total_block_size=*/64,
+                                     allocator.AsAllocator(), &fault_pool);
+    iree_arena_deinitialize(&graph->arena);
+    iree_arena_initialize(&fault_pool, &graph->arena);
+    graph->arena_allocator = iree_arena_allocator(&graph->arena);
+
+    iree_hal_streaming_module_t module = {};
+    iree_atomic_ref_count_init(&module.ref_count);
+    iree_atomic_store(&module.public_live, 1, iree_memory_order_release);
+    iree_hal_streaming_symbol_t symbol = {};
+    symbol.type = IREE_HAL_STREAMING_SYMBOL_TYPE_FUNCTION;
+    symbol.module = &module;
+    iree_hal_streaming_dispatch_params_t dispatch_params = {};
+
+    iree_hal_streaming_buffer_t dst_buffer = {};
+    iree_hal_streaming_buffer_t src_buffer = {};
+    iree_atomic_ref_count_init(&dst_buffer.ref_count);
+    iree_atomic_ref_count_init(&src_buffer.ref_count);
+    dst_buffer.size = 1;
+    src_buffer.size = 1;
+    const iree_hal_streaming_buffer_ref_t dst_ref = {
+        .buffer = &dst_buffer,
+        .offset = 0,
+    };
+    const iree_hal_streaming_buffer_ref_t src_ref = {
+        .buffer = &src_buffer,
+        .offset = 0,
+    };
+
+    iree_hal_streaming_event_t* event = nullptr;
+    IREE_ASSERT_OK(iree_hal_streaming_event_create(
+        context_, IREE_HAL_STREAMING_EVENT_FLAG_DISABLE_TIMING,
+        iree_allocator_system(), &event));
+    iree_hal_streaming_graph_t* child_graph = nullptr;
+    IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+        context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+        &child_graph));
+
+    const int32_t module_refs = iree_atomic_ref_count_load(&module.ref_count);
+    const int32_t dst_refs = iree_atomic_ref_count_load(&dst_buffer.ref_count);
+    const int32_t src_refs = iree_atomic_ref_count_load(&src_buffer.ref_count);
+    const int32_t event_refs = iree_atomic_ref_count_load(&event->ref_count);
+    const int32_t child_refs =
+        iree_atomic_ref_count_load(&child_graph->ref_count);
+
+    iree_hal_streaming_graph_node_t* node = nullptr;
+    iree_status_t status = iree_ok_status();
+    switch (kind) {
+      case NodeKind::kKernel:
+        status = iree_hal_streaming_graph_add_kernel_node(
+            graph, nullptr, 0, &symbol, &dispatch_params, &node);
+        break;
+      case NodeKind::kMemcpy:
+        status = iree_hal_streaming_graph_add_copy_buffer_node(
+            graph, nullptr, 0, dst_ref, src_ref, 1, &node);
+        break;
+      case NodeKind::kEvent:
+        status = iree_hal_streaming_graph_add_event_node(
+            graph, nullptr, 0, IREE_HAL_STREAMING_GRAPH_NODE_TYPE_EVENT_RECORD,
+            event, &node);
+        break;
+      case NodeKind::kChild:
+        status = iree_hal_streaming_graph_add_child_graph_node(
+            graph, nullptr, 0, child_graph, &node);
+        break;
+    }
+    IREE_EXPECT_STATUS_IS(IREE_STATUS_RESOURCE_EXHAUSTED, status);
+    EXPECT_EQ(nullptr, node);
+    EXPECT_EQ(0u, graph->node_count);
+    EXPECT_EQ(0u, graph->root_count);
+    EXPECT_EQ(nullptr, graph->node_blocks);
+    EXPECT_EQ(nullptr, graph->root_blocks);
+    EXPECT_EQ(0u, graph->next_clone_source_node_index);
+    EXPECT_EQ(module_refs, iree_atomic_ref_count_load(&module.ref_count));
+    EXPECT_EQ(dst_refs, iree_atomic_ref_count_load(&dst_buffer.ref_count));
+    EXPECT_EQ(src_refs, iree_atomic_ref_count_load(&src_buffer.ref_count));
+    EXPECT_EQ(event_refs, iree_atomic_ref_count_load(&event->ref_count));
+    EXPECT_EQ(child_refs, iree_atomic_ref_count_load(&child_graph->ref_count));
+
+    // The unused arena allocations do not poison the graph. A later insertion
+    // and instantiation must observe one ordinary root and no zombie node.
+    iree_hal_streaming_graph_node_t* replacement = nullptr;
+    IREE_ASSERT_OK(iree_hal_streaming_graph_add_empty_node(graph, nullptr, 0,
+                                                           &replacement));
+    ASSERT_NE(nullptr, replacement);
+    EXPECT_EQ(1u, graph->node_count);
+    EXPECT_EQ(1u, graph->root_count);
+    iree_hal_streaming_graph_exec_t* exec = nullptr;
+    IREE_ASSERT_OK(iree_hal_streaming_graph_instantiate(
+        graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec));
+    iree_hal_streaming_graph_exec_release(exec);
+
+    iree_hal_streaming_event_release(event);
+    iree_hal_streaming_graph_release(child_graph);
+    iree_hal_streaming_graph_release(graph);
+    iree_arena_block_pool_deinitialize(&fault_pool);
+  }
+}
+
+TEST_F(GraphExecTest,
+       BatchParameterRebuildFailuresRestoreBytesAndKeepArenaUsageFlat) {
+  static constexpr iree_host_size_t kEmptyNodeCount = 2048;
+  iree_hal_streaming_graph_t* graph = nullptr;
+  iree_hal_streaming_graph_exec_t* exec = nullptr;
+  ScopeExit release_handles([&] {
+    iree_hal_streaming_graph_exec_release(exec);
+    iree_hal_streaming_graph_release(graph);
+  });
+  ScopeExit reset_allocator([&] {
+    device_allocator_.fail_on_allocation.store(0, std::memory_order_release);
+  });
+
+  IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+      context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+      &graph));
+  std::array<uint8_t, 4> initial_params = {1, 2, 3, 4};
+  std::array<uint8_t, 4> initial_param_array = {5, 6, 7, 8};
+  iree_hal_streaming_graph_node_t* batch_node = nullptr;
+  IREE_ASSERT_OK(iree_hal_streaming_graph_add_batch_mem_op_node(
+      graph, /*dependencies=*/nullptr, /*dependency_count=*/0,
+      initial_params.data(), initial_params.size(), initial_param_array.data(),
+      initial_param_array.size(), &batch_node));
+  for (iree_host_size_t i = 0; i < kEmptyNodeCount; ++i) {
+    IREE_ASSERT_OK(iree_hal_streaming_graph_add_empty_node(
+        graph, /*dependencies=*/nullptr, /*dependency_count=*/0,
+        /*out_node=*/nullptr));
+  }
+  IREE_ASSERT_OK(iree_hal_streaming_graph_instantiate(
+      graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec));
+
+  iree_hal_streaming_graph_t* snapshot_graph = nullptr;
+  iree_arena_checkpoint_t checkpoint = {};
+  iree_hal_streaming_graph_batch_mem_op_node_attrs_t original_attrs = {};
+  std::array<uint8_t, 4> original_params;
+  std::array<uint8_t, 4> original_param_array;
+  {
+    iree_hal_streaming_graph_exec_state_guard_t guard = {};
+    IREE_ASSERT_OK(iree_hal_streaming_graph_exec_state_begin(exec, &guard));
+    ScopeExit end_state(
+        [&] { iree_hal_streaming_graph_exec_state_end(&guard); });
+    iree_hal_streaming_graph_node_t* snapshot_node =
+        iree_hal_streaming_graph_exec_state_resolve_node(&guard, batch_node);
+    ASSERT_NE(nullptr, snapshot_node);
+    snapshot_graph = snapshot_node->graph;
+    if (snapshot_graph->arena.block_bytes_remaining < 256) {
+      void* padding = nullptr;
+      IREE_ASSERT_OK(iree_arena_allocate(
+          &snapshot_graph->arena,
+          snapshot_graph->arena.block_bytes_remaining + 1, &padding));
+    }
+    ASSERT_GE(snapshot_graph->arena.block_bytes_remaining, 256u);
+    checkpoint = iree_arena_checkpoint_save(&snapshot_graph->arena);
+    original_attrs = snapshot_node->attrs.batch_mem_op;
+    memcpy(original_params.data(), original_attrs.params,
+           original_params.size());
+    memcpy(original_param_array.data(), original_attrs.param_array,
+           original_param_array.size());
+  }
+
+  std::array<uint8_t, 64> new_params;
+  std::array<uint8_t, 64> new_param_array;
+  new_params.fill(0xA5);
+  new_param_array.fill(0x5A);
+  for (int iteration = 0; iteration < 4; ++iteration) {
+    device_allocator_.allocation_attempt_count.store(0,
+                                                     std::memory_order_release);
+    device_allocator_.fail_on_allocation.store(1, std::memory_order_release);
+    iree_status_t status =
+        iree_hal_streaming_graph_exec_set_batch_mem_op_node_params(
+            exec, batch_node, new_params.data(), new_params.size(),
+            new_param_array.data(), new_param_array.size());
+    device_allocator_.fail_on_allocation.store(0, std::memory_order_release);
+    IREE_EXPECT_STATUS_IS(IREE_STATUS_RESOURCE_EXHAUSTED, status);
+    EXPECT_EQ(1, device_allocator_.allocation_attempt_count.load(
+                     std::memory_order_acquire));
+
+    iree_hal_streaming_graph_exec_state_guard_t guard = {};
+    IREE_ASSERT_OK(iree_hal_streaming_graph_exec_state_begin(exec, &guard));
+    ScopeExit end_state(
+        [&] { iree_hal_streaming_graph_exec_state_end(&guard); });
+    iree_hal_streaming_graph_node_t* snapshot_node =
+        iree_hal_streaming_graph_exec_state_resolve_node(&guard, batch_node);
+    ASSERT_NE(nullptr, snapshot_node);
+    const iree_hal_streaming_graph_batch_mem_op_node_attrs_t& attrs =
+        snapshot_node->attrs.batch_mem_op;
+    EXPECT_EQ(original_attrs.params, attrs.params);
+    EXPECT_EQ(original_attrs.params_size, attrs.params_size);
+    EXPECT_EQ(original_attrs.params_capacity, attrs.params_capacity);
+    EXPECT_EQ(0, memcmp(original_params.data(), attrs.params,
+                        original_params.size()));
+    EXPECT_EQ(original_attrs.param_array, attrs.param_array);
+    EXPECT_EQ(original_attrs.param_array_size, attrs.param_array_size);
+    EXPECT_EQ(original_attrs.param_array_capacity, attrs.param_array_capacity);
+    EXPECT_EQ(0, memcmp(original_param_array.data(), attrs.param_array,
+                        original_param_array.size()));
+    ExpectArenaMatchesCheckpoint(snapshot_graph->arena, checkpoint);
+  }
+
+  device_allocator_.allocation_attempt_count.store(0,
+                                                   std::memory_order_release);
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_set_batch_mem_op_node_params(
+      exec, batch_node, new_params.data(), new_params.size(),
+      new_param_array.data(), new_param_array.size()));
+  {
+    iree_hal_streaming_graph_exec_state_guard_t guard = {};
+    IREE_ASSERT_OK(iree_hal_streaming_graph_exec_state_begin(exec, &guard));
+    ScopeExit end_state(
+        [&] { iree_hal_streaming_graph_exec_state_end(&guard); });
+    iree_hal_streaming_graph_node_t* snapshot_node =
+        iree_hal_streaming_graph_exec_state_resolve_node(&guard, batch_node);
+    ASSERT_NE(nullptr, snapshot_node);
+    const iree_hal_streaming_graph_batch_mem_op_node_attrs_t& committed_attrs =
+        snapshot_node->attrs.batch_mem_op;
+    EXPECT_NE(original_attrs.params, committed_attrs.params);
+    EXPECT_EQ(new_params.size(), committed_attrs.params_size);
+    EXPECT_EQ(new_params.size(), committed_attrs.params_capacity);
+    EXPECT_EQ(0, memcmp(new_params.data(), committed_attrs.params,
+                        new_params.size()));
+    EXPECT_NE(original_attrs.param_array, committed_attrs.param_array);
+    EXPECT_EQ(new_param_array.size(), committed_attrs.param_array_size);
+    EXPECT_EQ(new_param_array.size(), committed_attrs.param_array_capacity);
+    EXPECT_EQ(0, memcmp(new_param_array.data(), committed_attrs.param_array,
+                        new_param_array.size()));
+    EXPECT_GT(snapshot_graph->arena.used_allocation_size,
+              checkpoint.used_allocation_size);
+  }
+}
 
 // A replayed event record ends its event's association with the graph a
 // capture-time record left on it, and the launch releases every reference it
@@ -302,23 +664,332 @@ TEST_F(GraphExecTest, ExecEventNodeTakesOnlyItsOwnContextsEvent) {
       replacement));
 }
 
-// A launch answers the cross-context record rule once for the whole executable,
-// and a record buried in a child graph is one of the records it answers for:
-// instantiating a child graph node folds the child's answer into the parent's,
-// so the launch below is refused before any of the graph is submitted.
-//
-// Nothing else in this executable would report the refusal in time. The
-// parent's own walk holds no record node, so without the fold the launch would
-// submit the host call ahead of the child and only reach the rule at the
-// child's record block, leaving that host call in flight on a stream whose
-// timeline the failed launch never advanced.
-//
-// The host-node read is what carries the fold. Drop the fold and the launch is
-// still refused with the same code and the same message, raised by the child's
-// own record block from inside the walk, so the status read below passes
-// either way: it pins that the refusal reaches the caller, not where it was
-// decided. Weaken the host-node read and nothing here tells the fold from its
-// absence.
+TEST_F(GraphExecTest, StateGuardSerializesUpdatesAndRejectsRetiredNodes) {
+  iree_hal_streaming_graph_t* first_graph = nullptr;
+  iree_hal_streaming_graph_t* second_graph = nullptr;
+  iree_hal_streaming_graph_t* third_graph = nullptr;
+  iree_hal_streaming_graph_exec_t* exec = nullptr;
+  ScopeExit release_handles([&] {
+    iree_hal_streaming_graph_exec_release(exec);
+    iree_hal_streaming_graph_release(third_graph);
+    iree_hal_streaming_graph_release(second_graph);
+    iree_hal_streaming_graph_release(first_graph);
+  });
+
+  iree_hal_streaming_graph_node_t* first_node = nullptr;
+  iree_hal_streaming_graph_node_t* second_node = nullptr;
+  iree_hal_streaming_graph_node_t* third_node = nullptr;
+  for (auto [graph, node] : {std::pair{&first_graph, &first_node},
+                             std::pair{&second_graph, &second_node},
+                             std::pair{&third_graph, &third_node}}) {
+    IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+        context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+        graph));
+    IREE_ASSERT_OK(iree_hal_streaming_graph_add_host_call_node(
+        *graph, /*dependencies=*/nullptr, /*dependency_count=*/0, &SetFlag,
+        &graph_host_node_ran_, node));
+  }
+  IREE_ASSERT_OK(iree_hal_streaming_graph_instantiate(
+      first_graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec));
+
+  iree_hal_streaming_graph_exec_state_guard_t first_guard = {};
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_state_begin(exec, &first_guard));
+  iree_hal_streaming_graph_exec_state_guard_t contending_guard = {};
+  EXPECT_FALSE(
+      iree_hal_streaming_graph_exec_state_try_begin(exec, &contending_guard));
+  EXPECT_NE(iree_hal_streaming_graph_exec_state_resolve_node(&first_guard,
+                                                             first_node),
+            nullptr);
+  iree_hal_streaming_graph_exec_state_end(&first_guard);
+
+  iree_hal_streaming_graph_node_t* error_node = nullptr;
+  iree_hal_streaming_graph_exec_update_result_t update_result =
+      IREE_HAL_STREAMING_GRAPH_EXEC_UPDATE_ERROR;
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_update(
+      exec, second_graph, &error_node, &update_result));
+  EXPECT_EQ(update_result, IREE_HAL_STREAMING_GRAPH_EXEC_UPDATE_SUCCESS);
+
+  iree_hal_streaming_graph_exec_state_guard_t second_guard = {};
+  IREE_ASSERT_OK(
+      iree_hal_streaming_graph_exec_state_begin(exec, &second_guard));
+  EXPECT_EQ(iree_hal_streaming_graph_exec_state_resolve_node(&second_guard,
+                                                             first_node),
+            nullptr);
+  EXPECT_NE(iree_hal_streaming_graph_exec_state_resolve_node(&second_guard,
+                                                             second_node),
+            nullptr);
+  iree_hal_streaming_graph_exec_state_end(&second_guard);
+
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_update(
+      exec, third_graph, &error_node, &update_result));
+  EXPECT_EQ(update_result, IREE_HAL_STREAMING_GRAPH_EXEC_UPDATE_SUCCESS);
+  iree_hal_streaming_graph_exec_state_guard_t third_guard = {};
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_state_begin(exec, &third_guard));
+  EXPECT_EQ(iree_hal_streaming_graph_exec_state_resolve_node(&third_guard,
+                                                             second_node),
+            nullptr);
+  EXPECT_NE(iree_hal_streaming_graph_exec_state_resolve_node(&third_guard,
+                                                             third_node),
+            nullptr);
+  iree_hal_streaming_graph_exec_state_end(&third_guard);
+
+  iree_hal_streaming_graph_exec_state_guard_t disable_guard = {};
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_rebuild_state_begin(
+      exec, nullptr, nullptr, &disable_guard));
+  iree_hal_streaming_graph_node_t* resolved_third_node =
+      iree_hal_streaming_graph_exec_state_resolve_node(&disable_guard,
+                                                       third_node);
+  ASSERT_NE(resolved_third_node, nullptr);
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_state_set_node_enabled(
+      &disable_guard, resolved_third_node, false));
+  EXPECT_FALSE(iree_hal_streaming_graph_exec_state_node_is_enabled(
+      &disable_guard, resolved_third_node));
+  iree_hal_streaming_graph_exec_state_end(&disable_guard);
+
+  iree_hal_streaming_graph_exec_state_guard_t enable_guard = {};
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_rebuild_state_begin(
+      exec, nullptr, nullptr, &enable_guard));
+  resolved_third_node = iree_hal_streaming_graph_exec_state_resolve_node(
+      &enable_guard, third_node);
+  ASSERT_NE(resolved_third_node, nullptr);
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_state_set_node_enabled(
+      &enable_guard, resolved_third_node, true));
+  EXPECT_TRUE(iree_hal_streaming_graph_exec_state_node_is_enabled(
+      &enable_guard, resolved_third_node));
+  iree_hal_streaming_graph_exec_state_end(&enable_guard);
+}
+
+TEST_F(GraphExecTest, PartialLaunchFailurePublishesReachablePrefixClosure) {
+  static constexpr iree_host_size_t kEventCount = 17;
+  std::array<iree_hal_streaming_event_t*, kEventCount> events = {};
+  HostCallLatch host_latch;
+  ActiveLaunchWaitLatch wait_latch;
+  FailNthAllocator exec_allocator;
+  iree_hal_streaming_graph_t* graph = nullptr;
+  iree_hal_streaming_graph_exec_t* exec = nullptr;
+  ScopeExit release_handles([&] {
+    host_latch.Release();
+    iree_hal_streaming_graph_exec_release(exec);
+    iree_hal_streaming_graph_release(graph);
+    for (iree_hal_streaming_event_t* event : events) {
+      iree_hal_streaming_event_release(event);
+    }
+  });
+
+  IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+      context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+      &graph));
+  iree_hal_streaming_graph_node_t* tail = nullptr;
+  IREE_ASSERT_OK(iree_hal_streaming_graph_add_host_call_node(
+      graph, /*dependencies=*/nullptr, /*dependency_count=*/0,
+      &BlockingHostCall, &host_latch, &tail));
+  for (iree_hal_streaming_event_t*& event : events) {
+    IREE_ASSERT_OK(iree_hal_streaming_event_create(
+        context_, IREE_HAL_STREAMING_EVENT_FLAG_DISABLE_TIMING,
+        iree_allocator_system(), &event));
+  }
+  AppendEventRecordChain(graph, events.data(), events.size(), &tail);
+  ASSERT_FALSE(HasFatalFailure());
+
+  // Executables capture the graph allocator at creation. Leave injection
+  // disabled while instantiating and restore the public graph immediately;
+  // the executable snapshot's private wrapper remains alive through release.
+  const iree_allocator_t old_graph_allocator = graph->host_allocator;
+  graph->host_allocator = exec_allocator.AsAllocator();
+  iree_status_t instantiate_status = iree_hal_streaming_graph_instantiate(
+      graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec);
+  graph->host_allocator = old_graph_allocator;
+  IREE_ASSERT_OK(instantiate_status);
+
+  // Sixteen event cleanup cells are inline. The first launch allocation is
+  // therefore the 17th cell, after the host block and sixteen event blocks
+  // have been accepted. Its failure must still enqueue the exact prefix
+  // closure on the stream timeline.
+  exec_allocator.allocation_attempt_count = 0;
+  exec_allocator.fail_on_allocation = 1;
+  iree_status_t launch_status =
+      iree_hal_streaming_graph_exec_launch(exec, stream_);
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_RESOURCE_EXHAUSTED, launch_status);
+  host_latch.WaitUntilEntered();
+
+  std::atomic<bool> rebuild_finished{false};
+  iree_status_t rebuild_status = iree_ok_status();
+  std::thread rebuild_thread([&] {
+    iree_hal_streaming_graph_exec_state_guard_t guard = {};
+    rebuild_status = iree_hal_streaming_graph_exec_rebuild_state_begin(
+        exec, &NotifyActiveLaunchWait, &wait_latch, &guard);
+    if (iree_status_is_ok(rebuild_status)) {
+      iree_hal_streaming_graph_exec_state_end(&guard);
+    }
+    rebuild_finished.store(true, std::memory_order_release);
+  });
+  wait_latch.WaitUntilReached();
+  EXPECT_FALSE(rebuild_finished.load(std::memory_order_acquire));
+
+  host_latch.Release();
+  rebuild_thread.join();
+  IREE_EXPECT_OK(rebuild_status);
+  IREE_EXPECT_OK(iree_hal_streaming_stream_synchronize(stream_));
+
+  // The failed attempt did not poison the executable. Its exact closure was
+  // drained, so a later launch can safely reuse compiled state and timelines.
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_launch(exec, stream_));
+  IREE_EXPECT_OK(iree_hal_streaming_stream_synchronize(stream_));
+}
+
+TEST_F(GraphExecTest, RejectedPrefixClosureDrainsExactAcceptedFrontier) {
+  HostCallLatch host_latch;
+  ActiveLaunchWaitLatch wait_latch;
+  iree_hal_streaming_graph_t* graph = nullptr;
+  iree_hal_streaming_graph_exec_t* exec = nullptr;
+  iree_hal_streaming_stream_t* recovery_stream = nullptr;
+  ScopeExit release_handles([&] {
+    host_latch.Release();
+    iree_hal_streaming_stream_release(recovery_stream);
+    iree_hal_streaming_graph_exec_release(exec);
+    iree_hal_streaming_graph_release(graph);
+  });
+
+  IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+      context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+      &graph));
+  iree_hal_streaming_graph_node_t* host_node = nullptr;
+  IREE_ASSERT_OK(iree_hal_streaming_graph_add_host_call_node(
+      graph, /*dependencies=*/nullptr, /*dependency_count=*/0,
+      &BlockingHostCall, &host_latch, &host_node));
+  IREE_ASSERT_OK(iree_hal_streaming_graph_instantiate(
+      graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec));
+
+  // The block has no initial stream wait and can be accepted independently.
+  // A prefailed stream timeline rejects only the root closure signal.
+  iree_hal_semaphore_fail(
+      stream_->timeline_semaphore,
+      iree_make_status(IREE_STATUS_ABORTED, "injected closure rejection"));
+  iree_status_t launch_status =
+      iree_hal_streaming_graph_exec_launch(exec, stream_);
+  IREE_EXPECT_OK(launch_status);
+  host_latch.WaitUntilEntered();
+
+  std::atomic<bool> rebuild_finished{false};
+  iree_status_t rebuild_status = iree_ok_status();
+  std::thread rebuild_thread([&] {
+    iree_hal_streaming_graph_exec_state_guard_t guard = {};
+    rebuild_status = iree_hal_streaming_graph_exec_rebuild_state_begin(
+        exec, &NotifyActiveLaunchWait, &wait_latch, &guard);
+    if (iree_status_is_ok(rebuild_status)) {
+      iree_hal_streaming_graph_exec_state_end(&guard);
+    }
+    rebuild_finished.store(true, std::memory_order_release);
+  });
+  wait_latch.WaitUntilReached();
+  EXPECT_FALSE(rebuild_finished.load(std::memory_order_acquire));
+
+  host_latch.Release();
+  rebuild_thread.join();
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_ABORTED, rebuild_status);
+  iree_status_t original_stream_status =
+      iree_hal_streaming_stream_synchronize(stream_);
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_ABORTED, original_stream_status);
+
+  // The failed launch poisons only the stream whose reserved closure could not
+  // be submitted. Explicit frontier drain leaves the executable reusable.
+  IREE_ASSERT_OK(iree_hal_streaming_stream_create(
+      context_, context_->queue, IREE_HAL_STREAMING_STREAM_FLAG_NONE,
+      /*priority=*/0, iree_allocator_system(), &recovery_stream));
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_launch(exec, recovery_stream));
+  IREE_EXPECT_OK(iree_hal_streaming_stream_synchronize(recovery_stream));
+}
+
+TEST_F(GraphExecTest,
+       DirectDestroyWaitFailurePreservesFrontierAndRemainsRetryable) {
+  HostCallLatch host_latch;
+  ActiveLaunchWaitLatch retry_wait_latch;
+  iree_hal_streaming_graph_t* graph = nullptr;
+  iree_hal_streaming_graph_exec_t* exec = nullptr;
+  ScopeExit release_handles([&] {
+    host_latch.Release();
+    iree_hal_streaming_graph_exec_release(exec);
+    iree_hal_streaming_graph_release(graph);
+  });
+
+  IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+      context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+      &graph));
+  iree_hal_streaming_graph_node_t* host_node = nullptr;
+  IREE_ASSERT_OK(iree_hal_streaming_graph_add_host_call_node(
+      graph, /*dependencies=*/nullptr, /*dependency_count=*/0,
+      &BlockingHostCall, &host_latch, &host_node));
+  IREE_ASSERT_OK(iree_hal_streaming_graph_instantiate(
+      graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec));
+
+  // Keep one test pin after successful destruction consumes the public edge.
+  iree_hal_streaming_graph_exec_retain(exec);
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_launch(exec, stream_));
+  host_latch.WaitUntilEntered();
+
+  // A failed wait with a healthy timeline has not proved the accepted launch
+  // terminal. Destruction must preserve both its public edge and exact
+  // frontier so the same handle can be retried.
+  FailActiveLaunchWaitOnce failure;
+  iree_status_t first_destroy_status =
+      iree_hal_streaming_graph_exec_destroy_handle_with_wait_callback(
+          exec, &InjectActiveLaunchWaitFailure, &failure);
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_UNAVAILABLE, first_destroy_status);
+  EXPECT_TRUE(failure.called);
+
+  std::atomic<bool> retry_finished{false};
+  iree_status_t retry_status = iree_ok_status();
+  std::thread retry_thread([&] {
+    retry_status =
+        iree_hal_streaming_graph_exec_destroy_handle_with_wait_callback(
+            exec, &NotifyActiveLaunchWait, &retry_wait_latch);
+    retry_finished.store(true, std::memory_order_release);
+  });
+  retry_wait_latch.WaitUntilReached();
+  EXPECT_FALSE(retry_finished.load(std::memory_order_acquire));
+
+  host_latch.Release();
+  retry_thread.join();
+  IREE_EXPECT_OK(retry_status);
+}
+
+TEST_F(GraphExecTest, DirectDestroyConsumesVerifiedTerminalFrontierInOneCall) {
+  std::atomic<int> call_count{0};
+  iree_hal_streaming_graph_t* graph = nullptr;
+  iree_hal_streaming_graph_exec_t* exec = nullptr;
+  ScopeExit release_handles([&] {
+    iree_hal_streaming_graph_exec_release(exec);
+    iree_hal_streaming_graph_release(graph);
+  });
+
+  IREE_ASSERT_OK(iree_hal_streaming_graph_create(
+      context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
+      &graph));
+  iree_hal_streaming_graph_node_t* host_node = nullptr;
+  IREE_ASSERT_OK(iree_hal_streaming_graph_add_deferred_host_call_node(
+      graph, /*dependencies=*/nullptr, /*dependency_count=*/0,
+      &FailDeferredHostCall, &call_count, &host_node));
+  IREE_ASSERT_OK(iree_hal_streaming_graph_instantiate(
+      graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec));
+
+  // Keep one test pin after successful destruction consumes the public edge.
+  iree_hal_streaming_graph_exec_retain(exec);
+  IREE_ASSERT_OK(iree_hal_streaming_graph_exec_launch(exec, stream_));
+
+  // The host block fails both its completion point and the reachable stream
+  // closure. Those persistent terminal payloads are execution results, not a
+  // reason to leave a fully quiesced public executable handle live for retry.
+  IREE_EXPECT_OK(iree_hal_streaming_graph_exec_destroy_handle(exec));
+  EXPECT_EQ(call_count.load(std::memory_order_acquire), 1);
+  iree_status_t stream_status = iree_hal_streaming_stream_synchronize(stream_);
+  IREE_EXPECT_STATUS_IS(IREE_STATUS_PERMISSION_DENIED, stream_status);
+}
+
+// A child executable's event-record property is transitive to its parent. A
+// cross-context launch must reject from the parent preflight, before any block
+// reaches a HAL queue operation. The synchronous observer sits at that exact
+// boundary, so a zero count distinguishes preflight rejection from a later
+// rejection inside the child's block walk.
 TEST_F(GraphExecTest, ChildGraphRecordRefusesALaunchOnAnotherContextsStream) {
   iree_hal_streaming_context_t* other_context = nullptr;
   iree_hal_streaming_stream_t* other_stream = nullptr;
@@ -360,8 +1031,8 @@ TEST_F(GraphExecTest, ChildGraphRecordRefusesALaunchOnAnotherContextsStream) {
 
   // The host node depends on nothing and the child graph node depends on it, so
   // the host call is the block a launch submits first and the child's record
-  // the block that would refuse it. Whether the host node ran is how the test
-  // sees what a refused launch had already submitted.
+  // the block that would refuse it. The synchronous observer below sees any
+  // parent block that reaches the queue-submission boundary.
   IREE_ASSERT_OK(iree_hal_streaming_graph_create(
       context_, IREE_HAL_STREAMING_GRAPH_FLAG_NONE, iree_allocator_system(),
       &parent_graph));
@@ -377,31 +1048,22 @@ TEST_F(GraphExecTest, ChildGraphRecordRefusesALaunchOnAnotherContextsStream) {
   IREE_ASSERT_OK(iree_hal_streaming_graph_instantiate(
       parent_graph, IREE_HAL_STREAMING_GRAPH_INSTANTIATE_FLAG_NONE, &exec));
 
+  int queue_submission_count = 0;
+  iree_hal_streaming_graph_test_set_queue_submission_observer(
+      &IncrementSubmissionCount, &queue_submission_count);
+  ScopeExit clear_submission_observer([] {
+    iree_hal_streaming_graph_test_set_queue_submission_observer(nullptr,
+                                                                nullptr);
+  });
   iree_status_t status =
       iree_hal_streaming_graph_exec_launch(exec, other_stream);
   EXPECT_EQ(IREE_STATUS_INCOMPATIBLE, iree_status_code(status))
       << "a launch on another context's stream was accepted for an executable "
          "whose only record sits in a child graph";
   iree_status_free(status);
-
-  // A refused launch leaves the stream tail where it was, so a block it had
-  // enqueued would have waited on nothing and been runnable the moment the
-  // queue took it. Draining the stream behind a callback enqueued after the
-  // refusal is what gives such a block its chance to run before the read below;
-  // synchronizing alone would not, because the launch advanced no timeline
-  // value for the synchronize to wait on. This is a window and not an ordering
-  // proof: user-visible order comes from semaphore edges, and a block an
-  // aborted launch left behind signals a semaphore internal to the executable
-  // that shares none with the callback below.
-  IREE_ASSERT_OK(iree_hal_streaming_launch_host_function(other_stream, &SetFlag,
-                                                         &stream_marker_ran_));
-  IREE_ASSERT_OK(iree_hal_streaming_stream_synchronize(other_stream));
-  ASSERT_TRUE(stream_marker_ran_.load(std::memory_order_acquire))
-      << "the stream was synchronized without running the callback behind it, "
-         "so nothing here says when the launch's own blocks would have run";
-  EXPECT_FALSE(graph_host_node_ran_.load(std::memory_order_acquire))
-      << "the node ahead of the refused record ran, so the launch submitted "
-         "part of the graph and then failed";
+  EXPECT_EQ(0, queue_submission_count)
+      << "cross-context rejection occurred after a graph block reached the "
+         "queue-submission boundary";
 }
 
 }  // namespace

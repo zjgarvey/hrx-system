@@ -142,6 +142,8 @@ typedef struct iree_hal_amdgpu_frontier_snapshot_t {
 #define IREE_HAL_AMDGPU_RECLAIM_INLINE_CAPACITY 8
 
 typedef struct iree_hal_amdgpu_reclaim_entry_t iree_hal_amdgpu_reclaim_entry_t;
+typedef struct iree_hal_amdgpu_feedback_source_batch_t
+    iree_hal_amdgpu_feedback_source_batch_t;
 
 // Infallible callback executed for one completed epoch before that epoch's
 // user-visible semaphore signals are published.
@@ -207,6 +209,10 @@ struct iree_hal_amdgpu_reclaim_entry_t {
   // completion, and during fail_all with the failure status before resources
   // are released.
   iree_hal_amdgpu_reclaim_action_t pre_signal_action;
+  // Optional feedback source-owner batch installed before this epoch's first
+  // packet is published. Lane C closes it after the epoch's HSA acquire and
+  // clears this pointer before ordinary reclaim releases begin.
+  iree_hal_amdgpu_feedback_source_batch_t* feedback_source_batch;
   // First dispatch profiling event position reserved by this epoch.
   // Valid only when |profile_event_count| is non-zero.
   uint64_t profile_event_first_position;
@@ -329,6 +335,80 @@ typedef struct iree_hal_amdgpu_notification_ring_t {
   // frontier ring buffer, and reclaim entries. Freed in deinitialize.
   void* storage;
 } iree_hal_amdgpu_notification_ring_t;
+
+// Private cursors owned by one serialized completion runner. All storage is
+// preallocated in the notification/reclaim rings; this object only records
+// scalar positions and may live on the runner's stack. Public ring reuse
+// cursors remain frozen until claim_commit publishes the complete final state.
+typedef struct iree_hal_amdgpu_notification_ring_claim_t {
+  uint64_t initial_epoch;
+  uint64_t claimed_epoch;
+  uint64_t transitioned_epoch;
+  uint64_t retired_epoch;
+  uint64_t retire_completed_epoch;
+  uint64_t released_epoch;
+  uint64_t initial_read;
+  uint64_t prepared_read;
+  uint64_t dispatched_read;
+  uint64_t initial_frontier_read;
+  uint64_t prepared_frontier_read;
+  iree_hal_amdgpu_reclaim_positions_t reclaim_positions;
+} iree_hal_amdgpu_notification_ring_claim_t;
+
+// Initializes a private claim from the ring's current public consumer cursors.
+// Does not mutate public cursors or invoke callbacks.
+void iree_hal_amdgpu_notification_ring_claim_initialize(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* out_claim);
+
+// Returns the highest epoch currently ready to claim. Normal mode observes the
+// acquired HSA completion signal and clamps it to last_published. Failure mode
+// returns last_published so terminal failure can retire every published epoch.
+uint64_t iree_hal_amdgpu_notification_ring_claim_query_target(
+    iree_hal_amdgpu_notification_ring_t* ring, bool force_failure);
+
+// Lane A: executes bounded pre-signal transitions through |target_epoch|.
+// |status| is borrowed and must be code-only/infallible on teardown paths.
+void iree_hal_amdgpu_notification_ring_claim_transition(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim, uint64_t target_epoch,
+    const iree_status_t status);
+
+// Lane B: makes every signal/failure state through |target_epoch| visible
+// without dispatching callbacks. Uses only in-place ring metadata and performs
+// no allocation when |force_failure| is true.
+void iree_hal_amdgpu_notification_ring_claim_prepare(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim, uint64_t target_epoch,
+    bool force_failure, iree_status_code_t failure_code,
+    const iree_async_frontier_t* fallback_frontier);
+
+// Lane C: invokes the optional profiling/feedback retirement callback once per
+// epoch through |target_epoch|. The caller must hold no queue mutex.
+void iree_hal_amdgpu_notification_ring_claim_retire(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim, uint64_t target_epoch,
+    bool force_failure, iree_hal_amdgpu_reclaim_retire_fn_t retire_fn,
+    void* retire_user_data);
+
+// Lane D: dispatches every semaphore callback prepared so far. Advances the
+// private dispatch cursor before invoking each callback so same-thread nested
+// drain can safely extend the same claim without duplicate dispatch.
+iree_host_size_t iree_hal_amdgpu_notification_ring_claim_dispatch(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim);
+
+// Lane E: releases one retired epoch's resources, advancing the private cursor
+// before any potentially-final release. Returns false when no epoch remains.
+bool iree_hal_amdgpu_notification_ring_claim_release_one(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    iree_hal_amdgpu_notification_ring_claim_t* claim);
+
+// Atomically publishes the private epoch/hot/frontier consumer cursors for
+// producer reuse. The caller serializes this logical commit with producers.
+void iree_hal_amdgpu_notification_ring_claim_commit(
+    iree_hal_amdgpu_notification_ring_t* ring,
+    const iree_hal_amdgpu_notification_ring_claim_t* claim);
 
 // Initializes a notification ring. Creates the epoch signal and allocates
 // the hot entry array, frontier snapshot byte ring, and reclaim entries in

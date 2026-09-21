@@ -11,6 +11,7 @@
 
 #include "iree/base/internal/math.h"
 #include "iree/hal/drivers/amdgpu/access_policy.h"
+#include "iree/hal/drivers/amdgpu/api.h"
 #include "iree/hal/drivers/amdgpu/atomic_memory.h"
 #include "iree/hal/drivers/amdgpu/buffer.h"
 #include "iree/hal/drivers/amdgpu/logical_device.h"
@@ -2134,7 +2135,29 @@ static iree_status_t iree_hal_amdgpu_allocator_virtual_memory_reserve(
       iree_hal_amdgpu_allocator_resolve_virtual_memory_placement(
           allocator, &params, &placement));
   return iree_hal_amdgpu_virtual_memory_reserve(
-      allocator->virtual_memory, placement, size, out_virtual_buffer);
+      allocator->virtual_memory, placement, size, /*minimum_alignment=*/0,
+      /*requested_address=*/0, out_virtual_buffer);
+}
+
+static iree_status_t iree_hal_amdgpu_allocator_virtual_memory_reserve_at(
+    iree_hal_allocator_t* IREE_RESTRICT base_allocator,
+    iree_hal_queue_family_affinity_t queue_family_affinity,
+    iree_device_size_t size, iree_device_size_t minimum_alignment,
+    iree_device_size_t requested_address,
+    iree_hal_buffer_t** IREE_RESTRICT out_virtual_buffer) {
+  IREE_ASSERT_ARGUMENT(out_virtual_buffer);
+  *out_virtual_buffer = NULL;
+  iree_hal_amdgpu_allocator_t* allocator =
+      iree_hal_amdgpu_allocator_cast(base_allocator);
+  iree_hal_buffer_params_t params =
+      iree_hal_amdgpu_allocator_virtual_buffer_params(queue_family_affinity);
+  iree_hal_amdgpu_virtual_memory_placement_t placement;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_resolve_virtual_memory_placement(
+          allocator, &params, &placement));
+  return iree_hal_amdgpu_virtual_memory_reserve(
+      allocator->virtual_memory, placement, size, minimum_alignment,
+      requested_address, out_virtual_buffer);
 }
 
 static iree_status_t iree_hal_amdgpu_allocator_virtual_memory_release(
@@ -2146,6 +2169,257 @@ static iree_status_t iree_hal_amdgpu_allocator_virtual_memory_release(
       iree_hal_amdgpu_allocator_require_virtual_memory(allocator));
   return iree_hal_amdgpu_virtual_memory_release(allocator->virtual_memory,
                                                 virtual_buffer);
+}
+
+iree_status_t iree_hal_amdgpu_allocator_virtual_memory_alias(
+    iree_hal_allocator_t* base_allocator, iree_hal_buffer_t* virtual_buffer,
+    iree_device_size_t virtual_offset, iree_device_size_t size,
+    iree_hal_memory_access_t allowed_access,
+    iree_hal_buffer_t** out_alias_buffer) {
+  IREE_ASSERT_ARGUMENT(base_allocator);
+  IREE_ASSERT_ARGUMENT(virtual_buffer);
+  IREE_ASSERT_ARGUMENT(out_alias_buffer);
+  *out_alias_buffer = NULL;
+  if (!iree_hal_resource_is(base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "target allocator is not an AMDGPU allocator");
+  }
+
+  iree_hal_amdgpu_allocator_t* allocator =
+      iree_hal_amdgpu_allocator_cast(base_allocator);
+  iree_hal_buffer_params_t params =
+      iree_hal_amdgpu_allocator_virtual_buffer_params(
+          IREE_HAL_QUEUE_FAMILY_AFFINITY_ANY);
+  params.access = allowed_access;
+  iree_hal_amdgpu_virtual_memory_placement_t placement;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_resolve_virtual_memory_placement(
+          allocator, &params, &placement));
+  return iree_hal_amdgpu_virtual_memory_alias(
+      allocator->virtual_memory, placement, virtual_buffer, virtual_offset,
+      size, allowed_access, out_alias_buffer);
+}
+
+iree_status_t iree_hal_amdgpu_allocator_virtual_memory_protect_peer(
+    iree_hal_allocator_t* reservation_base_allocator,
+    iree_hal_allocator_t* access_base_allocator,
+    iree_hal_buffer_t* virtual_buffer, iree_device_size_t virtual_offset,
+    iree_device_size_t size, iree_hal_memory_protection_t protection) {
+  IREE_ASSERT_ARGUMENT(reservation_base_allocator);
+  IREE_ASSERT_ARGUMENT(access_base_allocator);
+  IREE_ASSERT_ARGUMENT(virtual_buffer);
+  if (!iree_hal_resource_is(reservation_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable) ||
+      !iree_hal_resource_is(access_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "peer virtual-memory protection requires AMDGPU allocators");
+  }
+  iree_hal_amdgpu_allocator_t* reservation_allocator =
+      iree_hal_amdgpu_allocator_cast(reservation_base_allocator);
+  iree_hal_amdgpu_allocator_t* access_allocator =
+      iree_hal_amdgpu_allocator_cast(access_base_allocator);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(reservation_allocator));
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(access_allocator));
+  return iree_hal_amdgpu_virtual_memory_protect_peer(
+      reservation_allocator->virtual_memory, access_allocator->virtual_memory,
+      virtual_buffer, virtual_offset, size, protection);
+}
+
+iree_status_t iree_hal_amdgpu_allocator_vmm_native_operation_prepare_access(
+    iree_hal_allocator_t* reservation_base_allocator,
+    iree_hal_allocator_t* access_base_allocator,
+    iree_hal_buffer_t* virtual_buffer, iree_device_size_t virtual_offset,
+    iree_device_size_t size,
+    iree_hal_queue_family_affinity_t queue_family_affinity,
+    iree_hal_virtual_memory_access_scope_t access_scope,
+    iree_hal_memory_protection_t protection,
+    iree_host_size_t physical_memory_count,
+    iree_hal_physical_memory_t* const* physical_memories,
+    iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation) {
+  IREE_ASSERT_ARGUMENT(reservation_base_allocator);
+  IREE_ASSERT_ARGUMENT(virtual_buffer);
+  IREE_ASSERT_ARGUMENT(out_operation);
+  *out_operation = NULL;
+  if (!iree_hal_resource_is(reservation_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable) ||
+      (access_base_allocator &&
+       !iree_hal_resource_is(access_base_allocator,
+                             &iree_hal_amdgpu_allocator_vtable))) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "prepared VMM access requires AMDGPU allocators");
+  }
+  iree_hal_amdgpu_allocator_t* reservation_allocator =
+      iree_hal_amdgpu_allocator_cast(reservation_base_allocator);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(reservation_allocator));
+  iree_hal_amdgpu_virtual_memory_state_t* access_state = NULL;
+  if (access_base_allocator) {
+    iree_hal_amdgpu_allocator_t* access_allocator =
+        iree_hal_amdgpu_allocator_cast(access_base_allocator);
+    IREE_RETURN_IF_ERROR(
+        iree_hal_amdgpu_allocator_require_virtual_memory(access_allocator));
+    access_state = access_allocator->virtual_memory;
+  }
+  return iree_hal_amdgpu_vmm_native_operation_prepare_access(
+      reservation_allocator->virtual_memory, access_state, virtual_buffer,
+      virtual_offset, size, queue_family_affinity, access_scope, protection,
+      physical_memory_count, physical_memories, host_allocator, out_operation);
+}
+
+iree_status_t iree_hal_amdgpu_allocator_vmm_native_operation_prepare_unmap(
+    iree_hal_allocator_t* reservation_base_allocator,
+    iree_hal_buffer_t* virtual_buffer, iree_device_size_t virtual_offset,
+    iree_device_size_t size, iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation) {
+  IREE_ASSERT_ARGUMENT(reservation_base_allocator);
+  IREE_ASSERT_ARGUMENT(virtual_buffer);
+  IREE_ASSERT_ARGUMENT(out_operation);
+  *out_operation = NULL;
+  if (!iree_hal_resource_is(reservation_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "prepared VMM unmap requires an AMDGPU allocator");
+  }
+  iree_hal_amdgpu_allocator_t* reservation_allocator =
+      iree_hal_amdgpu_allocator_cast(reservation_base_allocator);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(reservation_allocator));
+  return iree_hal_amdgpu_vmm_native_operation_prepare_unmap(
+      reservation_allocator->virtual_memory, virtual_buffer, virtual_offset,
+      size, host_allocator, out_operation);
+}
+
+iree_status_t
+iree_hal_amdgpu_allocator_vmm_native_operation_prepare_release_reservation(
+    iree_hal_allocator_t* reservation_base_allocator,
+    iree_hal_buffer_t* virtual_buffer, iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation) {
+  IREE_ASSERT_ARGUMENT(reservation_base_allocator);
+  IREE_ASSERT_ARGUMENT(virtual_buffer);
+  IREE_ASSERT_ARGUMENT(out_operation);
+  *out_operation = NULL;
+  if (!iree_hal_resource_is(reservation_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "prepared VMM reservation release requires an AMDGPU allocator");
+  }
+  iree_hal_amdgpu_allocator_t* reservation_allocator =
+      iree_hal_amdgpu_allocator_cast(reservation_base_allocator);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(reservation_allocator));
+  return iree_hal_amdgpu_vmm_native_operation_prepare_release_reservation(
+      reservation_allocator->virtual_memory, virtual_buffer, host_allocator,
+      out_operation);
+}
+
+iree_status_t
+iree_hal_amdgpu_allocator_vmm_native_operation_prepare_free_physical(
+    iree_hal_allocator_t* creator_base_allocator,
+    iree_hal_physical_memory_t* physical_memory,
+    iree_allocator_t host_allocator,
+    iree_hal_amdgpu_vmm_native_operation_t** out_operation) {
+  IREE_ASSERT_ARGUMENT(creator_base_allocator);
+  IREE_ASSERT_ARGUMENT(physical_memory);
+  IREE_ASSERT_ARGUMENT(out_operation);
+  *out_operation = NULL;
+  if (!iree_hal_resource_is(creator_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "prepared VMM physical free requires an AMDGPU allocator");
+  }
+  iree_hal_amdgpu_allocator_t* creator_allocator =
+      iree_hal_amdgpu_allocator_cast(creator_base_allocator);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(creator_allocator));
+  return iree_hal_amdgpu_vmm_native_operation_prepare_free_physical(
+      creator_allocator->virtual_memory, physical_memory, host_allocator,
+      out_operation);
+}
+
+void iree_hal_amdgpu_allocator_virtual_memory_dispose_consumed_reservation(
+    iree_hal_allocator_t* reservation_base_allocator,
+    iree_hal_buffer_t* virtual_buffer) {
+  IREE_ASSERT_ARGUMENT(reservation_base_allocator);
+  IREE_ASSERT_ARGUMENT(virtual_buffer);
+  IREE_ASSERT(iree_hal_resource_is(reservation_base_allocator,
+                                   &iree_hal_amdgpu_allocator_vtable));
+  iree_hal_amdgpu_virtual_memory_dispose_consumed_reservation(virtual_buffer);
+}
+
+void iree_hal_amdgpu_allocator_physical_memory_dispose_consumed(
+    iree_hal_allocator_t* creator_base_allocator,
+    iree_hal_physical_memory_t* physical_memory) {
+  IREE_ASSERT_ARGUMENT(creator_base_allocator);
+  IREE_ASSERT_ARGUMENT(physical_memory);
+  IREE_ASSERT(iree_hal_resource_is(creator_base_allocator,
+                                   &iree_hal_amdgpu_allocator_vtable));
+  iree_hal_amdgpu_allocator_t* creator_allocator =
+      iree_hal_amdgpu_allocator_cast(creator_base_allocator);
+  iree_hal_amdgpu_physical_memory_dispose_consumed(
+      creator_allocator->virtual_memory, physical_memory);
+}
+
+iree_status_t iree_hal_amdgpu_allocator_virtual_memory_release_or_quarantine(
+    iree_hal_allocator_t* reservation_base_allocator,
+    iree_hal_buffer_t* virtual_buffer) {
+  IREE_ASSERT_ARGUMENT(reservation_base_allocator);
+  IREE_ASSERT_ARGUMENT(virtual_buffer);
+  if (!iree_hal_resource_is(reservation_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "VMM cleanup quarantine requires an AMDGPU allocator");
+  }
+  iree_hal_amdgpu_allocator_t* reservation_allocator =
+      iree_hal_amdgpu_allocator_cast(reservation_base_allocator);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(reservation_allocator));
+  return iree_hal_amdgpu_virtual_memory_release_or_quarantine(
+      reservation_allocator->virtual_memory, virtual_buffer);
+}
+
+iree_status_t iree_hal_amdgpu_allocator_physical_memory_free_or_quarantine(
+    iree_hal_allocator_t* creator_base_allocator,
+    iree_hal_physical_memory_t* physical_memory) {
+  IREE_ASSERT_ARGUMENT(creator_base_allocator);
+  IREE_ASSERT_ARGUMENT(physical_memory);
+  if (!iree_hal_resource_is(creator_base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "VMM cleanup quarantine requires an AMDGPU allocator");
+  }
+  iree_hal_amdgpu_allocator_t* creator_allocator =
+      iree_hal_amdgpu_allocator_cast(creator_base_allocator);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdgpu_allocator_require_virtual_memory(creator_allocator));
+  return iree_hal_amdgpu_physical_memory_free_or_quarantine(
+      creator_allocator->virtual_memory, physical_memory);
+}
+
+iree_status_t iree_hal_amdgpu_allocator_vmm_quarantine_drain(
+    iree_hal_allocator_t* base_allocator) {
+  IREE_ASSERT_ARGUMENT(base_allocator);
+  if (!iree_hal_resource_is(base_allocator,
+                            &iree_hal_amdgpu_allocator_vtable)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "VMM cleanup quarantine requires an AMDGPU allocator");
+  }
+  iree_hal_amdgpu_allocator_t* allocator =
+      iree_hal_amdgpu_allocator_cast(base_allocator);
+  // An allocator without VMM support cannot have acquired a quarantined VMM
+  // owner, so its drain is vacuously complete.
+  if (!allocator->virtual_memory) return iree_ok_status();
+  return iree_hal_amdgpu_vmm_quarantine_drain(allocator->virtual_memory);
 }
 
 static iree_status_t iree_hal_amdgpu_allocator_physical_memory_allocate(
@@ -2252,6 +2526,8 @@ static const iree_hal_allocator_vtable_t iree_hal_amdgpu_allocator_vtable = {
     .virtual_memory_query_granularity =
         iree_hal_amdgpu_allocator_virtual_memory_query_granularity,
     .virtual_memory_reserve = iree_hal_amdgpu_allocator_virtual_memory_reserve,
+    .virtual_memory_reserve_at =
+        iree_hal_amdgpu_allocator_virtual_memory_reserve_at,
     .virtual_memory_release = iree_hal_amdgpu_allocator_virtual_memory_release,
     .physical_memory_allocate =
         iree_hal_amdgpu_allocator_physical_memory_allocate,

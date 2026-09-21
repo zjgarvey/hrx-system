@@ -407,7 +407,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_fill_with_action(
     bool* out_ready) {
   IREE_ASSERT_ARGUMENT(out_ready);
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
 
   uint8_t* target_device_ptr = NULL;
@@ -597,7 +597,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_copy(
     bool* out_ready) {
   IREE_ASSERT_ARGUMENT(out_ready);
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
 
   const uint8_t* source_device_ptr = NULL;
@@ -680,7 +680,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_copy_with_action(
     bool* out_ready) {
   IREE_ASSERT_ARGUMENT(out_ready);
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
   if (IREE_UNLIKELY(extra_operation_resource_count > 0 &&
                     !extra_operation_resources)) {
@@ -892,7 +892,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_update_with_action(
     bool* out_ready) {
   IREE_ASSERT_ARGUMENT(out_ready);
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
 
   const uint8_t* source_bytes = NULL;

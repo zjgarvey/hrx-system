@@ -21,6 +21,25 @@ iree_status_t iree_hal_streaming_validate_prepacked_kernel_arguments(
     const iree_hal_streaming_symbol_t* symbol,
     const iree_hal_streaming_dispatch_params_t* params);
 
+// Validates every formal device pointer described by |parameters| in the
+// caller-selected argument representation. Unknown pointer ownership is a
+// policy decision of |params->pointer_validator|; no callback means no extra
+// validation. This must run before any unresolved binding falls back to raw
+// native arguments.
+iree_status_t iree_hal_streaming_validate_kernel_argument_pointers(
+    iree_hal_streaming_context_t* context,
+    const iree_hal_streaming_parameter_info_t* parameters,
+    const iree_hal_streaming_dispatch_params_t* params);
+
+// Validates formal device pointers in a target-native kernarg byte image. Used
+// by executable graphs to revalidate the exact captured bytes they submit.
+iree_status_t iree_hal_streaming_validate_native_kernel_argument_pointers(
+    iree_hal_streaming_context_t* context,
+    const iree_hal_streaming_parameter_info_t* parameters,
+    iree_const_byte_span_t arguments,
+    iree_hal_streaming_device_pointer_validator_t pointer_validator,
+    void* pointer_validator_user_data);
+
 // Unpacks a packed kernel parameter buffer into a constant buffer and binding
 // list. Some dispatches may use raw device buffer pointers and others may use
 // bindings that can be resolved to HAL buffers.

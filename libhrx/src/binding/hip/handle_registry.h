@@ -44,6 +44,12 @@ typedef struct iree_hip_handle_registry_t {
 // Retains a handle while its registry entry is locked and known to be live.
 typedef void (*iree_hip_handle_registry_retain_fn_t)(uintptr_t handle);
 
+// Returns true when |handle| belongs in a retained registry snapshot.
+// Invoked while all registry shard locks are held; implementations must not
+// call back into this registry.
+typedef bool (*iree_hip_handle_registry_match_fn_t)(uintptr_t handle,
+                                                    void* user_data);
+
 void iree_hip_handle_registry_initialize(iree_hip_handle_registry_t* registry);
 
 // Requires the registry to be empty.
@@ -61,6 +67,16 @@ bool iree_hip_handle_registry_lookup_retain(
 // Removes a live handle, transferring its existing ownership to the caller.
 bool iree_hip_handle_registry_remove(iree_hip_handle_registry_t* registry,
                                      uintptr_t handle);
+
+// Atomically snapshots and retains every live handle matching |match_fn|.
+// Locks all shards in increasing order across count, allocation, and retain so
+// the result is exact even without an external registry-stability gate. The
+// caller owns the system-allocator array and one reference per handle.
+iree_status_t iree_hip_handle_registry_snapshot_retain_if(
+    iree_hip_handle_registry_t* registry,
+    iree_hip_handle_registry_match_fn_t match_fn, void* user_data,
+    iree_hip_handle_registry_retain_fn_t retain_fn, uintptr_t** out_handles,
+    iree_host_size_t* out_count);
 
 #ifdef __cplusplus
 }  // extern "C"

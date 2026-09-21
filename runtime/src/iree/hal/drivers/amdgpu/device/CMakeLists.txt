@@ -194,7 +194,7 @@ iree_cc_library(
     "kernel_pm4.c"
   DEPS
     ::headers
-    iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::loaded_code_object
     iree::hal::drivers::amdgpu::util::pm4_dispatch
   PUBLIC
@@ -240,6 +240,7 @@ iree_cc_test(
     iree::base::internal
     iree::hal::drivers::amdgpu::util::device_library
     iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::packet
     iree::hal::drivers::amdgpu::util::queue_primitives
     iree::hal::drivers::amdgpu::util::topology

@@ -17,6 +17,7 @@
 #include "iree/hal/drivers/amdgpu/buffer.h"
 #include "iree/hal/drivers/amdgpu/device/dispatch.h"
 #include "iree/hal/drivers/amdgpu/executable.h"
+#include "iree/hal/drivers/amdgpu/feedback_state.h"
 #include "iree/hal/drivers/amdgpu/pm4_command_atomic.h"
 #include "iree/hal/drivers/amdgpu/pm4_command_builder.h"
 #include "iree/hal/drivers/amdgpu/pm4_command_dispatch.h"
@@ -556,6 +557,9 @@ typedef struct iree_hal_amdgpu_pm4_command_buffer_t {
   iree_hal_amdgpu_pm4_retained_resource_table_t retained_resources;
   // Last executable retained into |resource_set| during this recording.
   iree_hal_executable_t* last_retained_executable;
+  // Borrowed distinct executable identities used to retain feedback source
+  // metadata independently at queue admission, including UNRETAINED mode.
+  iree_hal_amdgpu_feedback_source_list_t feedback_sources;
   // Pool that owns resident PM4 storage allocations.
   iree_hal_amdgpu_pm4_command_buffer_resident_pool_t* resident_pool;
   // Stable opaque hostcall device address written into implicit templates.
@@ -1901,6 +1905,12 @@ static iree_status_t iree_hal_amdgpu_pm4_command_buffer_record_dispatch(
         descriptor->kernel_descriptor->group_segment_fixed_size,
         descriptor->kernel_args.group_segment_size);
   }
+  // Keep the feedback source sidecar independent of last_retained_executable
+  // and the mode-gated resource set. Queue admission converts these borrowed
+  // identities into a retained batch before the PM4 packet is published.
+  IREE_RETURN_IF_ERROR(iree_hal_amdgpu_feedback_source_list_insert(
+      command_buffer->host_allocator, &command_buffer->feedback_sources,
+      executable));
 
   iree_hal_amdgpu_pm4_dispatch_recorder_t recorder = {
       .recording_state = &command_buffer->recording,
@@ -2080,6 +2090,8 @@ iree_status_t iree_hal_amdgpu_pm4_command_buffer_create(
       binding_capacity, (uint8_t*)command_buffer + validation_state_offset,
       &iree_hal_amdgpu_pm4_command_buffer_vtable, &command_buffer->base);
   command_buffer->host_allocator = host_allocator;
+  iree_hal_amdgpu_feedback_source_list_initialize(
+      &command_buffer->feedback_sources);
   command_buffer->resource_set_block_pool = resource_set_block_pool;
   command_buffer->resident_pool = resident_pool;
   command_buffer->hostcall_buffer = hostcall_buffer;
@@ -2144,6 +2156,8 @@ static void iree_hal_amdgpu_pm4_command_buffer_destroy(
   iree_allocator_free(host_allocator, command_buffer->profile.operations);
   iree_allocator_free(host_allocator,
                       command_buffer->atomic_binding_requirements);
+  iree_hal_amdgpu_feedback_source_list_deinitialize(
+      host_allocator, &command_buffer->feedback_sources);
   iree_hal_resource_set_free(command_buffer->resource_set);
   iree_slim_mutex_deinitialize(&command_buffer->publication_mutex);
   iree_allocator_free(host_allocator, command_buffer);
@@ -2192,6 +2206,17 @@ uint64_t iree_hal_amdgpu_pm4_command_buffer_profile_id(
   iree_hal_amdgpu_pm4_command_buffer_t* command_buffer =
       iree_hal_amdgpu_pm4_command_buffer_cast(base_command_buffer);
   return command_buffer->profile.id;
+}
+
+iree_hal_executable_t* const*
+iree_hal_amdgpu_pm4_command_buffer_feedback_sources(
+    iree_hal_command_buffer_t* base_command_buffer,
+    iree_host_size_t* out_count) {
+  IREE_ASSERT_ARGUMENT(out_count);
+  iree_hal_amdgpu_pm4_command_buffer_t* command_buffer =
+      iree_hal_amdgpu_pm4_command_buffer_cast(base_command_buffer);
+  *out_count = command_buffer->feedback_sources.count;
+  return command_buffer->feedback_sources.values;
 }
 
 const iree_hal_profile_command_operation_record_t*

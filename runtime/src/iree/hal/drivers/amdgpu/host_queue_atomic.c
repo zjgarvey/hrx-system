@@ -322,7 +322,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_atomic(
     bool* out_ready) {
   *out_ready = false;
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
 
   uint8_t* target_device_ptr = NULL;

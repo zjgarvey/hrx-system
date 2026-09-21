@@ -121,8 +121,13 @@ typedef struct iree_hal_amdgpu_libhsa_t {
 #define IREE_HAL_AMDGPU_LIBHSA_PFN(trace_category, result_type, symbol, decl, \
                                    args)                                      \
   result_type(HSA_API* symbol)(decl);
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN \
+  IREE_HAL_AMDGPU_LIBHSA_PFN
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN IREE_HAL_AMDGPU_LIBHSA_PFN
 #define DECL(...) __VA_ARGS__
 #include "iree/hal/drivers/amdgpu/util/libhsa_tables.h"  // IWYU pragma: export
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN
 
 #endif  // !IREE_HAL_AMDGPU_LIBHSA_STATIC
 
@@ -167,6 +172,39 @@ IREE_API_EXPORT iree_status_t iree_status_from_hsa_status(
     const char* file, const uint32_t line, hsa_status_t hsa_status,
     const char* symbol, const char* message);
 
+#if defined(IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION)
+// Optional process-wide observer invoked immediately around each raw HSA
+// virtual address release, at every nesting level and on every calling thread.
+// Clear prevents new callbacks and waits for callbacks already in flight. The
+// observer must return normally and cannot clear itself from its callback.
+typedef void (*iree_hal_amdgpu_libhsa_vmem_address_free_observer_t)(
+    bool entering, void* address, size_t size, void* user_data);
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_libhsa_set_vmem_address_free_observer(
+    iree_hal_amdgpu_libhsa_vmem_address_free_observer_t observer,
+    void* user_data);
+IREE_API_EXPORT iree_status_t
+iree_hal_amdgpu_libhsa_clear_vmem_address_free_observer(
+    iree_hal_amdgpu_libhsa_vmem_address_free_observer_t observer,
+    void* user_data);
+IREE_API_EXPORT void iree_hal_amdgpu_libhsa_test_fail_next_observer_clear(void);
+
+// Resets and queries the exact placement arguments received by the raw HSA
+// reservation thunk immediately before its native function-pointer dispatch.
+IREE_API_EXPORT void
+iree_hal_amdgpu_libhsa_test_reset_vmem_address_reserve_observability(void);
+IREE_API_EXPORT uint64_t
+iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_address(void);
+IREE_API_EXPORT uint64_t
+iree_hal_amdgpu_libhsa_test_last_vmem_address_reserve_alignment(void);
+#endif  // IREE_HAL_AMDGPU_LIBHSA_TEST_INSTRUMENTATION
+
+// Returns true while the calling thread is inside one or more raw HSA virtual
+// address releases routed through this linked image. The depth is per thread
+// and independent of a particular iree_hal_amdgpu_libhsa_t copy in the image.
+IREE_API_EXPORT bool
+iree_hal_amdgpu_libhsa_vmem_address_free_callback_window_is_active(void);
+
 //===----------------------------------------------------------------------===//
 // HSA API Wrappers
 //===----------------------------------------------------------------------===//
@@ -203,11 +241,16 @@ IREE_API_EXPORT iree_status_t iree_status_from_hsa_status(
                                    ...)                                       \
   IREE_HAL_AMDGPU_LIBHSA_PFN_##result_type(trace_category, result_type,       \
                                            symbol, DECL(decl), __VA_ARGS__)
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN \
+  IREE_HAL_AMDGPU_LIBHSA_PFN
+#define IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN IREE_HAL_AMDGPU_LIBHSA_PFN
 #define DECL(...) __VA_ARGS__
 #define _COMMA_DECL(...) __VA_OPT__(, ) __VA_ARGS__
 
 #include "iree/hal/drivers/amdgpu/util/libhsa_tables.h"  // IWYU pragma: export
 
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN
+#undef IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN
 #undef _COMMA_DECL
 #undef IREE_HAL_AMDGPU_LIBHSA_PFN_hsa_status_t
 #undef IREE_HAL_AMDGPU_LIBHSA_PFN_result

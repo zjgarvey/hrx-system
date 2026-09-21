@@ -75,7 +75,7 @@ iree_cc_library(
   DEPS
     iree::base
     iree::hal
-    iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::topology
   PUBLIC
 )
@@ -97,7 +97,7 @@ iree_cc_library(
     iree::base::internal::arena
     iree::base::threading
     iree::hal
-    iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
   PUBLIC
 )
 endif()
@@ -115,7 +115,7 @@ iree_cc_library(
     iree::base
     iree::hal
     iree::hal::drivers::amdgpu::util::global_table
-    iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
   PUBLIC
 )
 endif()
@@ -131,7 +131,7 @@ iree_cc_library(
   DEPS
     iree::base
     iree::hal
-    iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::topology
   PUBLIC
 )
@@ -401,6 +401,7 @@ iree_cc_library(
     iree::hal::drivers::amdgpu::util::kfd
     iree::hal::drivers::amdgpu::util::libaqlprofile
     iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::loaded_code_object
     iree::hal::drivers::amdgpu::util::packet
     iree::hal::drivers::amdgpu::util::pm4_atomic
@@ -417,6 +418,211 @@ iree_cc_library(
     iree::hal::utils::elf_format
     iree::hal::utils::files
     iree::hal::utils::resource_set
+  PUBLIC
+)
+endif()
+
+if(IREE_HAL_DRIVER_AMDGPU)
+iree_cc_library(
+  NAME
+    amdgpu_test_instrumented
+  HDRS
+    "api.h"
+  SRCS
+    "allocator.c"
+    "allocator.h"
+    "aql_atomic.c"
+    "aql_atomic.h"
+    "aql_block_processor.c"
+    "aql_block_processor.h"
+    "aql_block_processor_profile.c"
+    "aql_block_processor_profile.h"
+    "aql_block_processor_timestamp.c"
+    "aql_block_processor_timestamp.h"
+    "aql_buffer_ref.c"
+    "aql_buffer_ref.h"
+    "aql_command_buffer.c"
+    "aql_command_buffer.h"
+    "aql_command_buffer_profile.c"
+    "aql_command_buffer_profile.h"
+    "aql_prepublished_kernarg_storage.h"
+    "aql_program_builder.c"
+    "aql_program_builder.h"
+    "aql_program_validation.c"
+    "aql_program_validation.h"
+    "asan_state.c"
+    "asan_state.h"
+    "barrier.c"
+    "barrier.h"
+    "driver.c"
+    "driver.h"
+    "executable.c"
+    "executable.h"
+    "feedback_state.c"
+    "feedback_state.h"
+    "host_queue.c"
+    "host_queue.h"
+    "host_queue_atomic.c"
+    "host_queue_atomic.h"
+    "host_queue_blit.c"
+    "host_queue_blit.h"
+    "host_queue_command_buffer.c"
+    "host_queue_command_buffer.h"
+    "host_queue_command_buffer_block.c"
+    "host_queue_command_buffer_block.h"
+    "host_queue_command_buffer_packet.c"
+    "host_queue_command_buffer_packet.h"
+    "host_queue_command_buffer_profile.c"
+    "host_queue_command_buffer_profile.h"
+    "host_queue_command_buffer_replay.c"
+    "host_queue_command_buffer_replay.h"
+    "host_queue_command_buffer_scratch.h"
+    "host_queue_dispatch.c"
+    "host_queue_dispatch.h"
+    "host_queue_file.c"
+    "host_queue_file.h"
+    "host_queue_host_call.c"
+    "host_queue_host_call.h"
+    "host_queue_memory.c"
+    "host_queue_memory.h"
+    "host_queue_pending.c"
+    "host_queue_pending.h"
+    "host_queue_pending_operation.h"
+    "host_queue_pending_payload.c"
+    "host_queue_policy.c"
+    "host_queue_policy.h"
+    "host_queue_profile.c"
+    "host_queue_profile.h"
+    "host_queue_profile_events.c"
+    "host_queue_profile_events.h"
+    "host_queue_staging.c"
+    "host_queue_staging.h"
+    "host_queue_submission.c"
+    "host_queue_submission.h"
+    "host_queue_timestamp.c"
+    "host_queue_timestamp.h"
+    "host_queue_transfer.c"
+    "host_queue_transfer.h"
+    "host_queue_waits.c"
+    "host_queue_waits.h"
+    "hostcall_provider.c"
+    "hostcall_provider.h"
+    "hsa_queue.c"
+    "hsa_queue.h"
+    "logical_device.c"
+    "logical_device.h"
+    "physical_device.c"
+    "physical_device.h"
+    "physical_device_capabilities.c"
+    "physical_device_capabilities.h"
+    "pm4_command_atomic.c"
+    "pm4_command_atomic.h"
+    "pm4_command_buffer.c"
+    "pm4_command_buffer.h"
+    "pm4_command_builder.c"
+    "pm4_command_builder.h"
+    "pm4_command_dispatch.c"
+    "pm4_command_dispatch.h"
+    "pm4_command_program_set.c"
+    "pm4_command_program_set.h"
+    "pm4_command_record.c"
+    "pm4_command_record.h"
+    "pm4_command_transfer.c"
+    "pm4_command_transfer.h"
+    "profile_aqlprofile.c"
+    "profile_aqlprofile.h"
+    "profile_counters.c"
+    "profile_counters.h"
+    "profile_device_metrics.c"
+    "profile_device_metrics.h"
+    "profile_device_metrics_linux.c"
+    "profile_device_metrics_source.h"
+    "profile_metadata.c"
+    "profile_metadata.h"
+    "profile_traces.c"
+    "profile_traces.h"
+    "queue_scope.h"
+    "semaphore.c"
+    "semaphore.h"
+    "slab_provider.c"
+    "slab_provider.h"
+    "system.c"
+    "system.h"
+    "system_event.c"
+    "system_event.h"
+    "transient_buffer.c"
+    "transient_buffer.h"
+    "tsan_state.c"
+    "tsan_state.h"
+    "virtual_memory.c"
+    "virtual_memory.h"
+  DEPS
+    ${CMAKE_DL_LIBS}
+    ::access_policy
+    ::atomic_memory
+    ::buffer
+    ::device_spec_builder
+    ::dispatch_concurrency
+    ::executable_global_resolver
+    ::executable_metadata
+    ::executable_metadata_hsaco
+    ::kernarg_layout
+    ::profile_events
+    ::queue_execution_resources
+    ::source_context
+    iree::async
+    iree::async::util::proactor_pool
+    iree::base
+    iree::base::core_headers
+    iree::base::internal
+    iree::base::internal::arena
+    iree::base::threading
+    iree::base::threading::thread
+    iree::hal
+    iree::hal::drivers::amdgpu::abi
+    iree::hal::drivers::amdgpu::device::atomic
+    iree::hal::drivers::amdgpu::device::atomic_pm4
+    iree::hal::drivers::amdgpu::device::binaries::toc
+    iree::hal::drivers::amdgpu::device::blit
+    iree::hal::drivers::amdgpu::device::blit_pm4
+    iree::hal::drivers::amdgpu::device::dispatch
+    iree::hal::drivers::amdgpu::device::grid_sync
+    iree::hal::drivers::amdgpu::device::headers
+    iree::hal::drivers::amdgpu::device::timestamp
+    iree::hal::drivers::amdgpu::device::tsan
+    iree::hal::drivers::amdgpu::target::code_object
+    iree::hal::drivers::amdgpu::target::identity
+    iree::hal::drivers::amdgpu::util::agent_target
+    iree::hal::drivers::amdgpu::util::block_pool
+    iree::hal::drivers::amdgpu::util::device_clock
+    iree::hal::drivers::amdgpu::util::device_library
+    iree::hal::drivers::amdgpu::util::feedback_channel
+    iree::hal::drivers::amdgpu::util::global_table
+    iree::hal::drivers::amdgpu::util::hsaco_metadata
+    iree::hal::drivers::amdgpu::util::info
+    iree::hal::drivers::amdgpu::util::kfd
+    iree::hal::drivers::amdgpu::util::libaqlprofile
+    iree::hal::drivers::amdgpu::util::libhsa_headers
+    iree::hal::drivers::amdgpu::util::libhsa_test_instrumented
+    iree::hal::drivers::amdgpu::util::loaded_code_object
+    iree::hal::drivers::amdgpu::util::packet
+    iree::hal::drivers::amdgpu::util::pm4_atomic
+    iree::hal::drivers::amdgpu::util::pm4_dispatch
+    iree::hal::drivers::amdgpu::util::pm4_program
+    iree::hal::drivers::amdgpu::util::queue_primitives
+    iree::hal::drivers::amdgpu::util::shadow_map
+    iree::hal::drivers::amdgpu::util::topology
+    iree::hal::drivers::amdgpu::util::vmem
+    iree::hal::memory::passthrough_pool
+    iree::hal::memory::slab_provider
+    iree::hal::memory::tlsf_pool
+    iree::hal::memory::tracing
+    iree::hal::utils::elf_format
+    iree::hal::utils::files
+    iree::hal::utils::resource_set
+  DEFINES
+    "IREE_HAL_AMDGPU_TEST_INSTRUMENTATION"
+  TESTONLY
   PUBLIC
 )
 endif()
@@ -501,7 +707,7 @@ iree_cc_library(
     iree::hal::drivers::amdgpu::util::feedback_channel
     iree::hal::drivers::amdgpu::util::info
     iree::hal::drivers::amdgpu::util::libaqlprofile
-    iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::packet
     iree::hal::drivers::amdgpu::util::pm4_dispatch
     iree::hal::drivers::amdgpu::util::pm4_program
@@ -1131,6 +1337,7 @@ iree_cc_test(
     iree::base::testing::dynamic_library_test_library
     iree::hal
     iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::io::file_handle
     iree::testing::gtest
     iree::testing::gtest_main
@@ -1258,6 +1465,7 @@ iree_cc_test(
     iree::hal
     iree::hal::cts::util::test_base
     iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::packet
     iree::hal::drivers::amdgpu::util::topology
     iree::hal::memory::fixed_block_pool
@@ -1316,6 +1524,50 @@ iree_cc_test(
     "iree-build-requirement=runtime.hal.amdgpu"
     "iree-run-requirement=runtime.resource.amd_gpu"
     "runtime-resource=amd-gpu"
+  RESOURCE_GROUP
+    iree-hal-drivers-amdgpu-tests
+)
+endif()
+
+if(IREE_HAL_DRIVER_AMDGPU)
+iree_cc_test(
+  NAME
+    host_queue_publisher_lifetime_test
+  SRCS
+    "host_queue_command_buffer_packet.h"
+    "host_queue_command_buffer_profiling_test_util.h"
+    "host_queue_command_buffer_test_util.h"
+    "host_queue_pending_operation.h"
+    "host_queue_publisher_lifetime_test.cc"
+  DEFINES
+    "IREE_HAL_AMDGPU_TEST_INSTRUMENTATION"
+  DEPS
+    ::amdgpu_test_instrumented
+    ::headers
+    iree::async
+    iree::async::util::proactor_pool
+    iree::base
+    iree::base::threading
+    iree::hal
+    iree::hal::cts::util::registry
+    iree::hal::cts::util::test_base
+    iree::hal::drivers::amdgpu::abi
+    iree::hal::drivers::amdgpu::cts::testdata_amdgpu
+    iree::hal::drivers::amdgpu::device::headers
+    iree::hal::drivers::amdgpu::target::selection
+    iree::hal::drivers::amdgpu::util::packet
+    iree::hal::memory::fixed_block_pool
+    iree::hal::utils::resource_set
+    iree::io::file_handle
+    iree::testing::gtest
+    iree::testing::gtest_main
+    iree::testing::temp_file
+  LABELS
+    "iree-build-requirement=runtime.hal.amdgpu"
+    "iree-run-requirement=runtime.resource.amd_gpu"
+    "runtime-resource=amd-gpu"
+  TIMEOUT
+    900
   RESOURCE_GROUP
     iree-hal-drivers-amdgpu-tests
 )
@@ -1517,6 +1769,7 @@ iree_cc_test(
     iree::base
     iree::hal::drivers::amdgpu::util
     iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::libhsa_headers
     iree::hal::drivers::amdgpu::util::topology
     iree::testing::gtest
     iree::testing::gtest_main

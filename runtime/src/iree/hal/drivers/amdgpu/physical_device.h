@@ -359,6 +359,11 @@ typedef struct iree_hal_amdgpu_physical_device_t {
     iree_slim_mutex_t mutex;
     // Physical-device-owned queue reference, or NULL before first use.
     iree_hal_amdgpu_host_queue_t* queue;
+    // Physical-device-owned queue reference moved out of |queue| while a
+    // frontier deassignment is in progress. Keeping this reference until all
+    // queues in the logical-device union are certified lets the outer logical
+    // device close every queue before it waits for any queue.
+    iree_hal_amdgpu_host_queue_t* teardown_queue;
   } cooperative_queue;
 
   // Process-wide HSA system event delivery target for |device_agent|, or NULL
@@ -426,7 +431,7 @@ iree_status_t iree_hal_amdgpu_physical_device_allocate_host_queue(
     iree_hal_amdgpu_physical_device_t* physical_device,
     const iree_hal_queue_params_t* params, iree_async_axis_t axis,
     iree_hal_amdgpu_host_queue_release_slot_callback_t release_slot,
-    iree_hal_amdgpu_host_queue_t** out_queue);
+    bool retain_parent_device, iree_hal_amdgpu_host_queue_t** out_queue);
 
 // Releases the physical device's lazy cooperative queue owner reference.
 // Caller-owned queue references remain live and continue to own their dynamic
@@ -434,7 +439,27 @@ iree_status_t iree_hal_amdgpu_physical_device_allocate_host_queue(
 void iree_hal_amdgpu_physical_device_release_cooperative_queue(
     iree_hal_amdgpu_physical_device_t* physical_device);
 
-// Deinitializes any host queues initialized by assign_frontier.
+// Begins deinitializing any host queues initialized by assign_frontier.
+// Moves the physical-device-owned cooperative queue reference into teardown
+// ownership and closes admission on the cooperative and provisioned queues.
+// This is the irreversible phase and must be called across the complete
+// logical-device queue union before sealing any queue.
+void iree_hal_amdgpu_physical_device_begin_deassign_frontier(
+    iree_hal_amdgpu_physical_device_t* physical_device);
+
+// Seals all queues whose admission was closed by begin_deassign_frontier.
+// The queue and failure-delivery ledgers remain published until the matching
+// finish call.
+void iree_hal_amdgpu_physical_device_seal_deassign_frontier(
+    iree_hal_amdgpu_physical_device_t* physical_device);
+
+// Releases inert queue storage and frontier-owned resources after every queue
+// in the logical-device union has been sealed.
+void iree_hal_amdgpu_physical_device_finish_deassign_frontier(
+    iree_hal_amdgpu_physical_device_t* physical_device);
+
+// Deinitializes any host queues initialized by assign_frontier using the three
+// phases above for a standalone physical-device unwind.
 //
 // Closes admission on every queue, waits for all of them to pass their
 // idle/error boundary, retires asynchronous failure delivery for this agent,

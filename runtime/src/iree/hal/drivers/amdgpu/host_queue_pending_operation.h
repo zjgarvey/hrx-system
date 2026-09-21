@@ -49,6 +49,11 @@ typedef enum iree_hal_amdgpu_pending_op_lifecycle_e {
   // Cancellation only claims PENDING ops; the arming thread publishes PENDING
   // after registration or observes a synchronous callback as COMPLETING.
   IREE_HAL_AMDGPU_PENDING_OP_LIFECYCLE_ARMING_MEMORY_WAIT = 3,
+  // The submitting thread is registering the operation's initial semaphore
+  // waits. The op is already linked, but cancellation must not take it until
+  // registration publishes PENDING. Synchronous callbacks that resolve every
+  // wait leave completion ownership to the arming thread.
+  IREE_HAL_AMDGPU_PENDING_OP_LIFECYCLE_ARMING_WAITS = 4,
 } iree_hal_amdgpu_pending_op_lifecycle_t;
 
 // A deferred queue operation waiting for its waits to become satisfiable.
@@ -67,6 +72,11 @@ struct iree_hal_amdgpu_pending_op_t {
   // Back-pointer to the previous link field for O(1) unlink.
   iree_hal_amdgpu_pending_op_t** prev_next;
 
+  // Scalar seal-join token held from list admission through terminal callback,
+  // resource, and arena cleanup. This is not a queue/device resource retain and
+  // therefore cannot form a cycle while the operation waits unresolved.
+  bool has_submission_epilogue_token;
+
   // Completion-thread retry queued when submission capacity is unavailable.
   iree_hal_amdgpu_host_queue_post_drain_action_t capacity_retry;
 
@@ -81,6 +91,12 @@ struct iree_hal_amdgpu_pending_op_t {
 
   // Wakes cancellation when a detached wait callback finishes touching the op.
   iree_notification_t callback_notification;
+
+  // Serializes callback-tail completion with its notification wake. A callback
+  // publishes its complete bit and posts callback_notification while holding
+  // this mutex, then unlocks as its final entry/op access. Cancellation checks
+  // the same predicate under this mutex before arena destruction.
+  iree_slim_mutex_t callback_mutex;
 
   // Arena-owned clone of the wait semaphore list.
   iree_hal_semaphore_list_t wait_semaphore_list;
@@ -232,6 +248,11 @@ struct iree_hal_amdgpu_pending_op_t {
 typedef struct iree_hal_amdgpu_pending_op_payload_issue_t {
   // Whether queue admission found enough capacity for this payload.
   bool ready;
+
+  // Optional owner produced while issuing a command-buffer replay. Its final
+  // release may invoke arbitrary resource destructors and is deferred until
+  // after submission_mutex is dropped.
+  iree_hal_resource_t* cleanup_resource;
 
   // Pending alloca operation that owns a prepared cold memory-readiness wait.
   iree_hal_amdgpu_pending_op_t* memory_wait_op;

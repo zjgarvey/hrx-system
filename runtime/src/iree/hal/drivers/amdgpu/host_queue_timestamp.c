@@ -187,7 +187,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_timestamp(
   IREE_ASSERT_ARGUMENT(out_ready);
   *out_ready = false;
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
   if (IREE_UNLIKELY(flags != IREE_HAL_TIMESTAMP_FLAG_NONE)) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,

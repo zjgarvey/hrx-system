@@ -155,6 +155,57 @@ bool iree_hip_stream_lookup_retain(hipStream_t handle,
   return true;
 }
 
+typedef struct iree_hip_stream_context_match_t {
+  iree_hal_streaming_context_t* const* contexts;
+  iree_host_size_t context_count;
+} iree_hip_stream_context_match_t;
+
+static bool iree_hip_stream_matches_context(uintptr_t handle, void* user_data) {
+  const iree_hip_stream_context_match_t* match =
+      (const iree_hip_stream_context_match_t*)user_data;
+  hipStream_t stream_handle = (hipStream_t)handle;
+  iree_hal_streaming_context_t* context = NULL;
+  iree_slim_mutex_lock(&stream_handle->mutex);
+  if (stream_handle->stream) {
+    iree_hal_streaming_stream_retain_context(stream_handle->stream, &context);
+  }
+  iree_slim_mutex_unlock(&stream_handle->mutex);
+
+  bool matches = false;
+  for (iree_host_size_t i = 0; i < match->context_count; ++i) {
+    if (match->contexts[i] == context) {
+      matches = true;
+      break;
+    }
+  }
+  iree_hal_streaming_context_release(context);
+  return matches;
+}
+
+iree_status_t iree_hip_stream_snapshot_retain_for_contexts(
+    iree_hal_streaming_context_t* const* contexts,
+    iree_host_size_t context_count, hipStream_t** out_handles,
+    iree_host_size_t* out_handle_count) {
+  IREE_ASSERT_ARGUMENT(out_handles);
+  IREE_ASSERT_ARGUMENT(out_handle_count);
+  *out_handles = NULL;
+  *out_handle_count = 0;
+  if (context_count == 0) return iree_ok_status();
+
+  iree_call_once(&iree_hip_stream_registry_once,
+                 iree_hip_stream_registry_initialize);
+  const iree_hip_stream_context_match_t match = {
+      .contexts = contexts,
+      .context_count = context_count,
+  };
+  uintptr_t* handles = NULL;
+  IREE_RETURN_IF_ERROR(iree_hip_handle_registry_snapshot_retain_if(
+      &iree_hip_stream_registry, iree_hip_stream_matches_context, (void*)&match,
+      iree_hip_stream_handle_retain, &handles, out_handle_count));
+  *out_handles = (hipStream_t*)handles;
+  return iree_ok_status();
+}
+
 bool iree_hip_stream_take(hipStream_t handle, hipStream_t* out_handle) {
   IREE_ASSERT_ARGUMENT(out_handle);
   if (!handle || handle == hipStreamLegacy || handle == hipStreamPerThread) {

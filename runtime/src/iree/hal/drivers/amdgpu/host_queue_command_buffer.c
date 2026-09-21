@@ -13,6 +13,7 @@
 #include "iree/hal/drivers/amdgpu/aql_program_validation.h"
 #include "iree/hal/drivers/amdgpu/atomic_memory.h"
 #include "iree/hal/drivers/amdgpu/buffer.h"
+#include "iree/hal/drivers/amdgpu/feedback_state.h"
 #include "iree/hal/drivers/amdgpu/host_queue_command_buffer_block.h"
 #include "iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.h"
 #include "iree/hal/drivers/amdgpu/host_queue_profile.h"
@@ -30,6 +31,22 @@ iree_status_t iree_hal_amdgpu_host_queue_validate_execute_flags(
                             "unsupported execute flags: 0x%" PRIx64, flags);
   }
   return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_amdgpu_host_queue_prepare_pm4_feedback_source_batch(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_command_buffer_t* command_buffer,
+    iree_hal_amdgpu_feedback_source_batch_t** out_batch) {
+  *out_batch = NULL;
+  if (!queue->feedback_state) return iree_ok_status();
+  iree_host_size_t feedback_source_count = 0;
+  iree_hal_executable_t* const* feedback_sources =
+      iree_hal_amdgpu_pm4_command_buffer_feedback_sources(
+          command_buffer, &feedback_source_count);
+  return iree_hal_amdgpu_feedback_source_batch_prepare(
+      queue->feedback_state, queue->device_ordinal, feedback_source_count,
+      feedback_sources, out_batch);
 }
 
 iree_status_t iree_hal_amdgpu_host_queue_create_binding_table_resource_set(
@@ -75,6 +92,10 @@ iree_status_t iree_hal_amdgpu_host_queue_create_binding_table_resource_set(
   iree_status_t status =
       iree_hal_resource_set_allocate(queue->block_pool, &resource_set);
   if (iree_status_is_ok(status)) {
+    // Publish ownership before insertion: a partial insertion failure can hold
+    // the last references to arbitrary binding resources and must be cleaned
+    // up by the caller only after submission_mutex is dropped.
+    *out_resource_set = resource_set;
     status = iree_hal_resource_set_insert_strided(
         resource_set, command_buffer->binding_count, binding_table.bindings,
         offsetof(iree_hal_buffer_binding_t, buffer),
@@ -82,9 +103,6 @@ iree_status_t iree_hal_amdgpu_host_queue_create_binding_table_resource_set(
   }
   if (iree_status_is_ok(status)) {
     iree_hal_resource_set_freeze(resource_set);
-    *out_resource_set = resource_set;
-  } else {
-    iree_hal_resource_set_free(resource_set);
   }
   IREE_TRACE_ZONE_END(z0);
   return status;
@@ -382,6 +400,14 @@ iree_hal_amdgpu_host_queue_submit_profiled_pm4_command_buffer(
             queue, command_buffer, binding_table, execute_flags,
             inout_binding_resource_set));
   }
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMMAND_BUFFER_OWNER_CAPTURE,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_OWNER_CAPTURED_BEFORE_VALIDATION,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_COMMAND_BUFFER_OWNER_PATH_PM4_PROFILED,
+      command_buffer->mode);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
 
   uint64_t* binding_ptrs = NULL;
   iree_host_size_t binding_ptr_bytes = 0;
@@ -458,7 +484,12 @@ iree_hal_amdgpu_host_queue_submit_profiled_pm4_command_buffer(
   iree_hal_resource_t* command_buffer_resource =
       (iree_hal_resource_t*)command_buffer;
   hsa_signal_t publication_signal = iree_hsa_signal_null();
+  iree_hal_amdgpu_feedback_source_batch_t* feedback_source_batch = NULL;
   bool submit_called = false;
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_prepare_pm4_feedback_source_batch(
+        queue, command_buffer, &feedback_source_batch);
+  }
   if (iree_status_is_ok(status)) {
     publication_signal =
         iree_hal_amdgpu_pm4_command_buffer_acquire_publication_reference(
@@ -475,9 +506,9 @@ iree_hal_amdgpu_host_queue_submit_profiled_pm4_command_buffer(
         profile_plan->entries, profile_plan->entry_count,
         profile_plan->target_base, binding_ptrs, profile_plan->binding_count,
         profile_plan->program.dwords, profile_plan->program.dword_count,
-        publication_signal, publication_retire_action, &command_buffer_resource,
-        /*operation_resource_count=*/1, inout_binding_resource_set,
-        profile_events, profile_event_info_ptr,
+        publication_signal, publication_retire_action, &feedback_source_batch,
+        &command_buffer_resource, /*operation_resource_count=*/1,
+        inout_binding_resource_set, profile_events, profile_event_info_ptr,
         IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES, out_ready,
         &submission_id);
     if (!iree_status_is_ok(status) || !*out_ready) {
@@ -494,9 +525,8 @@ iree_hal_amdgpu_host_queue_submit_profiled_pm4_command_buffer(
       iree_hal_amdgpu_host_queue_cancel_profile_dispatch_events(queue,
                                                                 profile_events);
     }
-    iree_hal_resource_set_free(*inout_binding_resource_set);
-    *inout_binding_resource_set = NULL;
   }
+  iree_hal_amdgpu_feedback_source_batch_cancel(feedback_source_batch);
   return status;
 }
 
@@ -570,14 +600,21 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_command_buffer(
     const iree_hal_amdgpu_reclaim_action_t publication_retire_action =
         iree_hal_amdgpu_host_queue_make_pm4_publication_retire_action(
             command_buffer, publication_signal);
+    iree_hal_amdgpu_feedback_source_batch_t* feedback_source_batch = NULL;
     uint64_t submission_id = 0;
-    iree_status_t status = iree_hal_amdgpu_host_queue_submit_pm4_ib(
-        queue, resolution, signal_semaphore_list, program->dwords,
-        program->dword_count, publication_signal, publication_retire_action,
-        &command_buffer_resource, /*operation_resource_count=*/1,
-        profile_event_info_ptr,
-        IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES, out_ready,
-        &submission_id);
+    iree_status_t status =
+        iree_hal_amdgpu_host_queue_prepare_pm4_feedback_source_batch(
+            queue, command_buffer, &feedback_source_batch);
+    if (iree_status_is_ok(status)) {
+      status = iree_hal_amdgpu_host_queue_submit_pm4_ib(
+          queue, resolution, signal_semaphore_list, program->dwords,
+          program->dword_count, publication_signal, publication_retire_action,
+          &feedback_source_batch, &command_buffer_resource,
+          /*operation_resource_count=*/1, profile_event_info_ptr,
+          IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES,
+          out_ready, &submission_id);
+    }
+    iree_hal_amdgpu_feedback_source_batch_cancel(feedback_source_batch);
     if (!iree_status_is_ok(status) || !*out_ready) {
       iree_hal_amdgpu_host_queue_cancel_pm4_publication_reference(
           command_buffer, publication_signal);
@@ -595,6 +632,14 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_command_buffer(
             queue, command_buffer, binding_table, execute_flags,
             inout_binding_resource_set));
   }
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMMAND_BUFFER_OWNER_CAPTURE,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_OWNER_CAPTURED_BEFORE_VALIDATION,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_COMMAND_BUFFER_OWNER_PATH_PM4_DYNAMIC_FIXUP,
+      command_buffer->mode);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
 
   const iree_hal_amdgpu_pm4_command_buffer_fixup_plan_t* fixup_plan =
       iree_hal_amdgpu_pm4_command_buffer_fixup_plan(command_buffer);
@@ -626,6 +671,13 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_command_buffer(
             command_buffer, binding_table, binding_ptrs);
   }
   if (iree_status_is_ok(status)) {
+    iree_hal_amdgpu_feedback_source_batch_t* feedback_source_batch = NULL;
+    status = iree_hal_amdgpu_host_queue_prepare_pm4_feedback_source_batch(
+        queue, command_buffer, &feedback_source_batch);
+    if (!iree_status_is_ok(status)) {
+      iree_arena_deinitialize(&scratch_arena);
+      return status;
+    }
     const hsa_signal_t publication_signal =
         iree_hal_amdgpu_pm4_command_buffer_acquire_publication_reference(
             command_buffer);
@@ -640,12 +692,13 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_command_buffer(
         fixup_plan->entries, fixup_plan->entry_count, fixup_plan->target_base,
         binding_ptrs, command_buffer->binding_count, program->dwords,
         program->dword_count, publication_signal, publication_retire_action,
-        &command_buffer_resource, /*operation_resource_count=*/1,
-        inout_binding_resource_set,
+        &feedback_source_batch, &command_buffer_resource,
+        /*operation_resource_count=*/1, inout_binding_resource_set,
         (iree_hal_amdgpu_profile_dispatch_event_reservation_t){0},
         profile_event_info_ptr,
         IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES, out_ready,
         &submission_id);
+    iree_hal_amdgpu_feedback_source_batch_cancel(feedback_source_batch);
     if (!iree_status_is_ok(status) || !*out_ready) {
       iree_hal_amdgpu_host_queue_cancel_pm4_publication_reference(
           command_buffer, publication_signal);
@@ -656,10 +709,6 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_command_buffer(
     }
   }
   iree_arena_deinitialize(&scratch_arena);
-  if (!iree_status_is_ok(status)) {
-    iree_hal_resource_set_free(*inout_binding_resource_set);
-    *inout_binding_resource_set = NULL;
-  }
   return status;
 }
 
@@ -670,14 +719,17 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer(
     iree_hal_command_buffer_t* command_buffer,
     iree_hal_buffer_binding_table_t binding_table,
     iree_hal_queue_execute_flags_t execute_flags,
-    iree_hal_resource_set_t** inout_binding_resource_set, bool* out_ready) {
+    iree_hal_resource_set_t** inout_binding_resource_set,
+    iree_hal_resource_t** out_cleanup_resource, bool* out_ready) {
   IREE_ASSERT_ARGUMENT(queue);
   IREE_ASSERT_ARGUMENT(resolution);
   IREE_ASSERT_ARGUMENT(out_ready);
+  IREE_ASSERT_ARGUMENT(out_cleanup_resource);
   *out_ready = false;
+  *out_cleanup_resource = NULL;
 
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
   IREE_RETURN_IF_ERROR(
       iree_hal_amdgpu_host_queue_validate_execute_flags(execute_flags));
@@ -733,7 +785,8 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer(
     iree_status_t status =
         iree_hal_amdgpu_command_buffer_replay_start_under_lock(
             queue, resolution, signal_semaphore_list, command_buffer,
-            binding_table, execute_flags, inout_binding_resource_set);
+            binding_table, execute_flags, inout_binding_resource_set,
+            out_cleanup_resource);
     if (iree_status_is_ok(status)) *out_ready = true;
     return status;
   }
@@ -743,6 +796,14 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer(
             queue, command_buffer, binding_table, execute_flags,
             inout_binding_resource_set));
   }
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMMAND_BUFFER_OWNER_CAPTURE,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_OWNER_CAPTURED_BEFORE_VALIDATION,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_COMMAND_BUFFER_OWNER_PATH_DIRECT_AQL,
+      command_buffer->mode);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
   iree_hal_resource_t* command_buffer_resource =
       (iree_hal_resource_t*)command_buffer;
   bool ready = false;
@@ -752,10 +813,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer(
       (iree_hal_amdgpu_reclaim_action_t){0}, &command_buffer_resource,
       /*operation_resource_count=*/1,
       IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES, &ready);
-  if (!iree_status_is_ok(status)) {
-    iree_hal_resource_set_free(*inout_binding_resource_set);
-    *inout_binding_resource_set = NULL;
-  } else {
+  if (iree_status_is_ok(status)) {
     *out_ready = ready;
   }
   return status;

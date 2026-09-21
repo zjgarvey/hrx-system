@@ -22,6 +22,8 @@
 typedef struct iree_hal_amdgpu_asan_state_t iree_hal_amdgpu_asan_state_t;
 typedef struct iree_hal_amdgpu_feedback_state_t
     iree_hal_amdgpu_feedback_state_t;
+typedef struct iree_hal_amdgpu_source_context_t
+    iree_hal_amdgpu_source_context_t;
 typedef struct iree_hal_amdgpu_physical_device_t
     iree_hal_amdgpu_physical_device_t;
 typedef struct iree_hal_amdgpu_topology_t iree_hal_amdgpu_topology_t;
@@ -150,6 +152,11 @@ iree_status_t iree_hal_amdgpu_executable_create(
 
 // Returns the logical-device-local executable id assigned at creation.
 uint64_t iree_hal_amdgpu_executable_id(iree_hal_executable_t* executable);
+
+// Returns the immutable executable-owned source identity copied into feedback
+// packets. The returned pointer is valid while |executable| is retained.
+const iree_hal_amdgpu_source_context_t*
+iree_hal_amdgpu_executable_source_context(iree_hal_executable_t* executable);
 
 // Returns metadata about an exported kernel function in host memory.
 // The returned pointers will remain valid for the lifetime of the executable.

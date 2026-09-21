@@ -280,6 +280,37 @@ IREE_API_EXPORT iree_status_t iree_hal_allocator_virtual_memory_reserve(
   return status;
 }
 
+IREE_API_EXPORT iree_status_t iree_hal_allocator_virtual_memory_reserve_at(
+    iree_hal_allocator_t* IREE_RESTRICT allocator,
+    iree_hal_queue_family_affinity_t queue_family_affinity,
+    iree_device_size_t size, iree_device_size_t minimum_alignment,
+    iree_device_size_t requested_address,
+    iree_hal_buffer_t** IREE_RESTRICT out_virtual_buffer) {
+  IREE_ASSERT_ARGUMENT(allocator);
+  IREE_ASSERT_ARGUMENT(out_virtual_buffer);
+  *out_virtual_buffer = NULL;
+  IREE_TRACE_ZONE_BEGIN(z0);
+  IREE_TRACE_ZONE_APPEND_VALUE_I64(z0, (int64_t)size);
+  if (!_VTABLE_DISPATCH(allocator, virtual_memory_reserve_at)) {
+    if (minimum_alignment == 0 && requested_address == 0) {
+      iree_status_t status =
+          _VTABLE_DISPATCH(allocator, virtual_memory_reserve)(
+              allocator, queue_family_affinity, size, out_virtual_buffer);
+      IREE_TRACE_ZONE_END(z0);
+      return status;
+    }
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "allocator does not support virtual memory placement hints");
+  }
+  iree_status_t status = _VTABLE_DISPATCH(allocator, virtual_memory_reserve_at)(
+      allocator, queue_family_affinity, size, minimum_alignment,
+      requested_address, out_virtual_buffer);
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
 IREE_API_EXPORT iree_status_t iree_hal_allocator_virtual_memory_release(
     iree_hal_allocator_t* IREE_RESTRICT allocator,
     iree_hal_buffer_t* IREE_RESTRICT virtual_buffer) {

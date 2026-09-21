@@ -16,6 +16,14 @@ extern "C" {
 typedef struct iree_hal_streaming_device_t iree_hal_streaming_device_t;
 typedef struct iree_hal_streaming_event_t iree_hal_streaming_event_t;
 
+// Owning, fallibly prepared reset transaction. The exact handle incarnations
+// remain pinned and published until commit; cancel leaves every handle, stream,
+// queue, and primary retain unchanged.
+typedef struct iree_hip_execution_context_reset_t {
+  hipExecutionCtx_t* contexts;
+  size_t count;
+} iree_hip_execution_context_reset_t;
+
 // Returns the process-managed primary execution context for |device|, creating
 // its handle for the current device incarnation if necessary. |out_context| is
 // unchanged on failure.
@@ -79,12 +87,21 @@ hipError_t iree_hip_execution_context_wait_event(
 // device.
 hipError_t iree_hip_execution_context_synchronize(hipExecutionCtx_t context);
 
-// Invalidates every resource-partitioned execution context on |device| before
-// releasing its primary-context ownership.
-hipError_t iree_hip_execution_context_reset_device(hipDevice_t device);
+// Allocates and pins an exact reset set while lifecycle writer admission
+// stabilizes the live registry.
+hipError_t iree_hip_execution_context_prepare_reset_device(
+    hipDevice_t device, iree_hip_execution_context_reset_t* out_reset);
+hipError_t iree_hip_execution_context_prepare_reset_all(
+    iree_hip_execution_context_reset_t* out_reset);
 
-// Invalidates every resource-partitioned execution context in the process.
-hipError_t iree_hip_execution_context_reset_all(void);
+// Drops a prepared set without mutation.
+void iree_hip_execution_context_cancel_reset(
+    iree_hip_execution_context_reset_t* reset);
+
+// Quiesced commit: detaches queues while handles remain published, then exact-
+// takes and releases them. This path is allocation-free and no-fail.
+void iree_hip_execution_context_commit_reset(
+    iree_hip_execution_context_reset_t* reset);
 
 #ifdef __cplusplus
 }  // extern "C"

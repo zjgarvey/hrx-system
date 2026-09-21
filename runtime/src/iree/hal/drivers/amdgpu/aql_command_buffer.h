@@ -114,6 +114,13 @@ iree_hal_amdgpu_aql_command_buffer_required_queue_features(
 uint64_t iree_hal_amdgpu_aql_command_buffer_profile_id(
     iree_hal_command_buffer_t* command_buffer);
 
+// Returns the immutable host-only executable source sidecar populated by every
+// recorded dispatch, independent of retained/UNRETAINED mode. Entries are
+// borrowed and valid for the command-buffer lifetime.
+iree_hal_executable_t* const*
+iree_hal_amdgpu_aql_command_buffer_feedback_sources(
+    iree_hal_command_buffer_t* command_buffer, iree_host_size_t* out_count);
+
 // Returns retained dispatch summaries for |block|, or NULL when no
 // summaries were retained. |out_count| receives the number of linked summaries.
 const iree_hal_amdgpu_aql_command_buffer_dispatch_summary_t*

@@ -26,6 +26,7 @@
 #include "iree/hal/drivers/amdgpu/host_queue_policy.h"
 #include "iree/hal/drivers/amdgpu/host_queue_profile.h"
 #include "iree/hal/drivers/amdgpu/host_queue_profile_events.h"
+#include "iree/hal/drivers/amdgpu/host_queue_staging.h"
 #include "iree/hal/drivers/amdgpu/host_queue_submission.h"
 #include "iree/hal/drivers/amdgpu/host_queue_timestamp.h"
 #include "iree/hal/drivers/amdgpu/host_queue_transfer.h"
@@ -41,6 +42,98 @@
 
 static void iree_hal_amdgpu_host_queue_destroy(iree_hal_queue_t* base_queue);
 static const iree_hal_queue_vtable_t iree_hal_amdgpu_host_queue_vtable;
+
+// Stack-owned identity of a queue completion service. The thread trampoline
+// copies its entry argument before calling us, so a self-finalizing queue may
+// detach/free its iree_thread_t and queue/device storage as long as this record
+// is the only state inspected before the entry point returns.
+typedef struct iree_hal_amdgpu_host_queue_completion_service_t {
+  iree_hal_amdgpu_host_queue_t* queue;
+  struct iree_hal_amdgpu_host_queue_completion_service_t* previous;
+  bool exit_requested;
+} iree_hal_amdgpu_host_queue_completion_service_t;
+
+static IREE_THREAD_LOCAL iree_hal_amdgpu_host_queue_completion_service_t*
+    iree_hal_amdgpu_host_queue_current_completion_service = NULL;
+
+bool iree_hal_amdgpu_host_queue_lifetime_try_acquire(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_host_queue_lifetime_claim_t* out_claim) {
+  IREE_ASSERT_ARGUMENT(queue);
+  IREE_ASSERT_ARGUMENT(out_claim);
+  memset(out_claim, 0, sizeof(*out_claim));
+
+  // The device is acquired first so every queue retain continues to satisfy
+  // the HAL queue contract requiring its parent to remain live. Both retains
+  // are non-resurrecting: failure means a destructor already owns lifetime and
+  // will join the independently stable callback/runner before freeing storage.
+  iree_hal_device_t* device = queue->logical_device;
+  if (!iree_hal_resource_try_retain(device)) return false;
+  out_claim->device = device;
+  out_claim->device_retained = true;
+  if (!iree_hal_resource_try_retain(&queue->base)) {
+    out_claim->device = NULL;
+    out_claim->device_retained = false;
+    iree_hal_device_release(device);
+    return false;
+  }
+  out_claim->queue = queue;
+  out_claim->queue_retained = true;
+  return true;
+}
+
+bool iree_hal_amdgpu_host_queue_lifetime_release(
+    iree_hal_amdgpu_host_queue_lifetime_claim_t* claim) {
+  IREE_ASSERT_ARGUMENT(claim);
+  iree_hal_amdgpu_host_queue_t* queue = claim->queue;
+  iree_hal_device_t* device = claim->device;
+  const bool queue_retained = claim->queue_retained;
+  const bool device_retained = claim->device_retained;
+  const bool is_dedicated = queue && queue->storage.parent_device != NULL;
+  memset(claim, 0, sizeof(*claim));
+
+  // A dedicated queue has a permanent queue->device edge. Drop the temporary
+  // device reference first and the queue reference last; its destructor can
+  // then consume the permanent edge after freeing queue storage. Provisioned
+  // and cached-cooperative queues are owned by the device, so return the queue
+  // to its parent-only reference before the final device release.
+  if (is_dedicated) {
+    if (device_retained) iree_hal_device_release(device);
+    if (queue_retained) iree_hal_queue_release(&queue->base);
+  } else {
+    if (queue_retained) iree_hal_queue_release(&queue->base);
+    if (device_retained) iree_hal_device_release(device);
+  }
+
+  iree_hal_amdgpu_host_queue_completion_service_t* current_service =
+      iree_hal_amdgpu_host_queue_current_completion_service;
+  return current_service && current_service->exit_requested;
+}
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+static iree_hal_amdgpu_host_queue_test_phase_observer_t
+    iree_hal_amdgpu_host_queue_test_phase_observer = NULL;
+static void* iree_hal_amdgpu_host_queue_test_phase_observer_user_data = NULL;
+
+void iree_hal_amdgpu_host_queue_test_set_phase_observer(
+    iree_hal_amdgpu_host_queue_test_phase_observer_t observer,
+    void* user_data) {
+  iree_hal_amdgpu_host_queue_test_phase_observer = observer;
+  iree_hal_amdgpu_host_queue_test_phase_observer_user_data = user_data;
+}
+
+void iree_hal_amdgpu_host_queue_test_notify_phase(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_host_queue_test_subject_t subject,
+    iree_hal_amdgpu_host_queue_test_phase_t phase, uint64_t value0,
+    uint64_t value1) {
+  if (iree_hal_amdgpu_host_queue_test_phase_observer) {
+    iree_hal_amdgpu_host_queue_test_phase_observer(
+        queue, subject, phase, value0, value1,
+        iree_hal_amdgpu_host_queue_test_phase_observer_user_data);
+  }
+}
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
 
 static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
     iree_hal_amdgpu_host_queue_t* queue,
@@ -92,8 +185,8 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
         /*inout_resource_set=*/NULL,
         IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_NONE, &submission);
     iree_hal_amdgpu_host_queue_publish_submission_kernargs(queue, &submission);
-    iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                    submission_epoch);
+    iree_hal_amdgpu_host_queue_publish_submission_epoch(queue,
+                                                        submission_epoch);
     iree_hal_amdgpu_aql_ring_commit(packet, header, setup);
     iree_hal_amdgpu_aql_ring_doorbell(&queue->aql_ring,
                                       submission.first_packet_id);
@@ -315,8 +408,20 @@ static void iree_hal_amdgpu_host_queue_reclaim_retired_with_feedback(
   (void)epoch;
   iree_hal_amdgpu_host_queue_t* queue =
       (iree_hal_amdgpu_host_queue_t*)user_data;
-  iree_hal_amdgpu_feedback_state_drain_physical_device(queue->feedback_state,
-                                                       queue->device_ordinal);
+  iree_hal_amdgpu_feedback_source_batch_t* source_batch =
+      entry->feedback_source_batch;
+  entry->feedback_source_batch = NULL;
+  if (source_batch &&
+      !iree_any_bit_set(flags, IREE_HAL_AMDGPU_RECLAIM_RETIRE_FLAG_FAILED)) {
+    // Lane A acquired this completed epoch before Lane C reached this hook.
+    // The acquired reservation target closes the exact source interval; the
+    // device feedback service owns eventual read-tail retirement independently
+    // of this queue and may outlive the reclaim entry.
+    iree_hal_amdgpu_feedback_source_batch_close(source_batch);
+  }
+  // A force-failed epoch has no matching HSA completion acquire. Its installed
+  // batch deliberately remains OPEN in the device ledger until feedback/device
+  // teardown, preventing a late packet from dereferencing a released source.
   iree_hal_amdgpu_host_queue_retire_reclaim_entry(entry, flags, queue);
 }
 
@@ -349,10 +454,11 @@ static void iree_hal_amdgpu_host_queue_reclaim_queue_owned_positions(
 // Initialization / deinitialization
 //===----------------------------------------------------------------------===//
 
-void iree_hal_amdgpu_host_queue_enqueue_post_drain_action(
+void iree_hal_amdgpu_host_queue_enqueue_post_drain_action_and_notify(
     iree_hal_amdgpu_host_queue_t* queue,
     iree_hal_amdgpu_host_queue_post_drain_action_t* action,
-    iree_hal_amdgpu_host_queue_post_drain_fn_t fn, void* user_data) {
+    iree_hal_amdgpu_host_queue_post_drain_fn_t fn, void* user_data,
+    iree_notification_t* enqueued_notification) {
   action->next = NULL;
   action->fn = fn;
   action->user_data = user_data;
@@ -364,17 +470,60 @@ void iree_hal_amdgpu_host_queue_enqueue_post_drain_action(
     queue->post_drain.head = action;
   }
   queue->post_drain.tail = action;
+  if (enqueued_notification) {
+    iree_notification_post(enqueued_notification, IREE_ALL_WAITERS);
+  }
+  if (queue->completion.work_signal.handle) {
+    iree_hsa_signal_store_screlease(IREE_LIBHSA(queue->libhsa),
+                                    queue->completion.work_signal, 1);
+  }
+  // Posting both wakes while holding post_drain_mutex makes the unlock the
+  // producer's final queue/action access. A service or sealer cannot dequeue
+  // and free embedded action storage until after this function stops touching
+  // it, and a stopped service can observe |enqueued_notification|.
   iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
+}
+
+void iree_hal_amdgpu_host_queue_enqueue_post_drain_action(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_host_queue_post_drain_action_t* action,
+    iree_hal_amdgpu_host_queue_post_drain_fn_t fn, void* user_data) {
+  iree_hal_amdgpu_host_queue_enqueue_post_drain_action_and_notify(
+      queue, action, fn, user_data, /*enqueued_notification=*/NULL);
 }
 
 static void iree_hal_amdgpu_host_queue_run_post_drain_actions(
     iree_hal_amdgpu_host_queue_t* queue) {
   iree_slim_mutex_lock(&queue->locks.post_drain_mutex);
+  if (queue->post_drain.runner_active) {
+    // The active runner owns exactly one detached batch. Ordinary drainers
+    // must not wait here: a callback may reenter a waiter drain on the same
+    // thread. Work appended behind the detached batch keeps the completion
+    // work signal raised for a later service pass, while terminal sealers use
+    // await_post_drain_idle to drive all batches to a fixed point.
+    iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
+    return;
+  }
+  queue->post_drain.runner_active = true;
+
+  // A normal completion epilogue owns one snapshot, not a drain-to-fixed-point
+  // loop. A callback that consumes newly reclaimed notification capacity may
+  // fill the ring again before a later callback retries. Yielding after this
+  // snapshot lets notification drain run between those attempts.
   iree_hal_amdgpu_host_queue_post_drain_action_t* action =
       queue->post_drain.head;
   queue->post_drain.head = NULL;
   queue->post_drain.tail = NULL;
   iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  if (action) {
+    iree_hal_amdgpu_host_queue_test_notify_phase(
+        queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_POST_DRAIN_RUNNER,
+        IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_POST_DRAIN_BATCH_DETACHED_BEFORE_CALLBACK,
+        /*value0=*/0, /*value1=*/0);
+  }
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
 
   while (action) {
     iree_hal_amdgpu_host_queue_post_drain_action_t* next_action = action->next;
@@ -382,6 +531,92 @@ static void iree_hal_amdgpu_host_queue_run_post_drain_actions(
     action->fn(action->user_data);
     action = next_action;
   }
+
+  iree_slim_mutex_lock(&queue->locks.post_drain_mutex);
+  IREE_ASSERT((queue->post_drain.head == NULL) ==
+              (queue->post_drain.tail == NULL));
+  queue->post_drain.runner_active = false;
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  const bool has_queued_batch = queue->post_drain.head != NULL;
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_POST_DRAIN_RUNNER,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_POST_DRAIN_BATCH_YIELDED_BEFORE_WAKE,
+      has_queued_batch ? 1 : 0, /*value1=*/0);
+  if (!has_queued_batch) {
+    iree_hal_amdgpu_host_queue_test_notify_phase(
+        queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_POST_DRAIN_RUNNER,
+        IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_POST_DRAIN_IDLE_BEFORE_WAKE, 0,
+        0);
+  }
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+  iree_notification_post(&queue->post_drain_notification, IREE_ALL_WAITERS);
+  // This unlock is the runner's final queue access. Posting while the mutex is
+  // still held prevents a woken sealer from observing the yielded state and
+  // freeing the notification storage before the post completes.
+  iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
+}
+
+static bool iree_hal_amdgpu_host_queue_post_drain_runner_is_inactive(
+    void* user_data) {
+  iree_hal_amdgpu_host_queue_t* queue =
+      (iree_hal_amdgpu_host_queue_t*)user_data;
+  iree_slim_mutex_lock(&queue->locks.post_drain_mutex);
+  const bool is_inactive = !queue->post_drain.runner_active;
+  IREE_ASSERT((queue->post_drain.head == NULL) ==
+              (queue->post_drain.tail == NULL));
+  iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
+  return is_inactive;
+}
+
+static void iree_hal_amdgpu_host_queue_await_post_drain_idle(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  // The sealer owns liveness after completion service shutdown. Repeatedly
+  // claim one batch or join its current owner, then recheck under the queue
+  // mutex. This is deliberately the fixed-point counterpart to the
+  // fairness-limited normal service pass above. Callers reach this only from
+  // terminal ownership outside a post-drain callback: completion/waiter
+  // lifetime claims defer self-seal until their epilogue (and its batch) has
+  // returned, so joining an active runner cannot wait on the calling thread.
+  for (;;) {
+    iree_hal_amdgpu_host_queue_run_post_drain_actions(queue);
+    iree_slim_mutex_lock(&queue->locks.post_drain_mutex);
+    const bool is_idle =
+        !queue->post_drain.runner_active && queue->post_drain.head == NULL;
+    IREE_ASSERT((queue->post_drain.head == NULL) ==
+                (queue->post_drain.tail == NULL));
+    iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
+    if (is_idle) return;
+    iree_notification_await(
+        &queue->post_drain_notification,
+        iree_hal_amdgpu_host_queue_post_drain_runner_is_inactive, queue,
+        iree_infinite_timeout());
+  }
+}
+
+// Drains every owner-sensitive deferred path while the queue's public failure
+// and resource ledgers are still published. Admission must already be closed.
+// The first pass resumes capacity-parked operations so they observe shutdown;
+// cancellation then waits out semaphore callbacks and releases their retained
+// resources; the final fixed-point drain consumes cleanup actions produced by
+// either path, including actions requeued by earlier detached snapshots.
+static void iree_hal_amdgpu_host_queue_drain_shutdown_deferred(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_hal_amdgpu_host_queue_run_post_drain_actions(queue);
+  iree_status_t shutdown_status =
+      iree_hal_amdgpu_host_queue_clone_shutdown_status(queue);
+  iree_hal_amdgpu_host_queue_cancel_pending(queue, shutdown_status);
+  iree_status_free(shutdown_status);
+  iree_hal_amdgpu_host_queue_await_post_drain_idle(queue);
+}
+
+static bool iree_hal_amdgpu_host_queue_post_drain_is_empty(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_slim_mutex_lock(&queue->locks.post_drain_mutex);
+  const bool is_empty =
+      queue->post_drain.head == NULL && !queue->post_drain.runner_active;
+  IREE_ASSERT(is_empty == (queue->post_drain.tail == NULL));
+  iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
+  return is_empty;
 }
 
 void iree_hal_amdgpu_host_queue_query_scope(
@@ -413,78 +648,459 @@ void iree_hal_amdgpu_host_queue_query_scope(
   };
 }
 
-// Drains completed notification entries and reclaims kernarg space. If the GPU
-// queue has faulted (error_status is set), fails all pending entries instead of
-// draining normally. Caller must hold completion_drain_mutex.
-static iree_host_size_t iree_hal_amdgpu_host_queue_drain_completions_locked(
+typedef struct iree_hal_amdgpu_host_queue_completion_runner_t {
+  iree_hal_amdgpu_host_queue_t* queue;
+  iree_hal_amdgpu_notification_ring_claim_t claim;
+  struct iree_hal_amdgpu_host_queue_completion_runner_t* previous;
+  uint64_t frontier_dispatched_epoch;
+  uint32_t dispatch_depth;
+  uint32_t retire_depth;
+  bool frontier_failed;
+  bool profile_events_cleared;
+  bool release_in_progress;
+} iree_hal_amdgpu_host_queue_completion_runner_t;
+
+// Direct waiters may assist from unmanaged threads, so runner identity is a
+// TLS stack instead of an iree_thread_t. The stack also supports a callback on
+// one queue draining another queue and then reentering its predecessor.
+static IREE_THREAD_LOCAL iree_hal_amdgpu_host_queue_completion_runner_t*
+    iree_hal_amdgpu_host_queue_current_completion_runner = NULL;
+
+static iree_hal_amdgpu_host_queue_completion_runner_t*
+iree_hal_amdgpu_host_queue_find_current_completion_runner(
     iree_hal_amdgpu_host_queue_t* queue) {
-  // Check for GPU queue error (set by the HSA error callback on another
-  // thread). If the queue has faulted, no further epochs will advance;
-  // fail all pending entries so waiters get the actual GPU error instead
-  // of hanging or timing out.
-  const intptr_t error_status =
-      iree_hal_amdgpu_host_queue_load_error_status_raw(queue);
-  const uint64_t previous_epoch = (uint64_t)iree_atomic_load(
-      &queue->notification_ring.epoch.last_drained, iree_memory_order_relaxed);
-  iree_hal_amdgpu_reclaim_positions_t reclaim_positions = {0};
-  iree_host_size_t count = 0;
-  if (IREE_UNLIKELY(error_status != 0)) {
-    count = iree_hal_amdgpu_notification_ring_fail_all_reclaim_positions(
-        &queue->notification_ring, (iree_status_t)error_status,
-        iree_hal_amdgpu_host_queue_reclaim_retire_fn(queue), queue,
-        &reclaim_positions);
-    iree_hal_amdgpu_host_queue_clear_profile_events(queue);
-    iree_async_frontier_tracker_fail_axis(
-        queue->frontier_tracker, queue->axis,
-        iree_status_from_code(iree_status_code((iree_status_t)error_status)));
-  } else {
-    count = iree_hal_amdgpu_notification_ring_drain_reclaim_positions(
-        &queue->notification_ring,
-        /*fallback_frontier=*/NULL,
-        iree_hal_amdgpu_host_queue_reclaim_retire_fn(queue), queue,
-        &reclaim_positions);
-    const uint64_t current_epoch =
-        (uint64_t)iree_atomic_load(&queue->notification_ring.epoch.last_drained,
-                                   iree_memory_order_acquire);
-    if (current_epoch > previous_epoch) {
-      iree_async_frontier_tracker_advance(queue->frontier_tracker, queue->axis,
-                                          current_epoch);
+  iree_hal_amdgpu_host_queue_completion_runner_t* runner =
+      iree_hal_amdgpu_host_queue_current_completion_runner;
+  while (runner && runner->queue != queue) runner = runner->previous;
+  return runner;
+}
+
+// Runs A-E against the runner's private cursors. Reentrant calls share the
+// same claim. A nested call may extend and dispatch later completed values but
+// never publishes producer-visible reuse cursors; only the outer owner commits.
+static iree_host_size_t iree_hal_amdgpu_host_queue_completion_runner_pump(
+    iree_hal_amdgpu_host_queue_completion_runner_t* runner) {
+  iree_hal_amdgpu_host_queue_t* queue = runner->queue;
+  iree_hal_amdgpu_notification_ring_claim_t* claim = &runner->claim;
+  const uint64_t initial_read = claim->dispatched_read;
+
+  // Feedback sinks are forbidden from reentering their originating device.
+  // Refuse to mutate the shared private claim if an internal diagnostic or
+  // malformed sink nevertheless reenters while lane C owns an entry.
+  if (runner->retire_depth != 0) return 0;
+
+  for (;;) {
+    const intptr_t error_status =
+        iree_hal_amdgpu_host_queue_load_error_status_raw(queue);
+    const bool force_failure = error_status != 0;
+    const iree_status_code_t failure_code =
+        force_failure ? iree_status_code((iree_status_t)error_status)
+                      : IREE_STATUS_OK;
+    const uint64_t target_epoch =
+        iree_hal_amdgpu_notification_ring_claim_query_target(
+            &queue->notification_ring, force_failure);
+
+    if (target_epoch > claim->transitioned_epoch) {
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+      iree_hal_amdgpu_host_queue_test_notify_phase(
+          queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+          IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_COMPLETION_CLAIMED,
+          target_epoch, force_failure ? 1 : 0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+      const iree_status_t transition_status =
+          force_failure ? iree_status_from_code(failure_code)
+                        : iree_ok_status();
+      iree_hal_amdgpu_notification_ring_claim_transition(
+          &queue->notification_ring, claim, target_epoch, transition_status);
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+      iree_hal_amdgpu_host_queue_test_notify_phase(
+          queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+          IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_TRANSITIONS_DONE,
+          claim->transitioned_epoch, 0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+      iree_hal_amdgpu_notification_ring_claim_prepare(
+          &queue->notification_ring, claim, target_epoch, force_failure,
+          failure_code, /*fallback_frontier=*/NULL);
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+      iree_hal_amdgpu_host_queue_test_notify_phase(
+          queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+          IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_VALUES_PREPARED,
+          claim->prepared_read, target_epoch);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+      ++runner->retire_depth;
+      iree_hal_amdgpu_notification_ring_claim_retire(
+          &queue->notification_ring, claim, target_epoch, force_failure,
+          iree_hal_amdgpu_host_queue_reclaim_retire_fn(queue), queue);
+      --runner->retire_depth;
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+      iree_hal_amdgpu_host_queue_test_notify_phase(
+          queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+          IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_FEEDBACK_TARGET_CLOSED,
+          claim->retire_completed_epoch, 0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
     }
+
+    // Dispatch may synchronously invoke timepoint callbacks. Nested drains
+    // share this claim and may extend A-D, but E remains blocked until the
+    // complete callback stack has returned.
+    ++runner->dispatch_depth;
+    (void)iree_hal_amdgpu_notification_ring_claim_dispatch(
+        &queue->notification_ring, claim);
+    --runner->dispatch_depth;
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+    iree_hal_amdgpu_host_queue_test_notify_phase(
+        queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+        IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_TIMEPOINTS_DISPATCHED,
+        claim->dispatched_read, 0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+    // Frontier failure/advance also synchronously dispatches callbacks and is
+    // therefore lane D work, not scalar bookkeeping after cursor publication.
+    // Mark the private cursor first so a nested same-thread drain extends the
+    // claim without recursively dispatching the same frontier transition.
+    if (runner->dispatch_depth == 0) {
+      if (force_failure && !runner->profile_events_cleared) {
+        runner->profile_events_cleared = true;
+        ++runner->dispatch_depth;
+        iree_hal_amdgpu_host_queue_clear_profile_events(queue);
+        --runner->dispatch_depth;
+        continue;
+      }
+      if (force_failure && !runner->frontier_failed) {
+        runner->frontier_failed = true;
+        ++runner->dispatch_depth;
+        iree_async_frontier_tracker_fail_axis(
+            queue->frontier_tracker, queue->axis,
+            iree_status_from_code(failure_code));
+        --runner->dispatch_depth;
+        continue;
+      }
+      if (!runner->frontier_failed &&
+          claim->retire_completed_epoch > runner->frontier_dispatched_epoch) {
+        const uint64_t frontier_epoch = claim->retire_completed_epoch;
+        runner->frontier_dispatched_epoch = frontier_epoch;
+        ++runner->dispatch_depth;
+        iree_async_frontier_tracker_advance(queue->frontier_tracker,
+                                            queue->axis, frontier_epoch);
+        --runner->dispatch_depth;
+        continue;
+      }
+    }
+
+    // A generic release may synchronously reenter this queue. Advance the
+    // private epoch first, but prevent the nested pump from starting a second
+    // E action until this release has returned. It may still run A-D so waits
+    // on later completed values make progress.
+    if (runner->dispatch_depth == 0 && !runner->release_in_progress &&
+        claim->released_epoch < claim->retire_completed_epoch) {
+      runner->release_in_progress = true;
+      const bool did_release =
+          iree_hal_amdgpu_notification_ring_claim_release_one(
+              &queue->notification_ring, claim);
+      runner->release_in_progress = false;
+      IREE_ASSERT(did_release);
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+      iree_hal_amdgpu_host_queue_test_notify_phase(
+          queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+          IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_RELEASES_DONE,
+          claim->released_epoch, 0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+      continue;
+    }
+
+    // Reclaim queue-owned ring positions as part of lane E. Detach the
+    // positions first and block nested E while the reclaim implementation may
+    // synchronously release resources or reenter the queue.
+    if (runner->dispatch_depth == 0 && !runner->release_in_progress &&
+        (claim->reclaim_positions.kernarg_write_position != 0 ||
+         claim->reclaim_positions.queue_upload_write_position != 0)) {
+      const iree_hal_amdgpu_reclaim_positions_t reclaim_positions =
+          claim->reclaim_positions;
+      claim->reclaim_positions = (iree_hal_amdgpu_reclaim_positions_t){0};
+      runner->release_in_progress = true;
+      iree_hal_amdgpu_host_queue_reclaim_queue_owned_positions(
+          queue, reclaim_positions);
+      runner->release_in_progress = false;
+      continue;
+    }
+
+    // Recheck after callback-capable D/E work. GPU completion or a reentrant
+    // submission may have extended the ready prefix while public reuse cursors
+    // intentionally remained frozen.
+    const intptr_t final_error_status =
+        iree_hal_amdgpu_host_queue_load_error_status_raw(queue);
+    const uint64_t final_target =
+        iree_hal_amdgpu_notification_ring_claim_query_target(
+            &queue->notification_ring, final_error_status != 0);
+    if (final_target > claim->claimed_epoch) continue;
+    if (claim->dispatched_read < claim->prepared_read) continue;
+    if (runner->dispatch_depth == 0 && !runner->release_in_progress &&
+        claim->released_epoch < claim->retire_completed_epoch) {
+      continue;
+    }
+    if (runner->dispatch_depth == 0 && !runner->release_in_progress &&
+        (claim->reclaim_positions.kernarg_write_position != 0 ||
+         claim->reclaim_positions.queue_upload_write_position != 0)) {
+      continue;
+    }
+    break;
   }
-  iree_hal_amdgpu_host_queue_reclaim_queue_owned_positions(queue,
-                                                           reclaim_positions);
+
+  return (iree_host_size_t)(claim->dispatched_read - initial_read);
+}
+
+static bool iree_hal_amdgpu_host_queue_completion_runner_is_idle(
+    void* user_data) {
+  iree_hal_amdgpu_host_queue_t* queue =
+      (iree_hal_amdgpu_host_queue_t*)user_data;
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  const bool is_idle = !queue->completion.runner_active;
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+  return is_idle;
+}
+
+static bool iree_hal_amdgpu_host_queue_completion_is_quiescent(
+    void* user_data) {
+  iree_hal_amdgpu_host_queue_t* queue =
+      (iree_hal_amdgpu_host_queue_t*)user_data;
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  const bool is_quiescent =
+      !queue->completion.runner_active && queue->completion.epilogue_count == 0;
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+  return is_quiescent;
+}
+
+static bool iree_hal_amdgpu_host_queue_completion_runner_is_closed_and_idle(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  const bool is_closed_and_idle =
+      queue->completion.runner_state ==
+          IREE_HAL_AMDGPU_COMPLETION_RUNNER_STATE_CLOSED &&
+      !queue->completion.runner_active && queue->completion.epilogue_count == 0;
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+  return is_closed_and_idle;
+}
+
+static void iree_hal_amdgpu_host_queue_close_completion_runner(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  queue->completion.runner_state =
+      IREE_HAL_AMDGPU_COMPLETION_RUNNER_STATE_CLOSED;
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  // completion_drain_mutex remains held. The observer must not reenter the
+  // queue or acquire any queue-owned lock.
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_COMPLETION_RUNNER_CLOSED_INSTALLED,
+      /*value0=*/0, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+  const bool is_quiescent =
+      !queue->completion.runner_active && queue->completion.epilogue_count == 0;
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+  if (!is_quiescent) {
+    iree_notification_await(&queue->completion.runner_notification,
+                            iree_hal_amdgpu_host_queue_completion_is_quiescent,
+                            queue, iree_infinite_timeout());
+  }
+}
+
+static iree_host_size_t iree_hal_amdgpu_host_queue_drain_completions_serialized(
+    iree_hal_amdgpu_host_queue_t* queue, bool allow_closed,
+    bool* out_has_epilogue_token) {
+  *out_has_epilogue_token = false;
+  iree_hal_amdgpu_host_queue_completion_runner_t* current_runner =
+      iree_hal_amdgpu_host_queue_find_current_completion_runner(queue);
+  if (current_runner) {
+    return iree_hal_amdgpu_host_queue_completion_runner_pump(current_runner);
+  }
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_RUNNER_CLAIM,
+      allow_closed ? 1 : 0, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+  // Acquire sole runner ownership. A competing thread waits for the complete
+  // outer cursor commit; callbacks on this thread reenter through TLS above.
+  for (;;) {
+    iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+    const bool is_closed = queue->completion.runner_state ==
+                           IREE_HAL_AMDGPU_COMPLETION_RUNNER_STATE_CLOSED;
+    if (is_closed && !allow_closed) {
+      iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+      return 0;
+    }
+    IREE_ASSERT(!allow_closed || is_closed,
+                "terminal runner claim requires CLOSED admission");
+    if (!queue->completion.runner_active) {
+      queue->completion.runner_active = true;
+      iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+      break;
+    }
+    iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+    iree_notification_await(
+        &queue->completion.runner_notification,
+        iree_hal_amdgpu_host_queue_completion_runner_is_idle, queue,
+        iree_infinite_timeout());
+  }
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_AFTER_RUNNER_CLAIM,
+      allow_closed ? 1 : 0, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+  iree_hal_amdgpu_host_queue_completion_runner_t runner = {
+      .queue = queue,
+      .previous = iree_hal_amdgpu_host_queue_current_completion_runner,
+  };
+  iree_hal_amdgpu_notification_ring_claim_initialize(&queue->notification_ring,
+                                                     &runner.claim);
+  runner.frontier_dispatched_epoch = runner.claim.initial_epoch;
+  iree_hal_amdgpu_host_queue_current_completion_runner = &runner;
+  const uint64_t initial_read = runner.claim.initial_read;
+  (void)iree_hal_amdgpu_host_queue_completion_runner_pump(&runner);
+  const iree_host_size_t count =
+      (iree_host_size_t)(runner.claim.dispatched_read - initial_read);
+
+  // Publish epoch/hot/frontier reuse as one producer-serialized logical
+  // commit. No callback or generic release runs under submission_mutex.
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  iree_hal_amdgpu_notification_ring_claim_commit(&queue->notification_ring,
+                                                 &runner.claim);
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_COMPLETION_RUNNER,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_PUBLIC_CURSORS_FINALIZED,
+      runner.claim.released_epoch, runner.claim.dispatched_read);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+  iree_hal_amdgpu_host_queue_current_completion_runner = runner.previous;
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  // Install the wrapper-tail token before publishing runner inactivity. Seal
+  // therefore observes either the runner or its admitted post-drain epilogue.
+  ++queue->completion.epilogue_count;
+  queue->completion.runner_active = false;
+  iree_notification_post(&queue->completion.runner_notification,
+                         IREE_ALL_WAITERS);
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+  *out_has_epilogue_token = true;
+  return count;
+}
+
+static void iree_hal_amdgpu_host_queue_run_completion_epilogue_and_leave(
+    iree_hal_amdgpu_host_queue_t* queue) {
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_SAFE_EPILOGUE,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_AFTER_RUNNER_RELEASE_BEFORE_EPILOGUE,
+      /*value0=*/0, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+  iree_hal_amdgpu_host_queue_run_post_drain_actions(queue);
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_SAFE_EPILOGUE,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_EPILOGUE_TOKEN_DROP,
+      /*value0=*/0, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+  // Wake and count publication are one lock-linearized final queue operation.
+  // A normal wrapper touches no queue storage after this unlock.
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  IREE_ASSERT(queue->completion.epilogue_count > 0);
+  --queue->completion.epilogue_count;
+  iree_notification_post(&queue->completion.runner_notification,
+                         IREE_ALL_WAITERS);
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+}
+
+// Registers an unlocked callback/resource-release epilogue before the
+// submission that owns it leaves submission_mutex. Queue teardown closes
+// submission admission before it closes the completion runner, so an accepted
+// submission always installs this token before the sealer can certify the
+// queue. Asynchronous terminal scopes consume the token as their final direct
+// queue access; capture scopes may consume it after regaining the submission
+// serialization still owned by their public queue call.
+void iree_hal_amdgpu_host_queue_enter_submission_epilogue(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  IREE_ASSERT(queue->completion.runner_state ==
+              IREE_HAL_AMDGPU_COMPLETION_RUNNER_STATE_RUNNING);
+  ++queue->completion.epilogue_count;
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+}
+
+// Consumes a token installed by
+// iree_hal_amdgpu_host_queue_enter_submission_epilogue. Unlocking the mutex is
+// the final queue access owned by the token scope.
+void iree_hal_amdgpu_host_queue_leave_submission_epilogue(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
+  IREE_ASSERT(queue->completion.epilogue_count > 0);
+  --queue->completion.epilogue_count;
+  iree_notification_post(&queue->completion.runner_notification,
+                         IREE_ALL_WAITERS);
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
+}
+
+static iree_host_size_t
+iree_hal_amdgpu_host_queue_drain_completions_with_lifetime(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_hal_amdgpu_host_queue_lifetime_claim_t lifetime_claim;
+  (void)iree_hal_amdgpu_host_queue_lifetime_try_acquire(queue, &lifetime_claim);
+  bool has_epilogue_token = false;
+  const iree_host_size_t count =
+      iree_hal_amdgpu_host_queue_drain_completions_serialized(
+          queue, /*allow_closed=*/false, &has_epilogue_token);
+  if (has_epilogue_token) {
+    iree_hal_amdgpu_host_queue_run_completion_epilogue_and_leave(queue);
+  }
+  // This is the outer safe point. It may synchronously destroy |queue| and
+  // its logical device on the current completion service; no queue access is
+  // permitted after the release.
+  (void)iree_hal_amdgpu_host_queue_lifetime_release(&lifetime_claim);
   return count;
 }
 
 iree_host_size_t iree_hal_amdgpu_host_queue_drain_completions(
     iree_hal_amdgpu_host_queue_t* queue) {
-  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
-  iree_host_size_t count =
-      iree_hal_amdgpu_host_queue_drain_completions_locked(queue);
-  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
-  iree_hal_amdgpu_host_queue_run_post_drain_actions(queue);
-  return count;
+  return iree_hal_amdgpu_host_queue_drain_completions_with_lifetime(queue);
 }
 
 iree_host_size_t iree_hal_amdgpu_host_queue_drain_completions_for_waiter(
     iree_hal_amdgpu_host_queue_t* queue) {
-  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
-  iree_host_size_t count =
-      iree_hal_amdgpu_host_queue_drain_completions_locked(queue);
-  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
-  return count;
+  return iree_hal_amdgpu_host_queue_drain_completions_with_lifetime(queue);
 }
 
 static bool iree_hal_amdgpu_host_queue_store_error(
     iree_hal_amdgpu_host_queue_t* queue, iree_status_t error) {
-  intptr_t expected = 0;
-  if (iree_atomic_compare_exchange_strong(
-          &queue->error_status, &expected, (intptr_t)error,
-          iree_memory_order_release, iree_memory_order_acquire)) {
-    return true;
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_FAILURE_ADMISSION,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_FAILURE_ADMISSION_LOCK,
+      /*value0=*/0, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+
+  // All queue publishers hold submission_mutex from admission through epoch
+  // publication/doorbell. Installing the first error and closing admission in
+  // the same critical section therefore gives failure one exact linearization
+  // against both already-admitted and not-yet-admitted publishers.
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  const bool won = iree_hal_amdgpu_host_queue_load_error_status_raw(queue) == 0;
+  if (won) {
+    iree_atomic_store(&queue->error_status, (intptr_t)error,
+                      iree_memory_order_release);
   }
-  iree_status_free(error);
-  return false;
+  queue->is_shutting_down = true;
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+  if (!won) iree_status_free(error);
+  return won;
 }
 
 static void iree_hal_amdgpu_host_queue_request_completion_thread_stop(
@@ -566,11 +1182,7 @@ iree_status_t iree_hal_amdgpu_host_queue_wait_for_setup_epoch(
         /*satisfying_value=*/NULL);
     if (IREE_UNLIKELY(signal_index >=
                       IREE_HAL_AMDGPU_EPOCH_WAIT_SIGNAL_COUNT)) {
-      iree_status_t error = iree_make_status(
-          IREE_STATUS_INTERNAL,
-          "hsa_amd_signal_wait_any returned invalid signal index %u while "
-          "waiting for AMDGPU host queue epoch %" PRIu64,
-          signal_index, epoch);
+      iree_status_t error = iree_status_from_code(IREE_STATUS_INTERNAL);
       iree_hal_amdgpu_host_queue_record_failure(queue,
                                                 iree_status_clone(error));
       return error;
@@ -578,10 +1190,7 @@ iree_status_t iree_hal_amdgpu_host_queue_wait_for_setup_epoch(
       iree_status_t error =
           iree_hal_amdgpu_host_queue_clone_error_status(queue);
       if (!iree_status_is_ok(error)) return error;
-      return iree_make_status(IREE_STATUS_CANCELLED,
-                              "AMDGPU host queue stopped while waiting for "
-                              "epoch %" PRIu64,
-                              epoch);
+      return iree_status_from_code(IREE_STATUS_CANCELLED);
     }
   } else {
     (void)iree_hsa_signal_wait_scacquire(
@@ -602,65 +1211,377 @@ static hsa_signal_value_t iree_hal_amdgpu_host_queue_last_drained_signal_value(
                               last_drained_epoch);
 }
 
+static bool iree_hal_amdgpu_host_queue_epoch_is_complete_or_terminal(
+    iree_hal_amdgpu_host_queue_t* queue, uint64_t epoch) {
+  if (iree_hal_amdgpu_host_queue_has_error(queue) || epoch == 0) return true;
+  if (!queue->hardware_queue || !queue->notification_ring.epoch.signal.handle ||
+      epoch > (uint64_t)IREE_HAL_AMDGPU_EPOCH_INITIAL_VALUE) {
+    return false;
+  }
+  const hsa_signal_value_t target_signal_value =
+      (hsa_signal_value_t)(IREE_HAL_AMDGPU_EPOCH_INITIAL_VALUE - epoch);
+  const hsa_signal_value_t signal_value = iree_hsa_signal_load_scacquire(
+      IREE_LIBHSA(queue->libhsa),
+      iree_hal_amdgpu_notification_ring_epoch_signal(
+          &queue->notification_ring));
+  return signal_value <= target_signal_value;
+}
+
+// Requires submission_mutex and a permanently closed queue. Returns true only
+// when all callback-capable notification/reclaim storage has been consumed.
+static bool iree_hal_amdgpu_host_queue_notification_storage_is_inert_locked(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_hal_amdgpu_notification_ring_t* ring = &queue->notification_ring;
+  if ((uint64_t)iree_atomic_load(&ring->write, iree_memory_order_acquire) !=
+          (uint64_t)iree_atomic_load(&ring->read, iree_memory_order_acquire) ||
+      (uint64_t)iree_atomic_load(&ring->frontier_ring.write,
+                                 iree_memory_order_acquire) !=
+          (uint64_t)iree_atomic_load(&ring->frontier_ring.read,
+                                     iree_memory_order_acquire) ||
+      (uint64_t)iree_atomic_load(&ring->epoch.last_drained,
+                                 iree_memory_order_acquire) !=
+          (uint64_t)iree_atomic_load(&ring->epoch.last_published,
+                                     iree_memory_order_acquire) ||
+      (uint64_t)iree_atomic_load(&ring->epoch.last_published,
+                                 iree_memory_order_acquire) !=
+          ring->epoch.next_submission) {
+    return false;
+  }
+  for (uint32_t i = 0; i < ring->capacity; ++i) {
+    const iree_hal_amdgpu_reclaim_entry_t* entry = &ring->reclaim_entries[i];
+    if (entry->resources || entry->resource_set || entry->count != 0 ||
+        entry->signal_semaphore_count != 0 || entry->pre_signal_action.fn) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Requires submission_mutex. A certificate is usable only while it names the
+// exact permanently closed frontier and that frontier remains complete or
+// terminal. The outcome check makes corrupted or prematurely published
+// certificates fail closed rather than suppressing the defensive wait.
+static bool iree_hal_amdgpu_host_queue_has_idle_certificate_locked(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  return queue->is_shutting_down && queue->idle_certificate_valid &&
+         iree_hal_amdgpu_host_queue_completion_runner_is_closed_and_idle(
+             queue) &&
+         queue->hardware_queue_retired && queue->hardware_queue == NULL &&
+         queue->completion.thread == NULL &&
+         queue->system_event_target == NULL &&
+         queue->epoch_registration_table == NULL &&
+         queue->frontier_tracker == NULL &&
+         iree_hal_amdgpu_host_queue_load_error_status_raw(queue) == 0 &&
+         queue->pending_head == NULL &&
+         queue->active_staging_transfer_head == NULL &&
+         queue->shutdown_staging_transfer_head == NULL &&
+         queue->active_file_action_head == NULL &&
+         queue->shutdown_file_action_head == NULL &&
+         queue->idle_certificate_epoch ==
+             queue->notification_ring.epoch.next_submission &&
+         iree_hal_amdgpu_host_queue_notification_storage_is_inert_locked(
+             queue) &&
+         iree_hal_amdgpu_host_queue_post_drain_is_empty(queue);
+}
+
+static bool iree_hal_amdgpu_host_queue_seal_is_complete(void* user_data) {
+  iree_hal_amdgpu_host_queue_t* queue =
+      (iree_hal_amdgpu_host_queue_t*)user_data;
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  const bool is_complete =
+      iree_hal_amdgpu_host_queue_has_idle_certificate_locked(queue);
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+  return is_complete;
+}
+
+static void iree_hal_amdgpu_host_queue_record_invalid_idle_state(
+    iree_hal_amdgpu_host_queue_t* queue, uint64_t epoch) {
+  (void)epoch;
+  iree_hal_amdgpu_host_queue_record_failure(
+      queue, iree_status_from_code(IREE_STATUS_INTERNAL));
+}
+
+// Retires every producer that can still publish an owner-sensitive callback,
+// destroys the native queue, and consumes all notification/reclaim state. The
+// final epoch has already been proven complete or terminal and the completion
+// thread/publisher registries have already joined.
+static void iree_hal_amdgpu_host_queue_retire_native_and_callbacks(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  // System-event delivery holds its registry mutex across record_failure.
+  // Exact retirement is therefore a quiescence barrier for in-flight delivery.
+  iree_hal_amdgpu_system_event_agent_target_t* system_event_target =
+      queue->system_event_target;
+  iree_hal_amdgpu_system_event_retire_queue_target(system_event_target, queue);
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  IREE_ASSERT(queue->system_event_target == system_event_target);
+  queue->system_event_target = NULL;
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+
+  // HSA queue destruction quiesces its native error callback. Keep the
+  // notification/error storage alive until after that callback can no longer
+  // run, then publish native retirement under submission_mutex.
+  hsa_queue_t* hardware_queue = queue->hardware_queue;
+  if (hardware_queue) {
+    iree_hal_amdgpu_hsa_queue_destroy(queue->libhsa, hardware_queue);
+  }
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  IREE_ASSERT(queue->hardware_queue == hardware_queue);
+  queue->hardware_queue = NULL;
+  queue->hardware_queue_retired = true;
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+
+  // No native or registry producer can install another queue error. The
+  // sealer is the sole runner admitted after CLOSED and consumes every
+  // remaining normal/failure callback through the same A-E claim without
+  // holding completion_drain_mutex.
+  bool has_epilogue_token = false;
+  (void)iree_hal_amdgpu_host_queue_drain_completions_serialized(
+      queue, /*allow_closed=*/true, &has_epilogue_token);
+  IREE_ASSERT(has_epilogue_token,
+              "terminal sealer claim must own an exact epilogue token");
+  iree_hal_amdgpu_host_queue_run_completion_epilogue_and_leave(queue);
+
+  // Once every hot entry has been consumed no future reader needs cold
+  // frontier snapshots. Collapse any trailing wrap/stale snapshots so the
+  // certificate directly proves the complete ring is empty.
+  const uint64_t frontier_write = (uint64_t)iree_atomic_load(
+      &queue->notification_ring.frontier_ring.write, iree_memory_order_acquire);
+  iree_atomic_store(&queue->notification_ring.frontier_ring.read,
+                    (int64_t)frontier_write, iree_memory_order_release);
+
+  // Reclaim callbacks may enqueue a final capacity/failure continuation.
+  // Keep the sticky queue failure published until every such continuation has
+  // observed it and the terminal owner has reached a post-drain fixed point.
+  iree_hal_amdgpu_host_queue_drain_shutdown_deferred(queue);
+
+  // Retire remaining shared publication while its parent device and callback
+  // machinery are still live. The notification ring signal remains allocated
+  // until inert storage destruction, but no new peer lookup can discover it.
+  iree_hal_amdgpu_epoch_signal_table_t* epoch_registration_table =
+      queue->epoch_registration_table;
+  if (epoch_registration_table) {
+    iree_hal_amdgpu_epoch_signal_table_deregister(
+        epoch_registration_table, iree_async_axis_queue_index(queue->axis));
+  }
+  iree_async_frontier_tracker_t* frontier_tracker = queue->frontier_tracker;
+  const iree_async_axis_t axis = queue->axis;
+  if (frontier_tracker) {
+    iree_async_frontier_tracker_retire_axis(
+        frontier_tracker, axis, iree_status_from_code(IREE_STATUS_CANCELLED));
+  }
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  IREE_ASSERT(queue->epoch_registration_table == epoch_registration_table);
+  IREE_ASSERT(queue->frontier_tracker == frontier_tracker);
+  queue->epoch_registration_table = NULL;
+  queue->frontier_tracker = NULL;
+  queue->axis = 0;
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+
+  // Native, completion, post-drain, and frontier producers are now quiescent.
+  // Take and free the exact queue-owned sticky status before certification.
+  iree_status_t error = (iree_status_t)iree_atomic_exchange(
+      &queue->error_status, 0, iree_memory_order_acq_rel);
+  iree_status_free(error);
+}
+
 void iree_hal_amdgpu_host_queue_wait_idle_before_deinitialize(
     iree_hal_amdgpu_host_queue_t* queue) {
   IREE_ASSERT_ARGUMENT(queue);
-  if (!queue->hardware_queue || !queue->notification_ring.epoch.signal.handle) {
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  IREE_ASSERT(queue->is_shutting_down,
+              "queue admission must close before the idle wait");
+  if (iree_hal_amdgpu_host_queue_has_idle_certificate_locked(queue)) {
+    iree_slim_mutex_unlock(&queue->locks.submission_mutex);
     return;
   }
-  const uint64_t submitted_epoch =
-      queue->notification_ring.epoch.next_submission;
-  if (submitted_epoch == 0 || iree_hal_amdgpu_host_queue_has_error(queue)) {
+  if (queue->seal_in_progress) {
+    iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+    iree_notification_await(&queue->seal_notification,
+                            iree_hal_amdgpu_host_queue_seal_is_complete, queue,
+                            iree_infinite_timeout());
     return;
   }
+  IREE_ASSERT(!queue->hardware_queue_retired,
+              "a retired native queue cannot rebuild an idle certificate");
+  queue->seal_in_progress = true;
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  // Test-only readiness boundary. The observer runs under submission_mutex and
+  // therefore must not reenter the queue or acquire queue-owned locks.
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      queue, IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_SEAL,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_SEAL_OWNER_ACQUIRED,
+      /*value0=*/0, /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
 
-  hsa_signal_t epoch_signal =
-      iree_hal_amdgpu_notification_ring_epoch_signal(&queue->notification_ring);
-  hsa_signal_t stop_signal = queue->completion.stop_signal;
-  const hsa_signal_value_t idle_epoch_signal_value =
-      (hsa_signal_value_t)(IREE_HAL_AMDGPU_EPOCH_INITIAL_VALUE -
-                           submitted_epoch);
-  const hsa_signal_value_t idle_compare_value = idle_epoch_signal_value + 1;
+  // Active file/proactor publishers are not represented by pending_head or
+  // the notification ring. Close their exact publisher set before draining
+  // deferred work. Joining happens after hardware and post-drain callbacks run
+  // so a capacity-parked or GPU-copy-backed transfer cannot deadlock seal.
+  iree_hal_amdgpu_staging_transfer_cancel_all(queue);
+  iree_hal_amdgpu_file_action_cancel_all(queue);
+  iree_hal_amdgpu_host_queue_drain_shutdown_deferred(queue);
+  uint64_t final_submitted_epoch = 0;
+  for (;;) {
+    iree_slim_mutex_lock(&queue->locks.submission_mutex);
+    queue->idle_certificate_valid = false;
+    const uint64_t submitted_epoch =
+        queue->notification_ring.epoch.next_submission;
+    iree_slim_mutex_unlock(&queue->locks.submission_mutex);
 
-  // Submission is already shut out. Wait only for hardware to publish the final
-  // submitted epoch so no late CP write can race with HSA queue/signal
-  // teardown; the completion thread still owns notification-ring draining.
-  if (stop_signal.handle) {
-    enum {
-      IREE_HAL_AMDGPU_IDLE_WAIT_EPOCH_SIGNAL = 0,
-      IREE_HAL_AMDGPU_IDLE_WAIT_STOP_SIGNAL = 1,
-      IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT = 2,
-    };
-    hsa_signal_t signals[IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT] = {
-        epoch_signal,
-        stop_signal,
-    };
-    hsa_signal_condition_t conditions[IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT] =
-        {
-            HSA_SIGNAL_CONDITION_LT,
-            HSA_SIGNAL_CONDITION_NE,
-        };
-    hsa_signal_value_t values[IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT] = {
-        idle_compare_value,
-        0,
-    };
-    const uint32_t signal_index = iree_hsa_amd_signal_wait_any(
-        IREE_LIBHSA(queue->libhsa), IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT,
-        signals, conditions, values, UINT64_MAX, HSA_WAIT_STATE_BLOCKED,
-        /*satisfying_value=*/NULL);
-    if (IREE_UNLIKELY(signal_index >= IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT)) {
-      iree_status_t error = iree_make_status(
-          IREE_STATUS_INTERNAL,
-          "hsa_amd_signal_wait_any returned invalid signal index %u during "
-          "AMDGPU host queue teardown",
-          signal_index);
-      iree_hal_amdgpu_host_queue_record_failure(queue, error);
+    if (!iree_hal_amdgpu_host_queue_epoch_is_complete_or_terminal(
+            queue, submitted_epoch)) {
+      if (!queue->hardware_queue ||
+          !queue->notification_ring.epoch.signal.handle ||
+          submitted_epoch > (uint64_t)IREE_HAL_AMDGPU_EPOCH_INITIAL_VALUE) {
+        iree_hal_amdgpu_host_queue_record_invalid_idle_state(queue,
+                                                             submitted_epoch);
+      } else {
+        hsa_signal_t epoch_signal =
+            iree_hal_amdgpu_notification_ring_epoch_signal(
+                &queue->notification_ring);
+        hsa_signal_t stop_signal = queue->completion.stop_signal;
+        const hsa_signal_value_t idle_epoch_signal_value =
+            (hsa_signal_value_t)(IREE_HAL_AMDGPU_EPOCH_INITIAL_VALUE -
+                                 submitted_epoch);
+        const hsa_signal_value_t idle_compare_value =
+            idle_epoch_signal_value + 1;
+
+        // Submission is shut out. Wait only for hardware to publish the final
+        // submitted epoch so no late CP write can race with HSA queue/signal
+        // teardown; the completion thread still owns notification draining.
+        if (stop_signal.handle) {
+          enum {
+            IREE_HAL_AMDGPU_IDLE_WAIT_EPOCH_SIGNAL = 0,
+            IREE_HAL_AMDGPU_IDLE_WAIT_STOP_SIGNAL = 1,
+            IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT = 2,
+          };
+          hsa_signal_t signals[IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT] = {
+              epoch_signal,
+              stop_signal,
+          };
+          hsa_signal_condition_t
+              conditions[IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT] = {
+                  HSA_SIGNAL_CONDITION_LT,
+                  HSA_SIGNAL_CONDITION_NE,
+              };
+          hsa_signal_value_t values[IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT] = {
+              idle_compare_value,
+              0,
+          };
+          const uint32_t signal_index = iree_hsa_amd_signal_wait_any(
+              IREE_LIBHSA(queue->libhsa),
+              IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT, signals, conditions,
+              values, UINT64_MAX, HSA_WAIT_STATE_BLOCKED,
+              /*satisfying_value=*/NULL);
+          if (IREE_UNLIKELY(signal_index >=
+                            IREE_HAL_AMDGPU_IDLE_WAIT_SIGNAL_COUNT)) {
+            iree_hal_amdgpu_host_queue_record_failure(
+                queue, iree_status_from_code(IREE_STATUS_INTERNAL));
+          } else if (IREE_UNLIKELY(
+                         signal_index ==
+                             IREE_HAL_AMDGPU_IDLE_WAIT_STOP_SIGNAL &&
+                         !iree_hal_amdgpu_host_queue_has_error(queue))) {
+            iree_hal_amdgpu_host_queue_record_failure(
+                queue, iree_status_from_code(IREE_STATUS_INTERNAL));
+          }
+        } else {
+          (void)iree_hsa_signal_wait_scacquire(
+              IREE_LIBHSA(queue->libhsa), epoch_signal, HSA_SIGNAL_CONDITION_LT,
+              idle_compare_value, UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
+        }
+      }
     }
-  } else {
-    (void)iree_hsa_signal_wait_scacquire(
-        IREE_LIBHSA(queue->libhsa), epoch_signal, HSA_SIGNAL_CONDITION_LT,
-        idle_compare_value, UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
+
+    iree_slim_mutex_lock(&queue->locks.submission_mutex);
+    const bool epoch_is_unchanged =
+        queue->notification_ring.epoch.next_submission == submitted_epoch;
+    const bool epoch_is_complete_or_terminal =
+        iree_hal_amdgpu_host_queue_epoch_is_complete_or_terminal(
+            queue, submitted_epoch);
+    if (epoch_is_unchanged && epoch_is_complete_or_terminal) {
+      final_submitted_epoch = submitted_epoch;
+      iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+      break;
+    }
+    iree_slim_mutex_unlock(&queue->locks.submission_mutex);
   }
+
+  // No hardware epoch can advance after the exact closed frontier completed.
+  // Stop and join the completion service before the final notification and
+  // deferred drains so no callback can be published behind the certificate.
+  iree_thread_t* completion_thread = queue->completion.thread;
+  if (completion_thread) {
+    iree_hal_amdgpu_host_queue_request_completion_thread_stop(queue);
+    iree_hal_amdgpu_host_queue_completion_service_t* current_service =
+        iree_hal_amdgpu_host_queue_current_completion_service;
+    const bool is_current_service =
+        current_service && current_service->queue == queue;
+    if (is_current_service) {
+      // A callback consumed the last public owner while this service held its
+      // safe-scope references. Transfer teardown to this outer safe point:
+      // remove the current handle from every future join set, mark the copied
+      // trampoline for immediate return, and self-release/detach the wrapper.
+      // The generic pthread/Darwin/Win32 thread implementations guarantee no
+      // wrapper access after the entry point returns.
+      iree_slim_mutex_lock(&queue->locks.submission_mutex);
+      IREE_ASSERT(queue->completion.thread == completion_thread);
+      queue->completion.thread = NULL;
+      iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+      current_service->exit_requested = true;
+      iree_thread_release(completion_thread);
+    } else {
+      iree_thread_release(completion_thread);
+      iree_slim_mutex_lock(&queue->locks.submission_mutex);
+      IREE_ASSERT(queue->completion.thread == completion_thread);
+      queue->completion.thread = NULL;
+      iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+    }
+  }
+  iree_hal_amdgpu_host_queue_drain_completions(queue);
+  iree_hal_amdgpu_host_queue_drain_shutdown_deferred(queue);
+  iree_hal_amdgpu_staging_transfer_await_all(queue);
+  iree_hal_amdgpu_file_action_await_all(queue);
+  // A terminal callback can enqueue one final failure-delivery continuation.
+  iree_hal_amdgpu_host_queue_drain_shutdown_deferred(queue);
+  // Close direct-waiter/completion claim admission and join any claim that
+  // began before the close. The sealer will make the sole terminal claim after
+  // retiring native and system-event producers.
+  iree_hal_amdgpu_host_queue_close_completion_runner(queue);
+  iree_hal_amdgpu_host_queue_retire_native_and_callbacks(queue);
+
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  IREE_ASSERT(queue->pending_head == NULL,
+              "sealed queue must not retain deferred operations");
+  IREE_ASSERT(queue->active_staging_transfer_head == NULL,
+              "sealed queue must not retain staged/proactor publishers");
+  IREE_ASSERT(queue->shutdown_staging_transfer_head == NULL,
+              "sealed queue must join staged/proactor publishers");
+  IREE_ASSERT(queue->active_file_action_head == NULL,
+              "sealed queue must not retain direct-file publishers");
+  IREE_ASSERT(queue->shutdown_file_action_head == NULL,
+              "sealed queue must join direct-file publishers");
+  IREE_ASSERT(queue->notification_ring.epoch.next_submission ==
+              final_submitted_epoch);
+  IREE_ASSERT(
+      iree_hal_amdgpu_host_queue_completion_runner_is_closed_and_idle(queue),
+      "sealed queue must have CLOSED and joined completion-runner admission");
+  IREE_ASSERT(queue->hardware_queue_retired && !queue->hardware_queue,
+              "sealed queue must retire its native queue");
+  IREE_ASSERT(!queue->system_event_target,
+              "sealed queue must retire exact system-event delivery");
+  IREE_ASSERT(iree_hal_amdgpu_host_queue_load_error_status_raw(queue) == 0,
+              "sealed queue must consume its terminal error status");
+  IREE_ASSERT(
+      iree_hal_amdgpu_host_queue_notification_storage_is_inert_locked(queue),
+      "sealed queue must consume notification/reclaim storage");
+  IREE_ASSERT(iree_hal_amdgpu_host_queue_post_drain_is_empty(queue),
+              "sealed queue must not retain post-drain callbacks");
+  queue->idle_certificate_epoch = final_submitted_epoch;
+  queue->idle_certificate_valid = true;
+  queue->seal_in_progress = false;
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+  iree_notification_post(&queue->seal_notification, IREE_ALL_WAITERS);
 }
 
 // Completion thread entry point. Blocks in HSA until either the queue epoch
@@ -674,15 +1595,22 @@ static int iree_hal_amdgpu_host_queue_completion_thread_main(void* entry_arg) {
   }
   iree_hal_amdgpu_host_queue_t* queue =
       (iree_hal_amdgpu_host_queue_t*)entry_arg;
+  iree_hal_amdgpu_host_queue_completion_service_t service = {
+      .queue = queue,
+      .previous = iree_hal_amdgpu_host_queue_current_completion_service,
+  };
+  iree_hal_amdgpu_host_queue_current_completion_service = &service;
 
   enum {
     IREE_HAL_AMDGPU_COMPLETION_WAIT_EPOCH_SIGNAL = 0,
-    IREE_HAL_AMDGPU_COMPLETION_WAIT_STOP_SIGNAL = 1,
-    IREE_HAL_AMDGPU_COMPLETION_WAIT_SIGNAL_COUNT = 2,
+    IREE_HAL_AMDGPU_COMPLETION_WAIT_WORK_SIGNAL = 1,
+    IREE_HAL_AMDGPU_COMPLETION_WAIT_STOP_SIGNAL = 2,
+    IREE_HAL_AMDGPU_COMPLETION_WAIT_SIGNAL_COUNT = 3,
   };
 
   hsa_signal_t epoch_signal =
       iree_hal_amdgpu_notification_ring_epoch_signal(&queue->notification_ring);
+  hsa_signal_t work_signal = queue->completion.work_signal;
   hsa_signal_t stop_signal = queue->completion.stop_signal;
   hsa_signal_value_t last_epoch_value =
       iree_hal_amdgpu_host_queue_last_drained_signal_value(queue);
@@ -691,15 +1619,18 @@ static int iree_hal_amdgpu_host_queue_completion_thread_main(void* entry_arg) {
   while (keep_running) {
     hsa_signal_t signals[IREE_HAL_AMDGPU_COMPLETION_WAIT_SIGNAL_COUNT] = {
         epoch_signal,
+        work_signal,
         stop_signal,
     };
     hsa_signal_condition_t
         conditions[IREE_HAL_AMDGPU_COMPLETION_WAIT_SIGNAL_COUNT] = {
             HSA_SIGNAL_CONDITION_NE,
             HSA_SIGNAL_CONDITION_NE,
+            HSA_SIGNAL_CONDITION_NE,
         };
     hsa_signal_value_t values[IREE_HAL_AMDGPU_COMPLETION_WAIT_SIGNAL_COUNT] = {
         last_epoch_value,
+        0,
         0,
     };
     const uint32_t signal_index = iree_hsa_amd_signal_wait_any(
@@ -713,7 +1644,25 @@ static int iree_hal_amdgpu_host_queue_completion_thread_main(void* entry_arg) {
           z0, "iree_hal_amdgpu_host_queue_completion_thread_pump");
       IREE_TRACE_ZONE_APPEND_VALUE_I64(z0, signal_index);
 
-      if (signal_index == IREE_HAL_AMDGPU_COMPLETION_WAIT_EPOCH_SIGNAL) {
+      // Hold both queue and device across every callback-capable lane and the
+      // pending-operation failure tail below. User/resource callbacks may drop
+      // their final public references, but destruction cannot begin until this
+      // outer safe point. If destruction already owns lifetime the borrowed
+      // service is still joined by that destructor.
+      iree_hal_amdgpu_host_queue_lifetime_claim_t lifetime_claim;
+      (void)iree_hal_amdgpu_host_queue_lifetime_try_acquire(queue,
+                                                            &lifetime_claim);
+
+      if (signal_index == IREE_HAL_AMDGPU_COMPLETION_WAIT_WORK_SIGNAL) {
+        // Reset before draining. A producer that enqueues after the exchange
+        // stores 1 again and forces a later wake; an action enqueued before the
+        // exchange is already visible through post_drain_mutex.
+        (void)iree_hsa_signal_exchange_scacquire(IREE_LIBHSA(queue->libhsa),
+                                                 work_signal, 0);
+      }
+
+      if (signal_index == IREE_HAL_AMDGPU_COMPLETION_WAIT_EPOCH_SIGNAL ||
+          signal_index == IREE_HAL_AMDGPU_COMPLETION_WAIT_WORK_SIGNAL) {
         iree_hal_amdgpu_host_queue_drain_completions(queue);
         // Arm the next wait from the epoch we actually drained, not from a raw
         // HSA signal load. A GPU completion can race with the drain and update
@@ -730,11 +1679,7 @@ static int iree_hal_amdgpu_host_queue_completion_thread_main(void* entry_arg) {
       if (IREE_UNLIKELY(signal_index >=
                         IREE_HAL_AMDGPU_COMPLETION_WAIT_SIGNAL_COUNT)) {
         iree_hal_amdgpu_host_queue_record_failure(
-            queue,
-            iree_make_status(
-                IREE_STATUS_INTERNAL,
-                "hsa_amd_signal_wait_any returned invalid signal index %u",
-                signal_index));
+            queue, iree_status_from_code(IREE_STATUS_INTERNAL));
       }
 
       if (signal_index == IREE_HAL_AMDGPU_COMPLETION_WAIT_STOP_SIGNAL ||
@@ -748,17 +1693,32 @@ static int iree_hal_amdgpu_host_queue_completion_thread_main(void* entry_arg) {
             iree_hal_amdgpu_host_queue_load_error_status_raw(queue);
         if (error_status != 0) {
           // Capacity-parked pending operations are retried by post-drain
-          // callbacks and the drain's own pass can enqueue more. Flush them
-          // under closed admission so they observe cancellation and run their
-          // normal failure path instead of being destroyed under the callback.
+          // callbacks and a detached pass can enqueue more. Run one fairness
+          // pass before cancellation, then let the failure owner drain the
+          // closed queue to a fixed point while its lifetime claim is active.
           iree_hal_amdgpu_host_queue_run_post_drain_actions(queue);
           iree_hal_amdgpu_host_queue_cancel_pending(
               queue, (iree_status_t)error_status);
+          // Cancellation can enqueue a final capacity/failure continuation.
+          // Consume every detached batch while the outer lifetime claim is
+          // still active; the completion service exits after this branch.
+          iree_hal_amdgpu_host_queue_await_post_drain_idle(queue);
         }
         keep_running = false;
       }
 
       IREE_TRACE_ZONE_END(z0);
+
+      // May synchronously self-seal and free queue/device storage. This must be
+      // the last operation in the iteration; only the stack-owned service flag
+      // may be inspected afterward.
+      const bool exit_now =
+          iree_hal_amdgpu_host_queue_lifetime_release(&lifetime_claim);
+      if (exit_now || service.exit_requested) {
+        iree_hal_amdgpu_host_queue_current_completion_service =
+            service.previous;
+        return 0;
+      }
     }
   }
 
@@ -767,6 +1727,7 @@ static int iree_hal_amdgpu_host_queue_completion_thread_main(void* entry_arg) {
         z0, "iree_hal_amdgpu_host_queue_completion_thread_exit");
     IREE_TRACE_ZONE_END(z0);
   }
+  iree_hal_amdgpu_host_queue_current_completion_service = service.previous;
   return 0;
 }
 
@@ -893,6 +1854,7 @@ iree_status_t iree_hal_amdgpu_host_queue_initialize(
                             &out_queue->base);
   out_queue->libhsa = params->hardware.libhsa;
   out_queue->logical_device = params->coordination.logical_device;
+  out_queue->system_event_target = params->coordination.system_event_target;
   out_queue->execution_resource_topology =
       params->hardware.execution_resource_topology;
   out_queue->dispatch_concurrency_capabilities =
@@ -906,7 +1868,12 @@ iree_status_t iree_hal_amdgpu_host_queue_initialize(
   // Submission pipeline state.
   iree_slim_mutex_initialize(&out_queue->locks.submission_mutex);
   iree_slim_mutex_initialize(&out_queue->locks.completion_drain_mutex);
+  out_queue->completion.runner_state =
+      IREE_HAL_AMDGPU_COMPLETION_RUNNER_STATE_RUNNING;
   iree_slim_mutex_initialize(&out_queue->locks.post_drain_mutex);
+  iree_notification_initialize(&out_queue->completion.runner_notification);
+  iree_notification_initialize(&out_queue->post_drain_notification);
+  iree_notification_initialize(&out_queue->seal_notification);
   iree_slim_mutex_initialize(&out_queue->profiling.event_mutex);
   out_queue->profiling.memory = params->memory.profiling;
   out_queue->axis = params->identity.axis;
@@ -949,6 +1916,12 @@ iree_status_t iree_hal_amdgpu_host_queue_initialize(
         IREE_LIBHSA(params->hardware.libhsa), /*initial_value=*/0,
         /*num_consumers=*/0, /*consumers=*/NULL, /*attributes=*/0,
         &out_queue->completion.stop_signal);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_hsa_amd_signal_create(
+        IREE_LIBHSA(params->hardware.libhsa), /*initial_value=*/0,
+        /*num_consumers=*/0, /*consumers=*/NULL, /*attributes=*/0,
+        &out_queue->completion.work_signal);
   }
 
   // Create the HSA hardware AQL queue.
@@ -1112,7 +2085,7 @@ iree_status_t iree_hal_amdgpu_host_queue_allocate(
     const iree_hal_amdgpu_host_queue_params_t* params,
     iree_hal_amdgpu_system_event_agent_target_t* system_event_target,
     iree_hal_amdgpu_host_queue_release_slot_callback_t release_slot,
-    iree_hal_amdgpu_host_queue_t** out_queue) {
+    bool retain_parent_device, iree_hal_amdgpu_host_queue_t** out_queue) {
   iree_host_size_t total_size = 0;
   iree_host_size_t resource_ordinals_offset = 0;
   IREE_RETURN_IF_ERROR(
@@ -1129,6 +2102,10 @@ iree_status_t iree_hal_amdgpu_host_queue_allocate(
                                     /*offset=*/0, (void**)&queue));
 
   iree_hal_amdgpu_host_queue_params_t owned_params = *params;
+  IREE_ASSERT(!owned_params.coordination.system_event_target ||
+              owned_params.coordination.system_event_target ==
+                  system_event_target);
+  owned_params.coordination.system_event_target = system_event_target;
   const iree_host_size_t resource_count =
       params->identity.params.execution_resources.count;
   if (resource_count) {
@@ -1151,6 +2128,10 @@ iree_status_t iree_hal_amdgpu_host_queue_allocate(
       queue->storage.allocator = params->host_allocator;
       queue->storage.system_event_target = system_event_target;
       queue->storage.release_slot = release_slot;
+      if (retain_parent_device) {
+        queue->storage.parent_device = params->coordination.logical_device;
+        iree_hal_device_retain(queue->storage.parent_device);
+      }
       *out_queue = queue;
     } else {
       iree_hal_amdgpu_host_queue_deinitialize(queue);
@@ -1168,10 +2149,19 @@ void iree_hal_amdgpu_host_queue_begin_deinitialize(
   iree_hal_amdgpu_host_queue_close_submission(queue);
 }
 
-void iree_hal_amdgpu_host_queue_deinitialize(
-    iree_hal_amdgpu_host_queue_t* queue) {
+void iree_hal_amdgpu_host_queue_seal(iree_hal_amdgpu_host_queue_t* queue) {
+  IREE_ASSERT_ARGUMENT(queue);
   iree_hal_amdgpu_host_queue_begin_deinitialize(queue);
   iree_hal_amdgpu_host_queue_wait_idle_before_deinitialize(queue);
+}
+
+bool iree_hal_amdgpu_host_queue_isa(iree_hal_queue_t* base_queue) {
+  return iree_hal_resource_is(base_queue, &iree_hal_amdgpu_host_queue_vtable);
+}
+
+void iree_hal_amdgpu_host_queue_deinitialize(
+    iree_hal_amdgpu_host_queue_t* queue) {
+  iree_hal_amdgpu_host_queue_seal(queue);
   iree_hal_queue_release(&queue->base);
 }
 
@@ -1180,82 +2170,30 @@ void iree_hal_amdgpu_host_queue_finish_deinitialize(
   IREE_ASSERT_ARGUMENT(queue);
   IREE_TRACE_ZONE_BEGIN(z0);
 
-  if (queue->completion.thread) {
-    iree_hal_amdgpu_host_queue_request_completion_thread_stop(queue);
-    // There is only one owner for the thread, so this also joins the thread.
-    iree_thread_release(queue->completion.thread);
-    queue->completion.thread = NULL;
-  }
+  IREE_ASSERT(!queue->completion.thread,
+              "queue completion service must stop before final teardown");
+  IREE_ASSERT(queue->pending_head == NULL,
+              "queue pending operations must drain before final teardown");
+  IREE_ASSERT(queue->active_staging_transfer_head == NULL,
+              "queue staged/proactor publishers must drain before teardown");
+  IREE_ASSERT(queue->shutdown_staging_transfer_head == NULL,
+              "queue staged/proactor publishers must join before teardown");
+  IREE_ASSERT(queue->active_file_action_head == NULL,
+              "queue direct-file publishers must drain before teardown");
+  IREE_ASSERT(queue->shutdown_file_action_head == NULL,
+              "queue direct-file publishers must join before teardown");
+  IREE_ASSERT(iree_hal_amdgpu_host_queue_post_drain_is_empty(queue),
+              "queue callbacks must drain before final teardown");
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  IREE_ASSERT(iree_hal_amdgpu_host_queue_has_idle_certificate_locked(queue),
+              "queue finalization requires an exact inert idle certificate");
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
 
-  // Destroy the hardware queue before the remaining host-side resources so the
-  // HSA runtime cannot race a late error callback against signal teardown.
-  if (queue->hardware_queue) {
-    iree_hal_amdgpu_hsa_queue_destroy(queue->libhsa, queue->hardware_queue);
-    queue->hardware_queue = NULL;
-  }
-
-  // Capacity-parked pending ops are retried by post-drain callbacks. Flush
-  // those callbacks under shutdown first so they observe cancellation and own
-  // their normal failure path instead of being destroyed out from under the
-  // callback storage.
-  iree_hal_amdgpu_host_queue_run_post_drain_actions(queue);
-
-  // Cancel all pending (deferred) operations. Their signal semaphores are
-  // failed so downstream waiters don't hang. A queue that failed has already
-  // cancelled these on its completion thread with the recorded failure, so
-  // anything still linked here was deferred during a clean teardown.
-  if (queue->pending_head) {
-    iree_status_t cancellation_status =
-        iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
-    iree_hal_amdgpu_host_queue_cancel_pending(queue, cancellation_status);
-    iree_status_free(cancellation_status);
-  }
-
-  // Process any remaining notification entries before destroying resources.
-  // If the GPU faulted, fail all pending entries so waiters get the actual
-  // error. Otherwise drain normally (entries completed but not yet processed).
-  //
-  // Emptying the slot in the same step that takes ownership of the failure is
-  // what makes the free below safe: a non-zero slot names a live status, and
-  // every reader that dereferences it - including the post-drain pass this
-  // function runs after the free - only clones from it.
-  iree_status_t error = (iree_status_t)iree_atomic_exchange(
-      &queue->error_status, 0, iree_memory_order_acq_rel);
-  iree_hal_amdgpu_reclaim_positions_t reclaim_positions = {0};
-  if (!iree_status_is_ok(error)) {
-    iree_hal_amdgpu_notification_ring_fail_all_reclaim_positions(
-        &queue->notification_ring, error,
-        iree_hal_amdgpu_host_queue_reclaim_retire_fn(queue), queue,
-        &reclaim_positions);
-    iree_hal_amdgpu_host_queue_clear_profile_events(queue);
-    iree_status_free(error);
-  } else {
-    iree_hal_amdgpu_notification_ring_drain_reclaim_positions(
-        &queue->notification_ring,
-        /*fallback_frontier=*/NULL,
-        iree_hal_amdgpu_host_queue_reclaim_retire_fn(queue), queue,
-        &reclaim_positions);
-  }
-  iree_hal_amdgpu_host_queue_reclaim_queue_owned_positions(queue,
-                                                           reclaim_positions);
-  iree_hal_amdgpu_host_queue_run_post_drain_actions(queue);
-
-  // Deregister before destroying the notification ring that owns the signal.
-  // The lookup-only epoch_table remains borrowed and needs no teardown.
-  if (queue->epoch_registration_table) {
-    iree_hal_amdgpu_epoch_signal_table_deregister(
-        queue->epoch_registration_table,
-        iree_async_axis_queue_index(queue->axis));
-    queue->epoch_registration_table = NULL;
-  }
-
-  if (queue->frontier_tracker) {
-    iree_async_frontier_tracker_retire_axis(
-        queue->frontier_tracker, queue->axis,
-        iree_status_from_code(IREE_STATUS_CANCELLED));
-    queue->frontier_tracker = NULL;
-    queue->axis = 0;
-  }
+  // Everything below only destroys inert host-side storage. All callbacks,
+  // retained operation resources, native queue/error producers, and failure
+  // delivery were consumed by the sole sealer before certificate publication.
+  IREE_ASSERT(!queue->epoch_registration_table && !queue->frontier_tracker,
+              "queue publication must retire before inert finalization");
 
   iree_hal_amdgpu_notification_ring_deinitialize(&queue->notification_ring);
 
@@ -1288,7 +2226,15 @@ void iree_hal_amdgpu_host_queue_finish_deinitialize(
         queue->libhsa, queue->completion.stop_signal));
     queue->completion.stop_signal.handle = 0;
   }
+  if (queue->completion.work_signal.handle) {
+    iree_hal_amdgpu_hsa_cleanup_assert_success(iree_hsa_signal_destroy_raw(
+        queue->libhsa, queue->completion.work_signal));
+    queue->completion.work_signal.handle = 0;
+  }
 
+  iree_notification_deinitialize(&queue->seal_notification);
+  iree_notification_deinitialize(&queue->post_drain_notification);
+  iree_notification_deinitialize(&queue->completion.runner_notification);
   iree_slim_mutex_deinitialize(&queue->locks.post_drain_mutex);
   iree_slim_mutex_deinitialize(&queue->locks.completion_drain_mutex);
   iree_slim_mutex_deinitialize(&queue->profiling.event_mutex);
@@ -1353,7 +2299,7 @@ typedef struct iree_hal_amdgpu_host_queue_op_submission_t {
 
 // Begins one direct/deferred queue operation attempt. The caller must pair this
 // with iree_hal_amdgpu_host_queue_op_submission_end exactly once.
-static inline void iree_hal_amdgpu_host_queue_op_submission_begin(
+static inline iree_status_t iree_hal_amdgpu_host_queue_op_submission_begin(
     iree_hal_amdgpu_host_queue_t* queue,
     const iree_hal_semaphore_list_t wait_semaphore_list,
     iree_hal_amdgpu_host_queue_op_submission_t* out_submission) {
@@ -1364,8 +2310,22 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_begin(
   out_submission->wait_for_capacity = false;
 
   iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  iree_status_t terminal_status =
+      iree_hal_amdgpu_host_queue_clone_error_status(queue);
+  if (IREE_UNLIKELY(!iree_status_is_ok(terminal_status) ||
+                    queue->is_shutting_down)) {
+    // Terminal closure is the admission linearization point for every direct
+    // and deferred operation. Keep the lock held for submission_end, but do
+    // not resolve waits, capture resources, link a pending op, or install an
+    // epilogue token after the completion service has closed admission.
+    memset(&out_submission->resolution, 0, sizeof(out_submission->resolution));
+    return iree_status_is_ok(terminal_status)
+               ? iree_status_from_code(IREE_STATUS_CANCELLED)
+               : terminal_status;
+  }
   iree_hal_amdgpu_host_queue_resolve_waits(queue, wait_semaphore_list,
                                            &out_submission->resolution);
+  return iree_ok_status();
 }
 
 // Marks a captured pending op as retrying after notification-ring drain because
@@ -1375,16 +2335,28 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_defer_for_capacity(
   submission->wait_for_capacity = submission->wait_semaphore_count == 0;
 }
 
-// Ends one direct/deferred queue operation attempt by releasing
-// submission_mutex and starting any captured pending op outside the lock.
+// Ends one direct/deferred queue operation attempt. Capacity-only retries are
+// made visible while submission_mutex remains held; wait-backed operations
+// start after releasing the lock because registration may invoke callbacks.
 static inline iree_status_t iree_hal_amdgpu_host_queue_op_submission_end(
     iree_hal_amdgpu_host_queue_op_submission_t* submission,
     iree_status_t status) {
+  // Capacity retry publication is callback-free and only takes
+  // post_drain_mutex. Publish its COMPLETING state and queued continuation
+  // before releasing submission admission so terminal failure cannot run its
+  // first post-drain/cancellation pass in between the two operations. A
+  // terminal owner subsequently drives queued snapshots to a fixed point.
+  if (iree_status_is_ok(status) && submission->deferred_op &&
+      submission->wait_for_capacity) {
+    status = iree_hal_amdgpu_pending_op_start(submission->deferred_op,
+                                              /*wait_for_capacity=*/true);
+    submission->deferred_op = NULL;
+  }
   iree_slim_mutex_unlock(&submission->queue->locks.submission_mutex);
 
   if (iree_status_is_ok(status) && submission->deferred_op) {
     status = iree_hal_amdgpu_pending_op_start(submission->deferred_op,
-                                              submission->wait_for_capacity);
+                                              /*wait_for_capacity=*/false);
   }
   return status;
 }
@@ -1476,9 +2448,9 @@ static iree_status_t iree_hal_amdgpu_host_queue_signal_empty_barrier(
     iree_hal_amdgpu_host_queue_t* queue,
     const iree_hal_semaphore_list_t signal_semaphore_list) {
   iree_slim_mutex_lock(&queue->locks.submission_mutex);
-  iree_status_t status = iree_ok_status();
-  if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    status = iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+  iree_status_t status = iree_hal_amdgpu_host_queue_clone_error_status(queue);
+  if (iree_status_is_ok(status) && IREE_UNLIKELY(queue->is_shutting_down)) {
+    status = iree_status_from_code(IREE_STATUS_CANCELLED);
   }
   iree_slim_mutex_unlock(&queue->locks.submission_mutex);
 
@@ -1514,12 +2486,19 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_execute(
   }
 
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
+  // Command-buffer helpers may construct partial binding/replay ownership
+  // while submission is serialized. Keep those cleanup handles through the
+  // transaction and release them only after op_submission_end unlocks.
+  iree_hal_resource_set_t* execute_cleanup_resource_set = NULL;
+  iree_hal_resource_t* execute_cleanup_resource = NULL;
   bool needs_staging = false;
-  iree_status_t status = iree_hal_amdgpu_host_queue_validate_buffer_state(
-      iree_hal_amdgpu_host_queue_binding_table_state(binding_table),
-      wait_semaphore_list, &needs_staging);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_validate_buffer_state(
+        iree_hal_amdgpu_host_queue_binding_table_state(binding_table),
+        wait_semaphore_list, &needs_staging);
+  }
   if (iree_status_is_ok(status) &&
       (submission.resolution.needs_deferral || needs_staging)) {
     status = iree_hal_amdgpu_host_queue_defer_execute(
@@ -1563,21 +2542,21 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_execute(
       }
     }
   } else if (iree_status_is_ok(status)) {
-    iree_hal_resource_set_t* binding_resource_set = NULL;
     status = iree_hal_amdgpu_host_queue_submit_command_buffer(
         queue, &submission.resolution, signal_semaphore_list, command_buffer,
-        binding_table, flags, &binding_resource_set, &submission.ready);
+        binding_table, flags, &execute_cleanup_resource_set,
+        &execute_cleanup_resource, &submission.ready);
     if (iree_status_is_ok(status) && !submission.ready) {
-      iree_hal_resource_set_free(binding_resource_set);
       status = iree_hal_amdgpu_host_queue_defer_execute(
           queue, &wait_semaphore_list, &signal_semaphore_list, command_buffer,
           binding_table, flags, &submission.deferred_op);
       iree_hal_amdgpu_host_queue_op_submission_defer_for_capacity(&submission);
-    } else if (!iree_status_is_ok(status)) {
-      iree_hal_resource_set_free(binding_resource_set);
     }
   }
-  return iree_hal_amdgpu_host_queue_op_submission_end(&submission, status);
+  status = iree_hal_amdgpu_host_queue_op_submission_end(&submission, status);
+  iree_hal_resource_release(execute_cleanup_resource);
+  iree_hal_resource_set_free(execute_cleanup_resource_set);
+  return status;
 }
 
 static iree_status_t iree_hal_amdgpu_host_queue_enqueue_atomic(
@@ -1586,12 +2565,14 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_atomic(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     const iree_hal_amdgpu_host_queue_atomic_operation_t* operation) {
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
   bool needs_staging = false;
-  iree_status_t status = iree_hal_amdgpu_host_queue_validate_buffer_state(
-      iree_hal_amdgpu_host_queue_buffer_state(operation->target_buffer),
-      wait_semaphore_list, &needs_staging);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_validate_buffer_state(
+        iree_hal_amdgpu_host_queue_buffer_state(operation->target_buffer),
+        wait_semaphore_list, &needs_staging);
+  }
   if (iree_status_is_ok(status) &&
       (submission.resolution.needs_deferral || needs_staging)) {
     status = iree_hal_amdgpu_host_queue_defer_atomic(
@@ -1733,9 +2714,10 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_alloca(
 
   iree_hal_amdgpu_host_queue_op_submission_t submission = {0};
   iree_hal_amdgpu_pending_op_t* memory_wait_op = NULL;
+  bool has_alloca_epilogue = false;
   if (iree_status_is_ok(status)) {
-    iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                   &submission);
+    status = iree_hal_amdgpu_host_queue_op_submission_begin(
+        queue, wait_semaphore_list, &submission);
   }
   if (iree_status_is_ok(status) && submission.resolution.needs_deferral) {
     status = iree_hal_amdgpu_host_queue_defer_alloca(
@@ -1743,6 +2725,12 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_alloca(
         request_count, canonical_requests, buffers, reserve_flags,
         &submission.deferred_op);
   } else if (iree_status_is_ok(status)) {
+    // The direct transaction deliberately unlocks submission_mutex around
+    // pool vtable calls and profiling. Register that entire lock-split window
+    // before the first unlock so a concurrent sealer cannot certify and tear
+    // down queue-owned state while the transaction is reentering the pool.
+    iree_hal_amdgpu_host_queue_enter_submission_epilogue(queue);
+    has_alloca_epilogue = true;
     status = iree_hal_amdgpu_host_queue_submit_alloca(
         queue, &submission.resolution, signal_semaphore_list, pool,
         &transaction, reserve_flags,
@@ -1772,6 +2760,11 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_alloca(
     }
   }
   iree_arena_deinitialize(&scratch_arena);
+  if (has_alloca_epilogue) {
+    // Final queue access after relocked publication/rollback, any pending-op
+    // handoff, output/failure cleanup, and scratch block-pool release.
+    iree_hal_amdgpu_host_queue_leave_submission_epilogue(queue);
+  }
   return status;
 }
 
@@ -1840,13 +2833,13 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_dealloca(
       .reservations = reservations,
   };
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
-  if (submission.resolution.needs_deferral) {
+  status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
+  if (iree_status_is_ok(status) && submission.resolution.needs_deferral) {
     status = iree_hal_amdgpu_host_queue_defer_dealloca(
         queue, &wait_semaphore_list, &signal_semaphore_list, buffer_count,
         buffers, source_pool, &submission.deferred_op);
-  } else {
+  } else if (iree_status_is_ok(status)) {
     status = iree_hal_amdgpu_host_queue_submit_dealloca(
         queue, &submission.resolution, signal_semaphore_list, &transaction,
         IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES,
@@ -1858,13 +2851,25 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_dealloca(
       iree_hal_amdgpu_host_queue_op_submission_defer_for_capacity(&submission);
     }
   }
+  const bool has_release_epilogue = transaction.reservations_detached;
+  if (has_release_epilogue) {
+    // Install the seal-joined token before dropping submission_mutex. This
+    // closes the accepted-submission -> unlocked-pool-callback window.
+    iree_hal_amdgpu_host_queue_enter_submission_epilogue(queue);
+  }
   status = iree_hal_amdgpu_host_queue_op_submission_end(&submission, status);
+  iree_hal_amdgpu_host_queue_release_dealloca_transaction(queue, &transaction);
   if (!iree_status_is_ok(status)) {
     for (iree_host_size_t i = 0; i < buffer_count; ++i) {
       iree_hal_amdgpu_transient_buffer_abort_dealloca(buffers[i]);
     }
   }
   iree_arena_deinitialize(&scratch_arena);
+  if (has_release_epilogue) {
+    // Final queue access: wakes any sealer after pool callbacks, profiling,
+    // buffer rollback, and arena/block-pool cleanup have all returned.
+    iree_hal_amdgpu_host_queue_leave_submission_epilogue(queue);
+  }
   return status;
 }
 
@@ -1879,12 +2884,14 @@ iree_status_t iree_hal_amdgpu_host_queue_fill(
     iree_device_size_t length, uint64_t pattern_bits,
     iree_host_size_t pattern_length, iree_hal_fill_flags_t flags) {
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
   bool needs_staging = false;
-  iree_status_t status = iree_hal_amdgpu_host_queue_validate_buffer_state(
-      iree_hal_amdgpu_host_queue_buffer_state(target_buffer),
-      wait_semaphore_list, &needs_staging);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_validate_buffer_state(
+        iree_hal_amdgpu_host_queue_buffer_state(target_buffer),
+        wait_semaphore_list, &needs_staging);
+  }
   if (iree_status_is_ok(status) &&
       (submission.resolution.needs_deferral || needs_staging)) {
     status = iree_hal_amdgpu_host_queue_defer_fill(
@@ -1926,12 +2933,14 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_timestamp(
   }
 
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
   bool needs_staging = false;
-  iree_status_t status = iree_hal_amdgpu_host_queue_validate_buffer_state(
-      iree_hal_amdgpu_host_queue_buffer_state(target_buffer),
-      wait_semaphore_list, &needs_staging);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_validate_buffer_state(
+        iree_hal_amdgpu_host_queue_buffer_state(target_buffer),
+        wait_semaphore_list, &needs_staging);
+  }
   if (iree_status_is_ok(status) &&
       (submission.resolution.needs_deferral || needs_staging)) {
     status = iree_hal_amdgpu_host_queue_defer_timestamp(
@@ -1962,15 +2971,17 @@ iree_status_t iree_hal_amdgpu_host_queue_copy_buffer(
     iree_device_size_t length, iree_hal_copy_flags_t flags,
     iree_hal_profile_queue_event_type_t profile_event_type) {
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
   iree_hal_amdgpu_host_queue_buffer_state_t buffer_state =
       iree_hal_amdgpu_host_queue_buffer_state(source_buffer);
   buffer_state = iree_hal_amdgpu_host_queue_merge_buffer_states(
       buffer_state, iree_hal_amdgpu_host_queue_buffer_state(target_buffer));
   bool needs_staging = false;
-  iree_status_t status = iree_hal_amdgpu_host_queue_validate_buffer_state(
-      buffer_state, wait_semaphore_list, &needs_staging);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_validate_buffer_state(
+        buffer_state, wait_semaphore_list, &needs_staging);
+  }
   if (iree_status_is_ok(status) &&
       (submission.resolution.needs_deferral || needs_staging)) {
     status = iree_hal_amdgpu_host_queue_defer_copy(
@@ -2020,12 +3031,14 @@ iree_status_t iree_hal_amdgpu_host_queue_update(
     iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
     iree_device_size_t length, iree_hal_update_flags_t flags) {
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
   bool needs_staging = false;
-  iree_status_t status = iree_hal_amdgpu_host_queue_validate_buffer_state(
-      iree_hal_amdgpu_host_queue_buffer_state(target_buffer),
-      wait_semaphore_list, &needs_staging);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_validate_buffer_state(
+        iree_hal_amdgpu_host_queue_buffer_state(target_buffer),
+        wait_semaphore_list, &needs_staging);
+  }
   if (iree_status_is_ok(status) &&
       (submission.resolution.needs_deferral || needs_staging)) {
     status = iree_hal_amdgpu_host_queue_defer_update(
@@ -2071,8 +3084,8 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_dispatch(
       iree_hal_amdgpu_host_queue_is_noop_dispatch(config, flags);
 
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
   iree_hal_amdgpu_host_queue_buffer_state_t buffer_state =
       iree_hal_amdgpu_host_queue_binding_refs_state(bindings);
   if (iree_hal_dispatch_uses_indirect_parameters(flags)) {
@@ -2081,8 +3094,10 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_dispatch(
                           config.workgroup_count_ref.buffer));
   }
   bool needs_staging = false;
-  iree_status_t status = iree_hal_amdgpu_host_queue_validate_buffer_state(
-      buffer_state, wait_semaphore_list, &needs_staging);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_validate_buffer_state(
+        buffer_state, wait_semaphore_list, &needs_staging);
+  }
   if (iree_status_is_ok(status) &&
       (submission.resolution.needs_deferral || needs_staging)) {
     if (is_noop_dispatch) {
@@ -2181,8 +3196,8 @@ iree_status_t iree_hal_amdgpu_host_queue_enqueue_host_action(
   }
 
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
   // Host actions execute on CPU threads and must observe device-produced
   // host-visible memory even when a semaphore edge itself is device-local.
   submission.resolution.inline_acquire_scope =
@@ -2193,12 +3208,11 @@ iree_status_t iree_hal_amdgpu_host_queue_enqueue_host_action(
       iree_hal_amdgpu_host_queue_max_fence_scope(
           submission.resolution.barrier_acquire_scope,
           IREE_HSA_FENCE_SCOPE_SYSTEM);
-  iree_status_t status = iree_ok_status();
-  if (submission.resolution.needs_deferral) {
+  if (iree_status_is_ok(status) && submission.resolution.needs_deferral) {
     status = iree_hal_amdgpu_host_queue_defer_host_action(
         queue, &wait_semaphore_list, action, operation_resources,
         operation_resource_count, &submission.deferred_op);
-  } else {
+  } else if (iree_status_is_ok(status)) {
     status = iree_hal_amdgpu_host_queue_try_submit_barrier(
         queue, &submission.resolution, iree_hal_semaphore_list_empty(), action,
         operation_resources, operation_resource_count,
@@ -2227,14 +3241,13 @@ static iree_status_t iree_hal_amdgpu_host_queue_enqueue_host_call(
       iree_hal_amdgpu_host_queue_validate_host_call(call, args, flags));
 
   iree_hal_amdgpu_host_queue_op_submission_t submission;
-  iree_hal_amdgpu_host_queue_op_submission_begin(queue, wait_semaphore_list,
-                                                 &submission);
-  iree_status_t status = iree_ok_status();
-  if (submission.resolution.needs_deferral) {
+  iree_status_t status = iree_hal_amdgpu_host_queue_op_submission_begin(
+      queue, wait_semaphore_list, &submission);
+  if (iree_status_is_ok(status) && submission.resolution.needs_deferral) {
     status = iree_hal_amdgpu_host_queue_defer_host_call(
         queue, &wait_semaphore_list, &signal_semaphore_list, call, args, flags,
         &submission.deferred_op);
-  } else {
+  } else if (iree_status_is_ok(status)) {
     status = iree_hal_amdgpu_host_queue_submit_host_call(
         queue, &submission.resolution, signal_semaphore_list, call, args, flags,
         &submission.ready);
@@ -2257,8 +3270,7 @@ static void iree_hal_amdgpu_host_queue_destroy(iree_hal_queue_t* base_queue) {
       (iree_hal_amdgpu_host_queue_t*)base_queue;
   const iree_hal_amdgpu_host_queue_storage_t storage = queue->storage;
   if (!iree_allocator_is_null(storage.allocator)) {
-    iree_hal_amdgpu_host_queue_begin_deinitialize(queue);
-    iree_hal_amdgpu_host_queue_wait_idle_before_deinitialize(queue);
+    iree_hal_amdgpu_host_queue_seal(queue);
     iree_hal_amdgpu_system_event_retire_queue_target(
         storage.system_event_target, queue);
   }
@@ -2270,6 +3282,9 @@ static void iree_hal_amdgpu_host_queue_destroy(iree_hal_queue_t* base_queue) {
   if (!iree_allocator_is_null(storage.allocator)) {
     iree_allocator_free_aligned(storage.allocator, queue);
   }
+  // Must be last: dropping the dedicated queue's parent edge may destroy the
+  // logical/physical device state borrowed by every earlier teardown step.
+  iree_hal_device_release(storage.parent_device);
 }
 
 static iree_status_t iree_hal_amdgpu_host_queue_check_device_failure(

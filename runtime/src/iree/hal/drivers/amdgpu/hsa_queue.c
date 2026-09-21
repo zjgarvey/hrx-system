@@ -42,48 +42,43 @@ iree_status_t iree_hal_amdgpu_hsa_queue_create(
         "native cooperative queues require normal scheduling priority");
   }
 
-  hsa_amd_queue_create_desc_t descriptor = {
-      .version = HSA_AMD_QUEUE_CREATE_DESC_VERSION,
-      .flags = HSA_AMD_QUEUE_CREATE_SYSTEM_MEM,
-      .engine_type = HSA_AMD_QUEUE_ENGINE_COMPUTE,
-      .queue_size_bytes = (uint32_t)(params->packet_count *
-                                     sizeof(hsa_kernel_dispatch_packet_t)),
-      .priority = params->priority,
-      .callback = params->error_callback,
-      .callback_data = params->error_callback_data,
-      .engine.compute =
-          {
-              .cu_mask = NULL,
-              .type = params->type,
-              .private_segment_size = HSA_AMD_PRIVATE_SEGMENT_SIZE_DEFAULT,
-              .cu_mask_count = 0,
-          },
-  };
-  iree_status_t status = iree_hsa_amd_queue_create(IREE_LIBHSA(params->libhsa),
-                                                   params->agent, &descriptor,
-                                                   /*num_descs=*/1);
-  if (iree_status_is_ok(status) && IREE_UNLIKELY(!descriptor.queue)) {
+  // Use the core queue API supported by the pinned ROCr runtime and apply all
+  // AMD-specific properties while the queue is still private. This provides
+  // the same publication boundary as the newer descriptor API without making
+  // the driver depend on an SDK extension unavailable in the supported
+  // toolchain.
+  hsa_queue_t* queue = NULL;
+  iree_status_t status = iree_hsa_queue_create(
+      IREE_LIBHSA(params->libhsa), params->agent, params->packet_count,
+      params->type, params->error_callback, params->error_callback_data,
+      /*private_segment_size=*/UINT32_MAX,
+      /*group_segment_size=*/UINT32_MAX, &queue);
+  if (iree_status_is_ok(status) && IREE_UNLIKELY(!queue)) {
     status = iree_make_status(
         IREE_STATUS_INTERNAL,
         "HSA reported successful queue creation without returning a queue");
   }
-  // The descriptor mask is not honored by all ROCr implementations exposing
-  // hsa_amd_queue_create. Apply the mask through the dedicated queue operation
-  // while the queue remains private. Any native rejection prevents the queue
-  // from being published through the HAL.
+  if (iree_status_is_ok(status) &&
+      params->priority != HSA_AMD_QUEUE_PRIORITY_NORMAL) {
+    status = iree_hsa_amd_queue_set_priority(IREE_LIBHSA(params->libhsa), queue,
+                                             params->priority);
+  }
+  // Apply the mask through the dedicated queue operation while the queue
+  // remains private. Any native rejection prevents the queue from being
+  // published through the HAL.
   // ROCr exposes one shared cooperative queue per agent, so never mutate its
   // mask; cooperative callers are restricted to the complete resource set.
   if (iree_status_is_ok(status) && !is_cooperative &&
       params->compute_unit_mask_bit_count) {
-    status = iree_hsa_amd_queue_cu_set_mask(
-        IREE_LIBHSA(params->libhsa), descriptor.queue,
-        params->compute_unit_mask_bit_count, params->compute_unit_mask);
+    status = iree_hsa_amd_queue_cu_set_mask(IREE_LIBHSA(params->libhsa), queue,
+                                            params->compute_unit_mask_bit_count,
+                                            params->compute_unit_mask);
   }
 
   if (iree_status_is_ok(status)) {
-    *out_queue = descriptor.queue;
-  } else if (descriptor.queue) {
-    iree_hal_amdgpu_hsa_queue_destroy(params->libhsa, descriptor.queue);
+    *out_queue = queue;
+  } else if (queue) {
+    iree_hal_amdgpu_hsa_queue_destroy(params->libhsa, queue);
   }
   return status;
 }

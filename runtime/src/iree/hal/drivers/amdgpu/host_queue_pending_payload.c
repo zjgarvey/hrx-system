@@ -102,10 +102,8 @@ static iree_status_t iree_hal_amdgpu_pending_op_issue_execute(
     iree_status_t status = iree_hal_amdgpu_host_queue_submit_command_buffer(
         op->queue, resolution, op->signal_semaphore_list,
         op->execute.command_buffer, op->execute.binding_table,
-        op->execute.flags, &op->execute.binding_resource_set, &issue->ready);
-    if (iree_status_is_ok(status) && issue->ready) {
-      iree_hal_amdgpu_pending_op_release_retained(op);
-    }
+        op->execute.flags, &op->execute.binding_resource_set,
+        &issue->cleanup_resource, &issue->ready);
     return status;
   }
 
@@ -174,9 +172,6 @@ static iree_status_t iree_hal_amdgpu_pending_op_issue_host_call(
   iree_status_t status = iree_hal_amdgpu_host_queue_submit_host_call(
       op->queue, resolution, op->signal_semaphore_list, op->host_call.call,
       op->host_call.args, op->host_call.flags, &issue->ready);
-  if (iree_status_is_ok(status) && issue->ready) {
-    iree_hal_amdgpu_pending_op_release_retained(op);
-  }
   return status;
 }
 
@@ -498,15 +493,17 @@ iree_status_t iree_hal_amdgpu_host_queue_defer_execute(
   }
 
   iree_hal_resource_set_t* binding_resource_set = NULL;
-  IREE_RETURN_IF_ERROR(
+  iree_status_t status =
       iree_hal_amdgpu_host_queue_create_binding_table_resource_set(
-          queue, command_buffer, binding_table, flags, &binding_resource_set));
+          queue, command_buffer, binding_table, flags, &binding_resource_set);
 
   const iree_host_size_t operation_resource_count = command_buffer ? 1 : 0;
   uint16_t max_resources = 0;
   iree_hal_amdgpu_pending_op_t* op = NULL;
-  iree_status_t status = iree_hal_amdgpu_host_queue_count_reclaim_resources(
-      signal_semaphore_list->count, operation_resource_count, &max_resources);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_count_reclaim_resources(
+        signal_semaphore_list->count, operation_resource_count, &max_resources);
+  }
   if (iree_status_is_ok(status)) {
     status = iree_hal_amdgpu_pending_op_allocate(
         queue, wait_semaphore_list, signal_semaphore_list,
@@ -540,9 +537,16 @@ iree_status_t iree_hal_amdgpu_host_queue_defer_execute(
   if (iree_status_is_ok(status)) {
     *out_op = op;
   } else {
-    iree_hal_resource_set_free(binding_resource_set);
     if (op) {
       iree_hal_amdgpu_pending_op_discard_under_lock(op);
+    }
+    if (binding_resource_set) {
+      // Capture helpers are entered with submission_mutex held. Resource-set
+      // destruction may perform final releases and must therefore run outside
+      // submission serialization.
+      iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+      iree_hal_resource_set_free(binding_resource_set);
+      iree_slim_mutex_lock(&queue->locks.submission_mutex);
     }
   }
   return status;

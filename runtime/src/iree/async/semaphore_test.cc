@@ -496,6 +496,42 @@ TEST(SemaphoreTest, FirstFailureWins) {
   iree_async_semaphore_release(sem);
 }
 
+TEST(SemaphoreTest, PreparedFailureDefersExistingTimepoints) {
+  iree_async_semaphore_t* sem = nullptr;
+  IREE_ASSERT_OK(iree_async_semaphore_create(
+      test_proactor(), 0, IREE_ASYNC_SEMAPHORE_DEFAULT_FRONTIER_CAPACITY,
+      iree_allocator_system(), &sem));
+
+  TimepointCallback before_prepare;
+  iree_async_semaphore_timepoint_t before_timepoint;
+  before_timepoint.callback = TimepointCallback::Invoke;
+  before_timepoint.user_data = &before_prepare;
+  IREE_ASSERT_OK(
+      iree_async_semaphore_acquire_timepoint(sem, 10, &before_timepoint));
+
+  EXPECT_TRUE(iree_async_semaphore_prepare_failure(
+      sem, iree_status_from_code(IREE_STATUS_ABORTED)));
+  EXPECT_EQ(before_prepare.call_count, 0);
+
+  // A timepoint acquired after preparation observes the failure immediately;
+  // the timepoint already present at the linearization point remains deferred.
+  TimepointCallback after_prepare;
+  iree_async_semaphore_timepoint_t after_timepoint;
+  after_timepoint.callback = TimepointCallback::Invoke;
+  after_timepoint.user_data = &after_prepare;
+  IREE_ASSERT_OK(
+      iree_async_semaphore_acquire_timepoint(sem, 10, &after_timepoint));
+  EXPECT_EQ(after_prepare.call_count, 1);
+  EXPECT_EQ(after_prepare.last_status_code, IREE_STATUS_ABORTED);
+  EXPECT_EQ(before_prepare.call_count, 0);
+
+  iree_async_semaphore_dispatch_prepared_failure(sem);
+  EXPECT_EQ(before_prepare.call_count, 1);
+  EXPECT_EQ(before_prepare.last_status_code, IREE_STATUS_ABORTED);
+
+  iree_async_semaphore_release(sem);
+}
+
 //===----------------------------------------------------------------------===//
 // Destroy with pending timepoints
 //===----------------------------------------------------------------------===//
@@ -675,6 +711,41 @@ TEST(SemaphoreTest, PublishUntaintedDispatchesOnce) {
 
   IREE_ASSERT_OK(iree_async_semaphore_publish_untainted(sem, 10, nullptr));
   EXPECT_EQ(callback.call_count, 1);
+
+  iree_async_semaphore_release(sem);
+}
+
+TEST(SemaphoreTest, PrepareUntaintedDefersExistingTimepoints) {
+  iree_async_semaphore_t* sem = nullptr;
+  IREE_ASSERT_OK(iree_async_semaphore_create(
+      test_proactor(), 0, IREE_ASYNC_SEMAPHORE_DEFAULT_FRONTIER_CAPACITY,
+      iree_allocator_system(), &sem));
+
+  TimepointCallback before_prepare;
+  iree_async_semaphore_timepoint_t before_timepoint;
+  before_timepoint.callback = TimepointCallback::Invoke;
+  before_timepoint.user_data = &before_prepare;
+  IREE_ASSERT_OK(
+      iree_async_semaphore_acquire_timepoint(sem, 10, &before_timepoint));
+
+  IREE_ASSERT_OK(iree_async_semaphore_prepare_untainted(sem, 10, nullptr));
+  EXPECT_EQ(iree_async_semaphore_query(sem), 10u);
+  EXPECT_EQ(iree_async_semaphore_query_untainted_value(sem), 10u);
+  EXPECT_EQ(before_prepare.call_count, 0);
+
+  // A timepoint acquired after preparation observes the value immediately.
+  TimepointCallback after_prepare;
+  iree_async_semaphore_timepoint_t after_timepoint;
+  after_timepoint.callback = TimepointCallback::Invoke;
+  after_timepoint.user_data = &after_prepare;
+  IREE_ASSERT_OK(
+      iree_async_semaphore_acquire_timepoint(sem, 10, &after_timepoint));
+  EXPECT_EQ(after_prepare.call_count, 1);
+  EXPECT_EQ(before_prepare.call_count, 0);
+
+  iree_async_semaphore_dispatch_prepared_untainted(sem, 10);
+  EXPECT_EQ(before_prepare.call_count, 1);
+  EXPECT_EQ(before_prepare.last_status_code, IREE_STATUS_OK);
 
   iree_async_semaphore_release(sem);
 }

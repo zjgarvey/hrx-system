@@ -1374,6 +1374,7 @@ static void iree_hal_amdgpu_physical_device_initialize_host_queue_construction(
       .coordination =
           {
               .logical_device = logical_device,
+              .system_event_target = physical_device->system_event_target,
               .proactor = proactor,
               .frontier_tracker = frontier_tracker,
               .epoch_table = epoch_signal_table,
@@ -1471,7 +1472,7 @@ iree_status_t iree_hal_amdgpu_physical_device_allocate_host_queue(
     iree_hal_amdgpu_physical_device_t* physical_device,
     const iree_hal_queue_params_t* params, iree_async_axis_t axis,
     iree_hal_amdgpu_host_queue_release_slot_callback_t release_slot,
-    iree_hal_amdgpu_host_queue_t** out_queue) {
+    bool retain_parent_device, iree_hal_amdgpu_host_queue_t** out_queue) {
   if (IREE_UNLIKELY(!physical_device->host_queue_construction.params
                          .coordination.frontier_tracker)) {
     return iree_make_status(
@@ -1488,7 +1489,7 @@ iree_status_t iree_hal_amdgpu_physical_device_allocate_host_queue(
   host_queue_params.coordination.epoch_registration_table = NULL;
   return iree_hal_amdgpu_host_queue_allocate(
       &host_queue_params, physical_device->system_event_target, release_slot,
-      out_queue);
+      retain_parent_device, out_queue);
 }
 
 void iree_hal_amdgpu_physical_device_release_cooperative_queue(
@@ -1501,11 +1502,27 @@ void iree_hal_amdgpu_physical_device_release_cooperative_queue(
   if (queue) iree_hal_queue_release(&queue->base);
 }
 
-void iree_hal_amdgpu_physical_device_deassign_frontier(
+void iree_hal_amdgpu_physical_device_begin_deassign_frontier(
     iree_hal_amdgpu_physical_device_t* physical_device) {
-  IREE_TRACE_ZONE_BEGIN(z0);
+  // Move the cached cooperative owner reference into teardown ownership. This
+  // prevents new acquisitions without dropping the final reference and
+  // recursively sealing the queue before the rest of the logical-device union
+  // has closed.
+  iree_slim_mutex_lock(&physical_device->cooperative_queue.mutex);
+  if (!physical_device->cooperative_queue.teardown_queue) {
+    physical_device->cooperative_queue.teardown_queue =
+        physical_device->cooperative_queue.queue;
+    physical_device->cooperative_queue.queue = NULL;
+  }
+  iree_hal_amdgpu_host_queue_t* cooperative_queue =
+      physical_device->cooperative_queue.teardown_queue;
+  iree_slim_mutex_unlock(&physical_device->cooperative_queue.mutex);
 
-  iree_hal_amdgpu_physical_device_release_cooperative_queue(physical_device);
+  if (cooperative_queue) {
+    iree_atomic_ref_count_abort_if_uses(
+        &cooperative_queue->base.resource.ref_count);
+    iree_hal_amdgpu_host_queue_begin_deinitialize(cooperative_queue);
+  }
 
   // The physical device owns the initial queue references and must outlive all
   // references retained by HAL users. Prove that lifetime invariant across all
@@ -1521,6 +1538,17 @@ void iree_hal_amdgpu_physical_device_deassign_frontier(
     iree_hal_amdgpu_host_queue_begin_deinitialize(
         &physical_device->host_queues[i]);
   }
+}
+
+void iree_hal_amdgpu_physical_device_seal_deassign_frontier(
+    iree_hal_amdgpu_physical_device_t* physical_device) {
+  iree_slim_mutex_lock(&physical_device->cooperative_queue.mutex);
+  iree_hal_amdgpu_host_queue_t* cooperative_queue =
+      physical_device->cooperative_queue.teardown_queue;
+  iree_slim_mutex_unlock(&physical_device->cooperative_queue.mutex);
+  if (cooperative_queue) {
+    iree_hal_amdgpu_host_queue_wait_idle_before_deinitialize(cooperative_queue);
+  }
 
   // Queue delivery is retired only after this loop, and where the targets were
   // published that is what releases these waits when the GPU can no longer
@@ -1531,6 +1559,20 @@ void iree_hal_amdgpu_physical_device_deassign_frontier(
   for (iree_host_size_t i = 0; i < physical_device->host_queue_count; ++i) {
     iree_hal_amdgpu_host_queue_wait_idle_before_deinitialize(
         &physical_device->host_queues[i]);
+  }
+}
+
+void iree_hal_amdgpu_physical_device_finish_deassign_frontier(
+    iree_hal_amdgpu_physical_device_t* physical_device) {
+  iree_slim_mutex_lock(&physical_device->cooperative_queue.mutex);
+  iree_hal_amdgpu_host_queue_t* cooperative_queue =
+      physical_device->cooperative_queue.teardown_queue;
+  physical_device->cooperative_queue.teardown_queue = NULL;
+  iree_slim_mutex_unlock(&physical_device->cooperative_queue.mutex);
+  if (cooperative_queue) {
+    iree_atomic_ref_count_abort_if_uses(
+        &cooperative_queue->base.resource.ref_count);
+    iree_hal_queue_release(&cooperative_queue->base);
   }
 
   // Every queue has passed its idle/error boundary, so nothing left to destroy
@@ -1564,6 +1606,14 @@ void iree_hal_amdgpu_physical_device_deassign_frontier(
   physical_device->default_pool = NULL;
   memset(&physical_device->host_queue_construction, 0,
          sizeof(physical_device->host_queue_construction));
+}
+
+void iree_hal_amdgpu_physical_device_deassign_frontier(
+    iree_hal_amdgpu_physical_device_t* physical_device) {
+  IREE_TRACE_ZONE_BEGIN(z0);
+  iree_hal_amdgpu_physical_device_begin_deassign_frontier(physical_device);
+  iree_hal_amdgpu_physical_device_seal_deassign_frontier(physical_device);
+  iree_hal_amdgpu_physical_device_finish_deassign_frontier(physical_device);
   IREE_TRACE_ZONE_END(z0);
 }
 

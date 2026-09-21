@@ -20,6 +20,7 @@
 #include "iree/base/threading/mutex.h"
 #include "libhrx/src/binding/hip/api.h"
 #include "libhrx/src/binding/hip/binding_internal.h"
+#include "libhrx/src/binding/hip/vmm.h"
 
 // Local compatibility declarations for ABI entries not represented by the
 // core binding header. These keep the exported call boundaries type-correct.
@@ -208,8 +209,11 @@ static hipError_t hrx_hip_mipmapped_array_level(
     unsigned int level) {
   if (out_level_array) *out_level_array = NULL;
   if (!out_level_array || !mipmapped_array) return hipErrorInvalidValue;
+  hipError_t admission_result = iree_hip_vmm_launch_begin();
+  if (admission_result != hipSuccess) return admission_result;
   hipMipmappedArray_t current = NULL;
   if (!hrx_hip_mipmapped_array_registry_lookup(mipmapped_array, &current)) {
+    iree_hip_vmm_launch_end();
     return hipErrorInvalidHandle;
   }
   hipError_t result = hipSuccess;
@@ -219,6 +223,7 @@ static hipError_t hrx_hip_mipmapped_array_level(
     *out_level_array = current->level_arrays[level];
   }
   hrx_hip_mipmapped_array_release(current);
+  iree_hip_vmm_launch_end();
   return result;
 }
 
@@ -226,12 +231,16 @@ static hipError_t hrx_hip_mipmapped_array_memory_size(
     hipMipmappedArray_const_t mipmapped_array, size_t* out_memory_size) {
   if (out_memory_size) *out_memory_size = 0;
   if (!mipmapped_array || !out_memory_size) return hipErrorInvalidValue;
+  hipError_t admission_result = iree_hip_vmm_launch_begin();
+  if (admission_result != hipSuccess) return admission_result;
   hipMipmappedArray_t current = NULL;
   if (!hrx_hip_mipmapped_array_registry_lookup(mipmapped_array, &current)) {
+    iree_hip_vmm_launch_end();
     return hipErrorInvalidHandle;
   }
   *out_memory_size = current->memory_size;
   hrx_hip_mipmapped_array_release(current);
+  iree_hip_vmm_launch_end();
   return hipSuccess;
 }
 
@@ -263,7 +272,7 @@ static void hrx_hip_mipmapped_array_destroy(
   mipmapped_array->magic = 0;
   for (unsigned int i = 0; i < mipmapped_array->level_count; ++i) {
     if (mipmapped_array->level_arrays[i]) {
-      (void)hipFreeArray(mipmapped_array->level_arrays[i]);
+      (void)iree_hip_array_free_admitted(mipmapped_array->level_arrays[i]);
     }
   }
   free(mipmapped_array->level_arrays);
@@ -278,15 +287,132 @@ static void hrx_hip_mipmapped_array_release(
   }
 }
 
+struct iree_hip_mipmapped_array_teardown_t {
+  hipMipmappedArray_t* arrays;
+  size_t count;
+};
+
+static bool hrx_hip_mipmapped_array_matches_teardown(
+    hipMipmappedArray_t mipmapped_array, iree_hip_array_match_fn_t match,
+    void* user_data, bool* out_all_levels_match) {
+  bool any_level_matches = false;
+  bool all_levels_match = true;
+  for (unsigned int i = 0; i < mipmapped_array->level_count; ++i) {
+    const bool level_matches =
+        match(mipmapped_array->level_arrays[i], user_data);
+    any_level_matches |= level_matches;
+    all_levels_match &= level_matches;
+  }
+  *out_all_levels_match = all_levels_match;
+  return any_level_matches;
+}
+
+hipError_t iree_hip_mipmapped_array_prepare_teardown(
+    iree_hip_array_match_fn_t match, void* user_data,
+    iree_hip_mipmapped_array_teardown_t** out_teardown) {
+  if (!match || !out_teardown) return hipErrorInvalidValue;
+  *out_teardown = NULL;
+
+  size_t count = 0;
+  bool exact = true;
+  hrx_hip_mipmapped_array_registry_lock();
+  for (hipMipmappedArray_t current = hrx_hip_mipmapped_array_registry_head;
+       current; current = current->next_live_mipmapped_array) {
+    bool all_levels_match = false;
+    if (!hrx_hip_mipmapped_array_matches_teardown(current, match, user_data,
+                                                  &all_levels_match)) {
+      continue;
+    }
+    if (!all_levels_match || count == SIZE_MAX) {
+      exact = false;
+      break;
+    }
+    ++count;
+  }
+  iree_slim_mutex_unlock(&hrx_hip_mipmapped_array_registry_mutex);
+  if (!exact) return hipErrorInvalidContext;
+  if (count == 0) return hipSuccess;
+
+  iree_hip_mipmapped_array_teardown_t* teardown =
+      (iree_hip_mipmapped_array_teardown_t*)calloc(1, sizeof(*teardown));
+  if (!teardown || count > SIZE_MAX / sizeof(teardown->arrays[0])) {
+    free(teardown);
+    return hipErrorOutOfMemory;
+  }
+  teardown->arrays =
+      (hipMipmappedArray_t*)calloc(count, sizeof(teardown->arrays[0]));
+  if (!teardown->arrays) {
+    free(teardown);
+    return hipErrorOutOfMemory;
+  }
+
+  hrx_hip_mipmapped_array_registry_lock();
+  for (hipMipmappedArray_t current = hrx_hip_mipmapped_array_registry_head;
+       current; current = current->next_live_mipmapped_array) {
+    bool all_levels_match = false;
+    if (!hrx_hip_mipmapped_array_matches_teardown(current, match, user_data,
+                                                  &all_levels_match)) {
+      continue;
+    }
+    IREE_ASSERT(all_levels_match && teardown->count < count,
+                "lifecycle writer must stabilize mipmapped arrays");
+    iree_atomic_ref_count_inc(&current->ref_count);
+    teardown->arrays[teardown->count++] = current;
+  }
+  iree_slim_mutex_unlock(&hrx_hip_mipmapped_array_registry_mutex);
+  IREE_ASSERT(teardown->count == count,
+              "lifecycle writer must stabilize mipmapped arrays");
+  *out_teardown = teardown;
+  return hipSuccess;
+}
+
+void iree_hip_mipmapped_array_cancel_teardown(
+    iree_hip_mipmapped_array_teardown_t* teardown) {
+  if (!teardown) return;
+  for (size_t i = 0; i < teardown->count; ++i) {
+    hrx_hip_mipmapped_array_release(teardown->arrays[i]);
+  }
+  free(teardown->arrays);
+  free(teardown);
+}
+
+void iree_hip_mipmapped_array_commit_teardown(
+    iree_hip_mipmapped_array_teardown_t* teardown) {
+  if (!teardown) return;
+  for (size_t i = 0; i < teardown->count; ++i) {
+    hipMipmappedArray_t mipmapped_array = teardown->arrays[i];
+    hipMipmappedArray_t owned_array = NULL;
+    IREE_ASSERT(hrx_hip_mipmapped_array_registry_remove(mipmapped_array,
+                                                        &owned_array) &&
+                    owned_array == mipmapped_array,
+                "prepared mipmapped-array handle changed under writer");
+    hipArray_t* level_arrays = mipmapped_array->level_arrays;
+    mipmapped_array->level_arrays = NULL;
+    mipmapped_array->level_count = 0;
+    mipmapped_array->magic = 0;
+    free(level_arrays);
+    // Drop the transferred public edge and the preparation pin. Exact level
+    // array invalidation remains owned by the caller's teardown transaction.
+    hrx_hip_mipmapped_array_release(mipmapped_array);
+    hrx_hip_mipmapped_array_release(mipmapped_array);
+  }
+  free(teardown->arrays);
+  free(teardown);
+}
+
 static hipError_t hrx_hip_destroy_mipmapped_array(
     hipMipmappedArray_t mipmapped_array) {
   if (!mipmapped_array) return hipErrorInvalidValue;
+  hipError_t admission_result = iree_hip_vmm_launch_begin();
+  if (admission_result != hipSuccess) return admission_result;
   hipMipmappedArray_t removed_array = NULL;
   if (!hrx_hip_mipmapped_array_registry_remove(mipmapped_array,
                                                &removed_array)) {
+    iree_hip_vmm_launch_end();
     return hipErrorInvalidHandle;
   }
   hrx_hip_mipmapped_array_release(removed_array);
+  iree_hip_vmm_launch_end();
   return hipSuccess;
 }
 
@@ -1459,9 +1585,16 @@ HIPAPI hipError_t hipMipmappedArrayCreate(
       pMipmappedArrayDesc, numMipmapLevels);
   if (result != hipSuccess) return result;
 
+  iree_hal_streaming_context_t* context = NULL;
+  result = iree_hip_internal_ensure_context_admitted(&context);
+  if (result != hipSuccess) return result;
+
   hipArray_t* level_arrays =
       (hipArray_t*)calloc(numMipmapLevels, sizeof(*level_arrays));
-  if (!level_arrays) return hipErrorOutOfMemory;
+  if (!level_arrays) {
+    iree_hip_internal_context_admission_end();
+    return hipErrorOutOfMemory;
+  }
 
   size_t memory_size = 0;
   for (unsigned int level = 0; level < numMipmapLevels; ++level) {
@@ -1477,25 +1610,28 @@ HIPAPI hipError_t hipMipmappedArrayCreate(
     result =
         hrx_hip_mipmapped_array_level_size(&level_descriptor, 0, &level_size);
     if (result == hipSuccess) {
-      result = hipArray3DCreate(&level_arrays[level], &level_descriptor);
+      result = iree_hip_array3d_create_admitted(context, &level_arrays[level],
+                                                &level_descriptor);
     }
     if (result != hipSuccess) {
       for (unsigned int i = 0; i < level; ++i) {
         if (level_arrays[i]) {
-          (void)hipFreeArray(level_arrays[i]);
+          (void)iree_hip_array_free_admitted(level_arrays[i]);
         }
       }
       free(level_arrays);
+      iree_hip_internal_context_admission_end();
       return result;
     }
     if (IREE_UNLIKELY(!iree_host_size_checked_add(memory_size, level_size,
                                                   &memory_size))) {
       for (unsigned int i = 0; i <= level; ++i) {
         if (level_arrays[i]) {
-          (void)hipFreeArray(level_arrays[i]);
+          (void)iree_hip_array_free_admitted(level_arrays[i]);
         }
       }
       free(level_arrays);
+      iree_hip_internal_context_admission_end();
       return hipErrorInvalidValue;
     }
   }
@@ -1505,10 +1641,11 @@ HIPAPI hipError_t hipMipmappedArrayCreate(
   if (!mipmapped_array) {
     for (unsigned int i = 0; i < numMipmapLevels; ++i) {
       if (level_arrays[i]) {
-        (void)hipFreeArray(level_arrays[i]);
+        (void)iree_hip_array_free_admitted(level_arrays[i]);
       }
     }
     free(level_arrays);
+    iree_hip_internal_context_admission_end();
     return hipErrorOutOfMemory;
   }
 
@@ -1519,21 +1656,30 @@ HIPAPI hipError_t hipMipmappedArrayCreate(
   mipmapped_array->memory_size = memory_size;
   hrx_hip_mipmapped_array_registry_insert(mipmapped_array);
   *pHandle = mipmapped_array;
+  iree_hip_internal_context_admission_end();
   return hipSuccess;
 }
 
 HIPAPI hipError_t hipMipmappedArrayGetMemoryRequirements(
     hipArrayMemoryRequirements* memoryRequirements, hipMipmappedArray_t mipmap,
     hipDevice_t device) {
-  if (!memoryRequirements) return hipErrorInvalidValue;
-  hipError_t result = hrx_hip_valid_device(device);
+  hipError_t result = iree_hip_vmm_launch_begin();
   if (result != hipSuccess) return result;
-  size_t memory_size = 0;
-  result = hrx_hip_mipmapped_array_memory_size(mipmap, &memory_size);
-  if (result != hipSuccess) return result;
-  memoryRequirements->alignment = HRX_HIP_MIPMAPPED_ARRAY_ALIGNMENT;
-  memoryRequirements->size = memory_size;
-  return hipSuccess;
+  if (!memoryRequirements) {
+    result = hipErrorInvalidValue;
+  } else {
+    result = hrx_hip_valid_device(device);
+    size_t memory_size = 0;
+    if (result == hipSuccess) {
+      result = hrx_hip_mipmapped_array_memory_size(mipmap, &memory_size);
+    }
+    if (result == hipSuccess) {
+      memoryRequirements->alignment = HRX_HIP_MIPMAPPED_ARRAY_ALIGNMENT;
+      memoryRequirements->size = memory_size;
+    }
+  }
+  iree_hip_vmm_launch_end();
+  return result;
 }
 
 HIPAPI hipError_t
@@ -1647,7 +1793,7 @@ HIPAPI hipError_t hipStreamAttachMemAsync(hipStream_t stream, void* dev_ptr,
   }
 
   if (length != 0) {
-    size_t allocation_size = 0;
+    uint32_t allocation_size = 0;
     result = hipPointerGetAttribute(&allocation_size,
                                     HIP_POINTER_ATTRIBUTE_RANGE_SIZE, dev_ptr);
     if (result != hipSuccess || length != allocation_size) {

@@ -77,7 +77,35 @@ typedef struct iree_hal_amdgpu_staging_pool_t {
   iree_hal_amdgpu_staging_pool_waiter_t* waiter_head;
   // Last waiter blocked on slot availability.
   iree_hal_amdgpu_staging_pool_waiter_t* waiter_tail;
+  // Number of waiters removed from the FIFO whose callbacks have not yet
+  // returned. Protected by |mutex|.
+  uint32_t claimed_waiter_count;
 } iree_hal_amdgpu_staging_pool_t;
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+// Test-only observer invoked after a staging waiter has atomically
+// claimed a slot and the pool mutex has been released, immediately before its
+// callback runs. Present only in the explicitly instrumented test library.
+typedef void(IREE_API_PTR* iree_hal_amdgpu_staging_waiter_claimed_observer_t)(
+    void* user_data);
+
+// Sets the process-wide staging-waiter observer. Intended for deterministic
+// lifecycle tests; production callers leave it NULL.
+void iree_hal_amdgpu_host_queue_staging_set_waiter_claimed_observer(
+    iree_hal_amdgpu_staging_waiter_claimed_observer_t observer,
+    void* user_data);
+
+// Test/diagnostic observer invoked after a completed chunk has captured and
+// cleared its exact slot under the transfer mutex, immediately before that
+// captured ordinal is returned to the staging pool.
+typedef void(
+    IREE_API_PTR* iree_hal_amdgpu_staging_chunk_slot_release_observer_t)(
+    void* user_data, uint32_t captured_slot_ordinal);
+
+void iree_hal_amdgpu_host_queue_staging_set_chunk_slot_release_observer(
+    iree_hal_amdgpu_staging_chunk_slot_release_observer_t observer,
+    void* user_data);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
 
 // Initializes |out_options| to its default values.
 void iree_hal_amdgpu_staging_pool_options_initialize(
@@ -124,6 +152,21 @@ iree_status_t iree_hal_amdgpu_staging_transfer_start(
 // Releases a captured host transfer.
 void iree_hal_amdgpu_staging_transfer_release(
     iree_hal_amdgpu_staging_transfer_t* transfer);
+
+// Detaches every staged/proactor publisher registered with |queue| and
+// requests cancellation. Queue admission must already be permanently closed.
+// This does not wait: hardware and post-drain completions may be required for
+// a publisher to reach its terminal callback.
+void iree_hal_amdgpu_staging_transfer_cancel_all(
+    iree_hal_amdgpu_host_queue_t* queue);
+
+// Joins all publishers detached by
+// iree_hal_amdgpu_staging_transfer_cancel_all, then consumes their queue-owned
+// registry edges. Hardware completions and post-drain actions must be drained
+// before this call. Returns only when no staged/proactor callback can touch
+// |queue| again.
+void iree_hal_amdgpu_staging_transfer_await_all(
+    iree_hal_amdgpu_host_queue_t* queue);
 
 // Submits a chunked fd-backed queue_read through the staging pool.
 iree_status_t iree_hal_amdgpu_host_queue_submit_staged_read(

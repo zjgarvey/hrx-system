@@ -214,14 +214,15 @@ IREE_HAL_AMDGPU_LIBHSA_PFN(
          const hsa_signal_t* dep_signals, hsa_signal_t completion_signal),
     ARGS(ptr, size, agent, num_dep_signals, dep_signals, completion_signal))
 
-IREE_HAL_AMDGPU_LIBHSA_PFN(TRACE_ALWAYS, hsa_status_t,
-                           hsa_amd_vmem_address_reserve_align,
-                           DECL(void** va, size_t size, uint64_t address,
-                                uint64_t alignment, uint64_t flags),
-                           ARGS(va, size, address, alignment, flags))
-IREE_HAL_AMDGPU_LIBHSA_PFN(TRACE_ALWAYS, hsa_status_t,
-                           hsa_amd_vmem_address_free,
-                           DECL(void* va, size_t size), ARGS(va, size))
+IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_RESERVE_ALIGN_PFN(
+    TRACE_ALWAYS, hsa_status_t, hsa_amd_vmem_address_reserve_align,
+    DECL(void** va, size_t size, uint64_t address, uint64_t alignment,
+         uint64_t flags),
+    ARGS(va, size, address, alignment, flags))
+IREE_HAL_AMDGPU_LIBHSA_VMEM_ADDRESS_FREE_PFN(TRACE_ALWAYS, hsa_status_t,
+                                             hsa_amd_vmem_address_free,
+                                             DECL(void* va, size_t size),
+                                             ARGS(va, size))
 IREE_HAL_AMDGPU_LIBHSA_PFN(TRACE_ALWAYS, hsa_status_t, hsa_amd_vmem_set_access,
                            DECL(void* va, size_t size,
                                 const hsa_amd_memory_access_desc_t* desc,
@@ -440,12 +441,6 @@ IREE_HAL_AMDGPU_LIBHSA_LEAK_CHECK_DISABLED_PFN(
          hsa_queue_t** queue),
     ARGS(agent, size, type, callback, data, private_segment_size,
          group_segment_size, queue))
-
-IREE_HAL_AMDGPU_LIBHSA_LEAK_CHECK_DISABLED_PFN(
-    TRACE_ALWAYS, hsa_status_t, hsa_amd_queue_create,
-    DECL(hsa_agent_t agent, hsa_amd_queue_create_desc_t* descs,
-         uint32_t num_descs),
-    ARGS(agent, descs, num_descs))
 
 IREE_HAL_AMDGPU_LIBHSA_PFN(
     TRACE_ALWAYS, hsa_status_t, hsa_soft_queue_create,

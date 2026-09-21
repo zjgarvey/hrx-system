@@ -240,3 +240,84 @@ bool iree_hip_handle_registry_remove(iree_hip_handle_registry_t* registry,
   iree_slim_mutex_unlock(&shard->mutex);
   return found;
 }
+
+iree_status_t iree_hip_handle_registry_snapshot_retain_if(
+    iree_hip_handle_registry_t* registry,
+    iree_hip_handle_registry_match_fn_t match_fn, void* user_data,
+    iree_hip_handle_registry_retain_fn_t retain_fn, uintptr_t** out_handles,
+    iree_host_size_t* out_count) {
+  IREE_ASSERT_ARGUMENT(registry);
+  IREE_ASSERT_ARGUMENT(match_fn);
+  IREE_ASSERT_ARGUMENT(retain_fn);
+  IREE_ASSERT_ARGUMENT(out_handles);
+  IREE_ASSERT_ARGUMENT(out_count);
+  *out_handles = NULL;
+  *out_count = 0;
+
+  for (iree_host_size_t i = 0; i < IREE_HIP_HANDLE_REGISTRY_SHARD_COUNT; ++i) {
+    iree_slim_mutex_lock(&registry->shards[i].mutex);
+  }
+
+  iree_status_t status = iree_ok_status();
+  iree_host_size_t match_count = 0;
+  for (iree_host_size_t i = 0;
+       i < IREE_HIP_HANDLE_REGISTRY_SHARD_COUNT && iree_status_is_ok(status);
+       ++i) {
+    iree_hip_handle_registry_shard_t* shard = &registry->shards[i];
+    for (iree_host_size_t j = 0; j < shard->capacity; ++j) {
+      if (shard->states[j] != IREE_HIP_HANDLE_REGISTRY_SLOT_LIVE ||
+          !match_fn(shard->handles[j], user_data)) {
+        continue;
+      }
+      if (IREE_UNLIKELY(
+              !iree_host_size_checked_add(match_count, 1, &match_count))) {
+        status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                  "opaque handle snapshot size overflow");
+        break;
+      }
+    }
+  }
+
+  uintptr_t* handles = NULL;
+  if (iree_status_is_ok(status) && match_count > 0) {
+    iree_host_size_t allocation_size = 0;
+    if (IREE_UNLIKELY(!iree_host_size_checked_mul(match_count, sizeof(*handles),
+                                                  &allocation_size))) {
+      status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                "opaque handle snapshot size overflow");
+    } else {
+      status = iree_allocator_malloc(iree_allocator_system(), allocation_size,
+                                     (void**)&handles);
+    }
+  }
+
+  iree_host_size_t write_index = 0;
+  if (iree_status_is_ok(status)) {
+    for (iree_host_size_t i = 0; i < IREE_HIP_HANDLE_REGISTRY_SHARD_COUNT;
+         ++i) {
+      iree_hip_handle_registry_shard_t* shard = &registry->shards[i];
+      for (iree_host_size_t j = 0; j < shard->capacity; ++j) {
+        if (shard->states[j] != IREE_HIP_HANDLE_REGISTRY_SLOT_LIVE ||
+            !match_fn(shard->handles[j], user_data)) {
+          continue;
+        }
+        IREE_ASSERT(write_index < match_count);
+        retain_fn(shard->handles[j]);
+        handles[write_index++] = shard->handles[j];
+      }
+    }
+    IREE_ASSERT(write_index == match_count);
+  }
+
+  for (iree_host_size_t i = IREE_HIP_HANDLE_REGISTRY_SHARD_COUNT; i > 0; --i) {
+    iree_slim_mutex_unlock(&registry->shards[i - 1].mutex);
+  }
+
+  if (!iree_status_is_ok(status)) {
+    iree_allocator_free(iree_allocator_system(), handles);
+    return status;
+  }
+  *out_handles = handles;
+  *out_count = match_count;
+  return iree_ok_status();
+}

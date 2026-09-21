@@ -9,6 +9,7 @@
 
 #include "iree/base/api.h"
 #include "iree/base/threading/mutex.h"
+#include "iree/base/threading/notification.h"
 #include "iree/hal/device_event.h"
 #include "iree/hal/drivers/amdgpu/abi/feedback.h"
 #include "iree/hal/drivers/amdgpu/api.h"
@@ -20,6 +21,31 @@ typedef struct iree_hal_amdgpu_logical_device_options_t
 typedef struct iree_hal_amdgpu_physical_device_t
     iree_hal_amdgpu_physical_device_t;
 typedef struct iree_hal_amdgpu_system_t iree_hal_amdgpu_system_t;
+typedef struct iree_hal_amdgpu_feedback_source_hold_t
+    iree_hal_amdgpu_feedback_source_hold_t;
+typedef struct iree_hal_amdgpu_feedback_source_batch_t
+    iree_hal_amdgpu_feedback_source_batch_t;
+
+enum {
+  IREE_HAL_AMDGPU_FEEDBACK_SOURCE_LIST_INLINE_CAPACITY = 8,
+};
+
+// Host-only immutable sidecar identifying every executable that can produce
+// feedback for a recorded command buffer. Entries are borrowed under the HAL
+// command-buffer resource-lifetime contract, including UNRETAINED mode; queue
+// admission converts them to independent retained source-owner holds before
+// publishing native work.
+typedef struct iree_hal_amdgpu_feedback_source_list_t {
+  // Borrowed executable pointers in first-recorded order.
+  iree_hal_executable_t** values;
+  // Number of occupied entries in |values|.
+  iree_host_size_t count;
+  // Allocated entry capacity of |values|.
+  iree_host_size_t capacity;
+  // Inline storage used before the distinct source count spills.
+  iree_hal_executable_t*
+      inline_values[IREE_HAL_AMDGPU_FEEDBACK_SOURCE_LIST_INLINE_CAPACITY];
+} iree_hal_amdgpu_feedback_source_list_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,7 +68,26 @@ typedef struct iree_hal_amdgpu_feedback_device_state_t {
   iree_host_size_t physical_device_ordinal;
 
   // Serializes drains between the feedback service thread and queue retirement.
+  // It protects runner admission and the source-owner ledger only and is never
+  // held while a device event sink, error handler, or resource release runs.
   iree_slim_mutex_t drain_mutex;
+
+  // True while one caller owns channel draining and callback claims.
+  bool runner_active;
+
+  // True after device teardown has closed new drain/owner admission.
+  bool is_stopping;
+
+  // True after malformed channel data or an unmatched source identity makes
+  // further packet consumption unsafe.
+  bool is_poisoned;
+
+  // Wakes teardown after the active runner and callback claim scope exits.
+  iree_notification_t runner_notification;
+
+  // Intrusive channel-visible source-owner holds. Every entry retains the
+  // executable owning its source context and is installed before AQL publish.
+  iree_hal_amdgpu_feedback_source_hold_t* source_hold_head;
 
   // Host-owned channel shared with device producers.
   iree_hal_amdgpu_feedback_channel_t channel;
@@ -117,6 +162,49 @@ void iree_hal_amdgpu_feedback_state_deinitialize(
 bool iree_hal_amdgpu_feedback_state_is_enabled(
     const iree_hal_amdgpu_feedback_state_t* state);
 
+// Initializes an empty borrowed executable sidecar.
+void iree_hal_amdgpu_feedback_source_list_initialize(
+    iree_hal_amdgpu_feedback_source_list_t* out_list);
+
+// Releases sidecar storage without releasing borrowed executable entries.
+void iree_hal_amdgpu_feedback_source_list_deinitialize(
+    iree_allocator_t host_allocator,
+    iree_hal_amdgpu_feedback_source_list_t* list);
+
+// Inserts |executable| if not already present. The sidecar never retains it.
+iree_status_t iree_hal_amdgpu_feedback_source_list_insert(
+    iree_allocator_t host_allocator,
+    iree_hal_amdgpu_feedback_source_list_t* list,
+    iree_hal_executable_t* executable);
+
+// Allocates a feedback source-owner batch and retains each distinct AMDGPU
+// executable in |executables|. The batch is private until explicitly installed
+// and may be cancelled without touching the channel ledger.
+iree_status_t iree_hal_amdgpu_feedback_source_batch_prepare(
+    iree_hal_amdgpu_feedback_state_t* state,
+    iree_host_size_t physical_device_ordinal, iree_host_size_t executable_count,
+    iree_hal_executable_t* const* executables,
+    iree_hal_amdgpu_feedback_source_batch_t** out_batch);
+
+// Atomically installs every hold in |batch| with one acquired lower
+// reservation bound. This is infallible and must run after all fallible packet
+// construction but before the first packet header/doorbell is published.
+void iree_hal_amdgpu_feedback_source_batch_install(
+    iree_hal_amdgpu_feedback_source_batch_t* batch);
+
+// Releases an uninstalled batch. Once installed, ownership belongs to the
+// device-stable feedback ledger and cancellation is forbidden.
+void iree_hal_amdgpu_feedback_source_batch_cancel(
+    iree_hal_amdgpu_feedback_source_batch_t* batch);
+
+// Closes an installed batch after the associated queue epoch has been observed
+// with an HSA system acquire. Captures the channel reservation head as the
+// exclusive upper sequence bound and wakes the device feedback service for
+// eventual retirement. Queue failure without an HSA acquire must leave the
+// batch OPEN for device teardown to release.
+void iree_hal_amdgpu_feedback_source_batch_close(
+    iree_hal_amdgpu_feedback_source_batch_t* batch);
+
 // Drains ready packets from the channel for |physical_device_ordinal|.
 //
 // This reports channel or packet handling errors through the state error
@@ -136,6 +224,25 @@ iree_status_t iree_hal_amdgpu_feedback_state_populate_config(
     const iree_hal_amdgpu_feedback_state_t* state,
     iree_host_size_t physical_device_ordinal,
     iree_hal_amdgpu_feedback_config_t* out_config);
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+typedef enum iree_hal_amdgpu_feedback_test_phase_e {
+  IREE_HAL_AMDGPU_FEEDBACK_TEST_PHASE_BATCH_INSTALLED = 0,
+  IREE_HAL_AMDGPU_FEEDBACK_TEST_PHASE_TARGET_CLOSED = 1,
+  IREE_HAL_AMDGPU_FEEDBACK_TEST_PHASE_CLAIM_ENTERED = 2,
+  IREE_HAL_AMDGPU_FEEDBACK_TEST_PHASE_CLAIM_RETURNED = 3,
+  IREE_HAL_AMDGPU_FEEDBACK_TEST_PHASE_BATCH_RETIRED = 4,
+} iree_hal_amdgpu_feedback_test_phase_t;
+
+typedef void(IREE_API_PTR* iree_hal_amdgpu_feedback_test_phase_observer_t)(
+    iree_host_size_t physical_device_ordinal,
+    iree_hal_amdgpu_feedback_test_phase_t phase, uint64_t source_identity,
+    uint64_t sequence, void* user_data);
+
+// Test-only observer compiled exclusively into the instrumented companion.
+void iree_hal_amdgpu_feedback_test_set_phase_observer(
+    iree_hal_amdgpu_feedback_test_phase_observer_t observer, void* user_data);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
 
 #ifdef __cplusplus
 }  // extern "C"

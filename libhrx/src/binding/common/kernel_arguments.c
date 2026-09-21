@@ -40,9 +40,114 @@ iree_hal_streaming_load_device_pointer_bytes(const void* source) {
   return value;
 }
 
+static iree_status_t iree_hal_streaming_validate_one_device_pointer(
+    iree_hal_streaming_context_t* context,
+    iree_hal_streaming_device_pointer_validator_t pointer_validator,
+    void* pointer_validator_user_data, const void* source) {
+  const iree_hal_streaming_deviceptr_t device_pointer =
+      iree_hal_streaming_load_device_pointer_bytes(source);
+  if (!device_pointer || !pointer_validator) return iree_ok_status();
+  return pointer_validator(pointer_validator_user_data, context,
+                           device_pointer);
+}
+
+iree_status_t iree_hal_streaming_validate_kernel_argument_pointers(
+    iree_hal_streaming_context_t* context,
+    const iree_hal_streaming_parameter_info_t* parameters,
+    const iree_hal_streaming_dispatch_params_t* params) {
+  IREE_ASSERT_ARGUMENT(context);
+  IREE_ASSERT_ARGUMENT(parameters);
+  IREE_ASSERT_ARGUMENT(params);
+  if (!params->pointer_validator || parameters->binding_count == 0) {
+    return iree_ok_status();
+  }
+  if (!parameters->ops || !params->buffer) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "formal kernel pointers require metadata and "
+                            "parameter storage");
+  }
+
+  const bool is_args_array = iree_any_bit_set(
+      params->flags, IREE_HAL_STREAMING_DISPATCH_FLAG_ARGS_ARRAY);
+  const bool is_pre_packed = iree_any_bit_set(
+      params->flags, IREE_HAL_STREAMING_DISPATCH_FLAG_PRE_PACKED);
+  const iree_hal_streaming_parameter_op_t* resolve_ops =
+      parameters->ops + parameters->copy_count;
+  const iree_host_size_t parameter_count =
+      parameters->copy_count + parameters->binding_count;
+  const iree_host_size_t packed_size =
+      params->buffer_size ? params->buffer_size : parameters->buffer_size;
+  for (iree_host_size_t i = 0; i < parameters->binding_count; ++i) {
+    const iree_hal_streaming_parameter_resolve_op_t resolve_op =
+        resolve_ops[i].resolve;
+    const void* source = NULL;
+    if (is_args_array) {
+      if (resolve_op.source_ordinal >= parameter_count) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "kernel pointer ordinal is out of range");
+      }
+      source = ((void* const*)params->buffer)[resolve_op.source_ordinal];
+      if (!source) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "kernel pointer argument storage is NULL");
+      }
+    } else {
+      const iree_host_size_t source_offset =
+          is_pre_packed ? resolve_op.native_abi_destination_offset
+                        : resolve_op.source_offset;
+      if (source_offset > packed_size ||
+          sizeof(iree_hal_streaming_deviceptr_t) >
+              packed_size - source_offset) {
+        return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                                "formal kernel pointer exceeds argument "
+                                "storage");
+      }
+      source = (const uint8_t*)params->buffer + source_offset;
+    }
+    IREE_RETURN_IF_ERROR(iree_hal_streaming_validate_one_device_pointer(
+        context, params->pointer_validator, params->pointer_validator_user_data,
+        source));
+  }
+  return iree_ok_status();
+}
+
+iree_status_t iree_hal_streaming_validate_native_kernel_argument_pointers(
+    iree_hal_streaming_context_t* context,
+    const iree_hal_streaming_parameter_info_t* parameters,
+    iree_const_byte_span_t arguments,
+    iree_hal_streaming_device_pointer_validator_t pointer_validator,
+    void* pointer_validator_user_data) {
+  IREE_ASSERT_ARGUMENT(context);
+  IREE_ASSERT_ARGUMENT(parameters);
+  if (!pointer_validator || parameters->binding_count == 0) {
+    return iree_ok_status();
+  }
+  if (!parameters->ops || (arguments.data_length > 0 && !arguments.data)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "captured formal kernel pointers are missing");
+  }
+  const iree_hal_streaming_parameter_op_t* resolve_ops =
+      parameters->ops + parameters->copy_count;
+  for (iree_host_size_t i = 0; i < parameters->binding_count; ++i) {
+    const iree_host_size_t offset =
+        resolve_ops[i].resolve.native_abi_destination_offset;
+    if (offset > arguments.data_length ||
+        sizeof(iree_hal_streaming_deviceptr_t) >
+            arguments.data_length - offset) {
+      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                              "captured formal kernel pointer exceeds native "
+                              "argument storage");
+    }
+    IREE_RETURN_IF_ERROR(iree_hal_streaming_validate_one_device_pointer(
+        context, pointer_validator, pointer_validator_user_data,
+        arguments.data + offset));
+  }
+  return iree_ok_status();
+}
+
 static bool iree_hal_streaming_buffer_can_import_for_context(
     const iree_hal_streaming_buffer_t* buffer) {
-  if (!buffer) return false;
+  if (!buffer || buffer->is_virtual_memory_access) return false;
   if (buffer->is_managed) return true;
   return iree_all_bits_set(
       (iree_hal_memory_type_t)buffer->memory_type,
@@ -153,8 +258,10 @@ static iree_status_t iree_hal_streaming_lookup_kernel_buffer_ref(
   // coverage.
   iree_hal_streaming_buffer_ref_t stream_ref;
   iree_hal_streaming_context_t* owner_context = NULL;
-  iree_status_t status =
-      iree_hal_streaming_memory_lookup(context, device_pointer, &stream_ref);
+  uint64_t capability_id = 0;
+  iree_status_t status = iree_hal_streaming_memory_lookup_range_with_access(
+      context, device_pointer, 1, IREE_HAL_MEMORY_ACCESS_READ, &stream_ref,
+      &capability_id);
   if (iree_status_is_ok(status) ||
       iree_status_code(status) != IREE_STATUS_NOT_FOUND) {
     if (!iree_status_is_ok(status)) return status;

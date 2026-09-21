@@ -13,6 +13,7 @@
 #include "iree/hal/drivers/amdgpu/device/grid_sync.h"
 #include "iree/hal/drivers/amdgpu/device/timestamp.h"
 #include "iree/hal/drivers/amdgpu/executable.h"
+#include "iree/hal/drivers/amdgpu/feedback_state.h"
 #include "iree/hal/drivers/amdgpu/host_queue_policy.h"
 #include "iree/hal/drivers/amdgpu/host_queue_profile.h"
 #include "iree/hal/drivers/amdgpu/host_queue_profile_events.h"
@@ -943,6 +944,30 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_dispatch_packets(
     sources[0].ticks = iree_hal_amdgpu_profile_dispatch_event_ticks(event);
   }
 
+  // Feedback packets borrow executable-owned source metadata and can remain
+  // globally blocked after this queue epoch completes. Install an independent
+  // exact owner before committing even the prefix packets. This deliberately
+  // ignores BORROW_RESOURCE_LIFETIMES: that contract ends at signal completion,
+  // while feedback channel retirement may occur later.
+  iree_hal_amdgpu_feedback_source_batch_t* feedback_source_batch = NULL;
+  if (queue->feedback_state) {
+    iree_hal_executable_t* source_executables[] = {executable};
+    status = iree_hal_amdgpu_feedback_source_batch_prepare(
+        queue->feedback_state, queue->device_ordinal,
+        IREE_ARRAYSIZE(source_executables), source_executables,
+        &feedback_source_batch);
+    if (!iree_status_is_ok(status)) {
+      iree_hal_amdgpu_host_queue_fail_kernel_submission(queue, &submission);
+      iree_hal_amdgpu_host_queue_cancel_profile_dispatch_events(queue,
+                                                                profile_events);
+      iree_hal_amdgpu_host_queue_cancel_profile_queue_device_events(
+          queue, profile_queue_device_events);
+      return status;
+    }
+    iree_hal_amdgpu_feedback_source_batch_install(feedback_source_batch);
+    submission.reclaim_entry->feedback_source_batch = feedback_source_batch;
+  }
+
   iree_hal_amdgpu_host_queue_emit_kernel_submission_prefix(queue, resolution,
                                                            &submission);
   const uint64_t submission_epoch =
@@ -990,8 +1015,7 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_dispatch_packets(
     iree_hal_amdgpu_host_queue_publish_profile_host_writes(queue);
   }
   iree_hal_amdgpu_host_queue_publish_submission_kernargs(queue, &submission);
-  iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                  submission_epoch);
+  iree_hal_amdgpu_host_queue_publish_submission_epoch(queue, submission_epoch);
   if (queue_device_event) {
     iree_hal_amdgpu_host_queue_commit_queue_device_start_packet(
         queue, resolution,
@@ -1079,7 +1103,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_dispatch(
   IREE_ASSERT_ARGUMENT(out_ready);
   *out_ready = false;
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
   iree_hal_amdgpu_host_queue_dispatch_plan_t plan;
   IREE_RETURN_IF_ERROR(iree_hal_amdgpu_host_queue_prepare_dispatch_plan(

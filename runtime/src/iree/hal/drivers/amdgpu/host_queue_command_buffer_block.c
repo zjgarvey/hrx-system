@@ -13,6 +13,7 @@
 #include "iree/hal/drivers/amdgpu/aql_command_buffer.h"
 #include "iree/hal/drivers/amdgpu/buffer.h"
 #include "iree/hal/drivers/amdgpu/device/timestamp.h"
+#include "iree/hal/drivers/amdgpu/feedback_state.h"
 #include "iree/hal/drivers/amdgpu/host_queue_command_buffer_packet.h"
 #include "iree/hal/drivers/amdgpu/host_queue_command_buffer_profile.h"
 #include "iree/hal/drivers/amdgpu/host_queue_command_buffer_scratch.h"
@@ -557,8 +558,7 @@ static uint64_t iree_hal_amdgpu_host_queue_finish_command_buffer_block(
     iree_hal_amdgpu_host_queue_publish_profile_host_writes(queue);
   }
   iree_hal_amdgpu_host_queue_publish_submission_kernargs(queue, submission);
-  iree_hal_amdgpu_notification_ring_publish_epoch(&queue->notification_ring,
-                                                  submission_epoch);
+  iree_hal_amdgpu_host_queue_publish_submission_epoch(queue, submission_epoch);
   if (queue_device_event) {
     const uint64_t start_packet_id =
         submission->first_packet_id + resolution->barrier_count;
@@ -681,6 +681,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer_block(
       profile_queue_device_events = {0};
   iree_hal_amdgpu_host_queue_kernel_submission_t submission;
   memset(&submission, 0, sizeof(submission));
+  iree_hal_amdgpu_feedback_source_batch_t* feedback_source_batch = NULL;
   bool submission_begun = false;
   bool submitted = false;
   iree_status_t status = iree_ok_status();
@@ -872,7 +873,22 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer_block(
           profile_counter_set_count, profile_trace_packet_count,
           profile_harvest_sources, profile_dispatches);
     }
+    if (iree_status_is_ok(status) && queue->feedback_state) {
+      iree_host_size_t feedback_source_count = 0;
+      iree_hal_executable_t* const* feedback_sources =
+          iree_hal_amdgpu_aql_command_buffer_feedback_sources(
+              command_buffer, &feedback_source_count);
+      status = iree_hal_amdgpu_feedback_source_batch_prepare(
+          queue->feedback_state, queue->device_ordinal, feedback_source_count,
+          feedback_sources, &feedback_source_batch);
+    }
     if (iree_status_is_ok(status)) {
+      // All fallible replay construction is complete. Install the broad
+      // command-buffer source set for this exact published block and transfer
+      // it to the same epoch reclaim entry before any packet header/doorbell.
+      iree_hal_amdgpu_feedback_source_batch_install(feedback_source_batch);
+      submission.reclaim_entry->feedback_source_batch = feedback_source_batch;
+      feedback_source_batch = NULL;
       iree_hal_amdgpu_host_queue_command_buffer_profile_submission_t
           profile_submission = {
               .dispatch_events = profile_events,
@@ -907,6 +923,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_command_buffer_block(
   }
 
   if (!submitted) {
+    iree_hal_amdgpu_feedback_source_batch_cancel(feedback_source_batch);
     if (submission_begun) {
       iree_hal_amdgpu_host_queue_fail_kernel_submission(queue, &submission);
     }

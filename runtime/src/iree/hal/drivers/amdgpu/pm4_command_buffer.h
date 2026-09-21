@@ -181,6 +181,13 @@ const iree_hal_amdgpu_pm4_program_t* iree_hal_amdgpu_pm4_command_buffer_program(
 uint64_t iree_hal_amdgpu_pm4_command_buffer_profile_id(
     iree_hal_command_buffer_t* command_buffer);
 
+// Returns the immutable host-only executable source sidecar populated by every
+// recorded dispatch, independent of retained/UNRETAINED mode. Entries are
+// borrowed and valid for the command-buffer lifetime.
+iree_hal_executable_t* const*
+iree_hal_amdgpu_pm4_command_buffer_feedback_sources(
+    iree_hal_command_buffer_t* command_buffer, iree_host_size_t* out_count);
+
 // Returns retained profile command operations, or NULL when not retained.
 const iree_hal_profile_command_operation_record_t*
 iree_hal_amdgpu_pm4_command_buffer_profile_operations(

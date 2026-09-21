@@ -17,6 +17,13 @@ typedef struct iree_hal_streaming_stream_t iree_hal_streaming_stream_t;
 typedef struct iree_hal_streaming_context_t iree_hal_streaming_context_t;
 typedef struct iree_hal_streaming_symbol_t iree_hal_streaming_symbol_t;
 
+// Validates one formal device pointer for a target streaming context. The
+// callback decides only pointers identified by reflected kernel metadata;
+// pointers embedded in opaque argument data are outside this contract.
+typedef iree_status_t (*iree_hal_streaming_device_pointer_validator_t)(
+    void* user_data, iree_hal_streaming_context_t* context,
+    uint64_t device_pointer);
+
 // Dispatch flags for kernel launches.
 typedef enum iree_hal_streaming_dispatch_flag_bits_e {
   IREE_HAL_STREAMING_DISPATCH_FLAG_NONE = 0ull,
@@ -42,6 +49,10 @@ typedef struct iree_hal_streaming_dispatch_params_t {
   size_t buffer_size;
   // Flags controlling parameter interpretation and dispatch behavior.
   iree_hal_streaming_dispatch_flags_t flags;
+  // Optional binding-specific validator for formal device pointer arguments.
+  iree_hal_streaming_device_pointer_validator_t pointer_validator;
+  // Opaque value passed to |pointer_validator|.
+  void* pointer_validator_user_data;
 } iree_hal_streaming_dispatch_params_t;
 
 // One member of a kernel launch batch.

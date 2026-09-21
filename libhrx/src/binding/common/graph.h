@@ -39,6 +39,8 @@ typedef struct iree_hal_streaming_graph_owned_host_allocation_t {
   struct iree_hal_streaming_graph_owned_host_allocation_t* next;
   // Streaming buffer wrapper for this host-visible allocation.
   iree_hal_streaming_buffer_t* buffer;
+  // Never-reused wrapper identity paired with the graph-owned wrapper pin.
+  uint64_t buffer_id;
   // Host pointer returned by the streaming host allocation.
   void* host_ptr;
   // Device pointer associated with the host-visible allocation.
@@ -64,6 +66,16 @@ typedef struct iree_hal_streaming_graph_user_object_ref_t {
   // Callback used when destroying this graph template or releasing references.
   iree_hal_streaming_graph_user_object_release_fn_t release;
 } iree_hal_streaming_graph_user_object_ref_t;
+
+// Stable shared ownership for an eager graph-memory allocation. Public graph
+// nodes and immutable executable snapshots retain this record independently;
+// the exact backing pin is transferred or finalized only once.
+struct iree_hal_streaming_graph_mem_allocation_t {
+  iree_atomic_ref_count_t ref_count;
+  iree_hal_streaming_buffer_t* buffer;
+  uint64_t buffer_id;
+  bool owns_device_allocation;
+};
 
 // Graph structure (template).
 typedef struct iree_hal_streaming_graph_t {
@@ -100,10 +112,28 @@ typedef struct iree_hal_streaming_graph_t {
   // Opaque user objects retained by this graph template.
   iree_hal_streaming_graph_user_object_ref_t* user_object_refs;
 
+  // Public graph retained by an immutable executable snapshot. This preserves
+  // raw public node identity storage without making snapshot launches or
+  // rebuilds consult mutable public topology. NULL for public templates and
+  // public clones.
+  struct iree_hal_streaming_graph_t* executable_source_graph;
+  // Public graph whose memory-node slot and transfer state govern this
+  // snapshot. Aliases |executable_source_graph| and owns no additional ref.
+  struct iree_hal_streaming_graph_t* graph_memory_owner_graph;
+
   // True when the graph contains HIP memory allocation or free nodes.
   bool has_graph_memory_nodes;
-  // Number of live executable graphs instantiated from memory-node graph.
+  // Serializes the graph-memory executable slot and one-way transfer state.
+  iree_slim_mutex_t graph_memory_state_mutex;
+  // Number of live executable graphs instantiated from this memory-node graph.
   uint32_t active_graph_memory_exec_count;
+  // Number of committed child-graph nodes in other templates that retain this
+  // graph. Nonzero forbids subsequently adding graph-memory nodes.
+  uint32_t child_parent_edge_count;
+  // True after an accepted unmatched allocation transferred backing ownership
+  // to the context registry. Reinstantiation is rejected because this eager
+  // allocation implementation cannot recreate a fresh allocation epoch.
+  bool has_transferred_unfreed_allocation;
 
   // Graph creation flags.
   uint32_t flags;
@@ -113,6 +143,26 @@ typedef struct iree_hal_streaming_graph_t {
   // Host allocator used for graph object allocation.
   iree_allocator_t host_allocator;
 } iree_hal_streaming_graph_t;
+
+// Transfers an unmatched allocation node's independent wrapper pin to the
+// still-published context allocation registry after the node's exact launch
+// barrier has been accepted. Idempotent for already-transferred nodes.
+void iree_hal_streaming_graph_mem_alloc_transfer_to_context(
+    iree_hal_streaming_graph_node_t* node);
+
+void iree_hal_streaming_graph_mem_allocation_initialize(
+    iree_hal_streaming_graph_mem_allocation_t* allocation,
+    iree_hal_streaming_buffer_t* buffer, uint64_t buffer_id);
+void iree_hal_streaming_graph_mem_allocation_retain(
+    iree_hal_streaming_graph_mem_allocation_t* allocation);
+void iree_hal_streaming_graph_mem_allocation_release(
+    iree_hal_streaming_graph_mem_allocation_t* allocation);
+
+// Creates an immutable executable template with exact public-node identity
+// mappings. Unlike the public clone API this supports graph-memory nodes.
+iree_status_t iree_hal_streaming_graph_snapshot(
+    iree_hal_streaming_graph_t* source_graph,
+    iree_hal_streaming_graph_t** out_graph);
 
 // Type of partition - determines how nodes are executed.
 enum iree_hal_streaming_graph_partition_type_e {
@@ -160,9 +210,16 @@ iree_status_t iree_hal_streaming_graph_exec_instantiate_from_template(
 iree_status_t iree_hal_streaming_graph_exec_rebuild_from_template(
     iree_hal_streaming_graph_exec_t* exec);
 
-bool iree_hal_streaming_graph_exec_owns_node(
-    iree_hal_streaming_graph_exec_t* exec,
-    iree_hal_streaming_graph_node_t* node);
+#if defined(IREE_HAL_STREAMING_TEST_INSTRUMENTATION)
+// Synchronous test observer invoked immediately before each compiled graph
+// block attempts a HAL queue operation. Installation and graph launches must
+// be externally serialized.
+typedef void (*iree_hal_streaming_graph_test_queue_submission_observer_t)(
+    void* user_data);
+void iree_hal_streaming_graph_test_set_queue_submission_observer(
+    iree_hal_streaming_graph_test_queue_submission_observer_t observer,
+    void* user_data);
+#endif  // IREE_HAL_STREAMING_TEST_INSTRUMENTATION
 
 // Augmented node for sorting and partitioning.
 typedef struct iree_hal_streaming_graph_sort_node_t {
@@ -233,6 +290,11 @@ iree_status_t iree_hal_streaming_graph_validate_child_graph(
     iree_hal_streaming_graph_t* parent_graph,
     iree_hal_streaming_graph_t* child_graph);
 
+// Rejects adding a graph-memory node while |graph| is retained as a child by
+// any committed parent node.
+iree_status_t iree_hal_streaming_graph_validate_memory_node_addition(
+    iree_hal_streaming_graph_t* graph);
+
 // Adds dependencies between nodes in the graph.
 // For each index i in [0, count), adds an edge from from_nodes[i] to
 // to_nodes[i], meaning to_nodes[i] will wait for from_nodes[i] to complete.
@@ -245,6 +307,37 @@ iree_status_t iree_hal_streaming_graph_add_dependencies(
 iree_status_t iree_hal_streaming_graph_allocate_host_staging(
     iree_hal_streaming_graph_t* graph, iree_device_size_t size,
     iree_hal_streaming_buffer_t** out_buffer);
+
+// Allocates host staging without publishing it into |graph|. Callers must
+// commit or abort the returned ownership record exactly once.
+iree_status_t iree_hal_streaming_graph_prepare_host_staging(
+    iree_hal_streaming_graph_t* graph, iree_device_size_t size,
+    iree_hal_streaming_graph_owned_host_allocation_t** out_allocation,
+    iree_hal_streaming_buffer_t** out_buffer);
+void iree_hal_streaming_graph_commit_host_staging(
+    iree_hal_streaming_graph_t* graph,
+    iree_hal_streaming_graph_owned_host_allocation_t* allocation);
+void iree_hal_streaming_graph_abort_host_staging(
+    iree_hal_streaming_graph_t* graph,
+    iree_hal_streaming_graph_owned_host_allocation_t* allocation);
+
+// Finds a committed staging allocation by its buffer identity.
+iree_hal_streaming_graph_owned_host_allocation_t*
+iree_hal_streaming_graph_find_host_staging(
+    iree_hal_streaming_graph_t* graph,
+    const iree_hal_streaming_buffer_t* buffer);
+
+// Removes a committed staging allocation from |graph| without releasing it.
+// Returns true when detached. The caller must abort the detached allocation
+// exactly once, and may do so after dropping an outer serialization lock.
+bool iree_hal_streaming_graph_detach_host_staging(
+    iree_hal_streaming_graph_t* graph,
+    iree_hal_streaming_graph_owned_host_allocation_t* allocation);
+
+// Detaches and releases a committed staging allocation.
+void iree_hal_streaming_graph_release_host_staging(
+    iree_hal_streaming_graph_t* graph,
+    iree_hal_streaming_graph_owned_host_allocation_t* allocation);
 
 #ifdef __cplusplus
 }

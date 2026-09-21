@@ -1578,8 +1578,7 @@ static iree_status_t iree_async_proactor_io_uring_cancel(
   iree_io_uring_sqe_t* sqe = iree_io_uring_ring_get_sqe(&proactor->ring);
   if (!sqe) {
     iree_io_uring_ring_sq_unlock(&proactor->ring);
-    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                            "SQ full, cannot submit cancel");
+    return iree_status_from_code(IREE_STATUS_RESOURCE_EXHAUSTED);
   }
 
   // Fill the cancel SQE.

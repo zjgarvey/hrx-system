@@ -453,6 +453,51 @@ void iree_hal_streaming_stream_release(iree_hal_streaming_stream_t* stream) {
   }
 }
 
+void iree_hal_streaming_stream_abort_capture_quiesced(
+    iree_hal_streaming_stream_t* stream) {
+  if (!stream) return;
+  iree_hal_streaming_graph_t* owned_graph = NULL;
+  iree_slim_mutex_lock(&stream->mutex);
+  if (stream->capture_status != IREE_HAL_STREAMING_CAPTURE_STATUS_NONE) {
+    if (stream->capture_graph_owned) owned_graph = stream->capture_graph;
+    iree_hal_streaming_stream_set_capture_status(
+        stream, IREE_HAL_STREAMING_CAPTURE_STATUS_NONE);
+    stream->capture_graph = NULL;
+    stream->capture_graph_owned = false;
+    stream->capture_origin = false;
+    stream->capture_joined_to_origin = false;
+    stream->capture_id = 0;
+    stream->capture_owner_thread_id = 0;
+    stream->capture_dependency_count = 0;
+  }
+  iree_slim_mutex_unlock(&stream->mutex);
+  iree_hal_streaming_graph_release(owned_graph);
+}
+
+void iree_hal_streaming_stream_detach_quiesced(
+    iree_hal_streaming_context_t* context,
+    iree_hal_streaming_stream_t* stream) {
+  if (!context || !stream) return;
+  iree_hal_queue_t* queue = NULL;
+  iree_hal_queue_t* cooperative_queue = NULL;
+  iree_slim_mutex_lock(&stream->mutex);
+  IREE_ASSERT(stream->context == context,
+              "quiesced detach must name the exact attached context");
+  IREE_ASSERT(stream->capture_status == IREE_HAL_STREAMING_CAPTURE_STATUS_NONE,
+              "quiesced detach requires capture-free stream state");
+  IREE_ASSERT(!stream->capture_graph && !stream->capture_graph_owned,
+              "quiesced detach requires released capture ownership");
+  queue = stream->queue;
+  cooperative_queue = stream->cooperative_queue;
+  stream->queue = NULL;
+  stream->cooperative_queue = NULL;
+  stream->context = NULL;
+  iree_slim_mutex_unlock(&stream->mutex);
+  iree_hal_queue_release(cooperative_queue);
+  iree_hal_queue_release(queue);
+  iree_hal_streaming_context_unregister_stream(context, stream);
+}
+
 bool iree_hal_streaming_stream_retain_context(
     iree_hal_streaming_stream_t* stream,
     iree_hal_streaming_context_t** out_context) {
@@ -1114,6 +1159,52 @@ iree_status_t iree_hal_streaming_stream_wait_submitted(
   return iree_ok_status();
 }
 
+iree_status_t iree_hal_streaming_stream_wait_submitted_or_terminal(
+    iree_hal_streaming_stream_t* stream,
+    iree_hal_streaming_teardown_wait_observer_t wait_observer,
+    void* wait_observer_user_data, iree_status_t* out_execution_status) {
+  IREE_ASSERT_ARGUMENT(stream);
+  IREE_ASSERT_ARGUMENT(out_execution_status);
+  *out_execution_status = iree_ok_status();
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  // Binding teardown has exclusive admission, so this is the final accepted
+  // frontier. Snapshot it under the same mutex used to publish queue work.
+  iree_slim_mutex_lock(&stream->mutex);
+  const uint64_t pending_value = stream->pending_value;
+  iree_slim_mutex_unlock(&stream->mutex);
+  if (pending_value == 0) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_ok_status();
+  }
+
+  if (wait_observer) wait_observer(wait_observer_user_data, stream);
+  iree_status_t wait_status = iree_hal_semaphore_wait(
+      stream->timeline_semaphore, pending_value, iree_infinite_timeout(),
+      IREE_ASYNC_WAIT_FLAG_NONE);
+  if (iree_status_is_ok(wait_status)) {
+    IREE_TRACE_ZONE_END(z0);
+    return wait_status;
+  }
+
+  // Infinite waits have no ordinary timeout. Verify that the returned error is
+  // the timeline's persistent terminal result before allowing teardown to
+  // treat the accepted frontier as quiescent. A healthy query means the wait
+  // itself failed and cleanup must not proceed.
+  uint64_t current_value = 0;
+  iree_status_t query_status =
+      iree_hal_semaphore_query(stream->timeline_semaphore, &current_value);
+  if (iree_status_is_ok(query_status)) {
+    IREE_TRACE_ZONE_END(z0);
+    return wait_status;
+  }
+
+  iree_status_ignore(wait_status);
+  *out_execution_status = query_status;
+  IREE_TRACE_ZONE_END(z0);
+  return iree_ok_status();
+}
+
 // Joins |stream| to the capture |event|'s last capture-time record belongs to,
 // adopting |capture_graph| as |stream|'s own capture when the stream is not
 // already capturing and then adding the event's dependency frontier to the
@@ -1375,6 +1466,11 @@ static iree_status_t iree_hal_streaming_prepare_launch_arguments(
     // ordering instead of trying to translate visible pointer slots.
     IREE_RETURN_IF_ERROR(
         iree_hal_streaming_validate_prepacked_kernel_arguments(symbol, params));
+    IREE_RETURN_IF_ERROR(
+        iree_hal_streaming_validate_native_kernel_argument_pointers(
+            context, &symbol->parameters,
+            iree_make_const_byte_span(params->buffer, params->buffer_size),
+            params->pointer_validator, params->pointer_validator_user_data));
     out_arguments->constants = params->buffer;
     out_arguments->constants_size = params->buffer_size;
     out_arguments->bindings.count = 0;
@@ -1395,6 +1491,12 @@ static iree_status_t iree_hal_streaming_prepare_launch_arguments(
     IREE_RETURN_IF_ERROR(iree_hal_streaming_pack_raw_argument_list(
         &symbol->parameters, (void**)params->buffer, out_arguments->constants,
         &out_arguments->constants_size));
+    IREE_RETURN_IF_ERROR(
+        iree_hal_streaming_validate_native_kernel_argument_pointers(
+            context, &symbol->parameters,
+            iree_make_const_byte_span(out_arguments->constants,
+                                      out_arguments->constants_size),
+            params->pointer_validator, params->pointer_validator_user_data));
     out_arguments->bindings.count = 0;
     out_arguments->use_raw_arguments = true;
     return iree_ok_status();
@@ -1418,6 +1520,8 @@ static iree_status_t iree_hal_streaming_prepare_launch_arguments(
     // native kernarg bytes with PRE_PACKED or provide ARGS_ARRAY so device
     // pointer values are preserved without depending on reflected pointer
     // slots.
+    IREE_RETURN_IF_ERROR(iree_hal_streaming_validate_kernel_argument_pointers(
+        context, &symbol->parameters, params));
     iree_status_t status = iree_hal_streaming_unpack_parameters(
         context, &symbol->parameters, params->buffer, out_arguments->constants,
         &out_arguments->bindings);
@@ -1904,6 +2008,14 @@ iree_status_t iree_hal_streaming_launch_kernel_batch(
     status = iree_hal_streaming_pack_raw_argument_list(
         &launch->symbol->parameters, (void**)launch->params.buffer,
         prepared[i].constants, &prepared[i].constants_size);
+    if (iree_status_is_ok(status)) {
+      status = iree_hal_streaming_validate_native_kernel_argument_pointers(
+          launch->stream->context, &launch->symbol->parameters,
+          iree_make_const_byte_span(prepared[i].constants,
+                                    prepared[i].constants_size),
+          launch->params.pointer_validator,
+          launch->params.pointer_validator_user_data);
+    }
     constants += constants_capacity;
   }
 

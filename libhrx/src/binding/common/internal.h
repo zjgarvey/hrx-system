@@ -26,10 +26,32 @@
 extern "C" {
 #endif
 
+// Atomically allocates a non-zero monotonically increasing identity in
+// [1, |max_valid|]. Allocating the terminal value stores zero, which is a
+// permanent exhausted sentinel; no later call can wrap and reuse an identity.
+static inline bool iree_hal_streaming_atomic_allocate_id(
+    iree_atomic_uint64_t* next_id, uint64_t max_valid, uint64_t* out_id) {
+  IREE_ASSERT_ARGUMENT(next_id);
+  IREE_ASSERT_ARGUMENT(out_id);
+  *out_id = 0;
+  uint64_t current = iree_atomic_load(next_id, iree_memory_order_relaxed);
+  while (current != 0 && current <= max_valid) {
+    const uint64_t next = current == max_valid ? 0 : current + 1;
+    if (iree_atomic_compare_exchange_weak(next_id, &current, next,
+                                          iree_memory_order_relaxed,
+                                          iree_memory_order_relaxed)) {
+      *out_id = current;
+      return true;
+    }
+  }
+  return false;
+}
+
 typedef uint64_t iree_hal_streaming_deviceptr_t;
 typedef iree_host_size_t iree_hal_streaming_device_ordinal_t;
 
 typedef struct iree_hal_streaming_buffer_t iree_hal_streaming_buffer_t;
+typedef struct iree_hal_streaming_buffer_ref_t iree_hal_streaming_buffer_ref_t;
 typedef struct iree_hal_streaming_context_module_entry_t
     iree_hal_streaming_context_module_entry_t;
 typedef struct iree_hal_streaming_context_symbol_map_t
@@ -56,6 +78,8 @@ typedef struct iree_hal_streaming_global_symbol_registry_t
 typedef struct iree_hal_streaming_graph_t iree_hal_streaming_graph_t;
 typedef struct iree_hal_streaming_graph_exec_t iree_hal_streaming_graph_exec_t;
 typedef struct iree_hal_streaming_graph_node_t iree_hal_streaming_graph_node_t;
+typedef struct iree_hal_streaming_graph_mem_allocation_t
+    iree_hal_streaming_graph_mem_allocation_t;
 // mem_pool is now hrx_mem_pool_t from libhrx (no binding-internal type).
 typedef struct iree_hal_streaming_module_t iree_hal_streaming_module_t;
 typedef struct iree_hal_streaming_module_registration_t
@@ -213,15 +237,38 @@ typedef struct iree_hal_streaming_timestamp_domain_t {
   uint32_t valid_bits;
 } iree_hal_streaming_timestamp_domain_t;
 
+typedef iree_status_t (*iree_hal_streaming_lifecycle_begin_fn_t)(
+    void* user_data, iree_hal_streaming_context_t* context);
+typedef void (*iree_hal_streaming_lifecycle_end_fn_t)(void* user_data);
+typedef iree_status_t (*iree_hal_streaming_pointer_resolver_fn_t)(
+    void* user_data, iree_hal_streaming_context_t* context,
+    iree_hal_streaming_deviceptr_t device_ptr, iree_device_size_t size,
+    iree_hal_memory_access_t required_access,
+    iree_hal_streaming_buffer_ref_t* out_ref, uint64_t* out_capability_id);
+
 // Stream context mapped to HAL device.
 struct iree_hal_streaming_context_t {
   // Reference counting.
   iree_atomic_ref_count_t ref_count;
 
+  // Non-zero while public operations may resolve or submit work through this
+  // context. Explicit destruction clears this before detaching capabilities.
+  iree_atomic_int32_t accepting_work;
+
+  // Set only after successful all-stream quiescence and permanent retirement.
+  // Final destruction then skips a redundant fallible wait.
+  iree_atomic_int32_t teardown_quiesced;
+
   // Associated device.
   iree_hal_device_t* device;
   iree_hal_streaming_device_ordinal_t device_ordinal;
   iree_hal_streaming_device_t* device_entry;
+  // True only for the context published through |device_entry|'s primary
+  // context slot. Explicit contexts remain false for their entire lifetime.
+  bool is_primary;
+  // Process generation and device reset epoch captured at context creation.
+  uint64_t runtime_generation;
+  uint64_t device_epoch;
 
   // Provisioned hardware queue used by streams in this context. Borrowed from
   // |device| and valid for the context lifetime.
@@ -274,6 +321,14 @@ struct iree_hal_streaming_context_t {
 
   // Context resource limits.
   iree_hal_streaming_limits_t limits;
+
+  // Optional binding lifecycle/capability hooks. HIP installs these before an
+  // operation can publish or resolve VMM aliases; other bindings leave them
+  // NULL and preserve ordinary pointer-table behavior.
+  iree_hal_streaming_lifecycle_begin_fn_t lifecycle_begin;
+  iree_hal_streaming_lifecycle_end_fn_t lifecycle_end;
+  iree_hal_streaming_pointer_resolver_fn_t pointer_resolver;
+  void* lifecycle_user_data;
 
   // Synchronization.
   iree_slim_mutex_t mutex;
@@ -361,6 +416,9 @@ typedef struct iree_hal_streaming_p2p_link_t {
 typedef struct iree_hal_streaming_device_t {
   // Device ordinal in the global registry.
   iree_host_size_t ordinal;
+  // Process generation and mutable per-device reset epoch.
+  uint64_t runtime_generation;
+  iree_atomic_uint64_t reset_epoch;
 
   // HRX device handle (owns the HAL device and driver).
   hrx_device_t hrx_device;
@@ -425,6 +483,11 @@ typedef struct iree_hal_streaming_device_t {
   // Protected by primary_context_mutex.
   int32_t primary_context_ref_count;
 
+  // Logical retains detached by primary-context reset and awaiting matching
+  // release calls. These never own the current primary-context generation.
+  // Protected by primary_context_mutex.
+  int32_t retired_primary_context_ref_count;
+
   // Default device allocation pool, protected by primary_context_mutex.
   hrx_mem_pool_t default_mem_pool;
   // Current device allocation pool, protected by primary_context_mutex.
@@ -457,6 +520,17 @@ typedef struct iree_hal_streaming_device_registry_t {
 
   // Global initialization state.
   bool initialized;
+  // Never-reused process generation assigned at initialization.
+  uint64_t runtime_generation;
+
+  // Optional binding callback that admits one context operation.
+  iree_hal_streaming_lifecycle_begin_fn_t lifecycle_begin;
+  // Optional binding callback that releases one context operation.
+  iree_hal_streaming_lifecycle_end_fn_t lifecycle_end;
+  // Optional binding callback that resolves binding-owned pointer capabilities.
+  iree_hal_streaming_pointer_resolver_fn_t pointer_resolver;
+  // Opaque value passed to binding lifecycle and pointer callbacks.
+  void* lifecycle_user_data;
 
   iree_slim_mutex_t mutex;
 
@@ -736,6 +810,10 @@ typedef struct iree_hal_streaming_symbol_t {
 typedef struct iree_hal_streaming_module_t {
   // Reference counting.
   iree_atomic_ref_count_t ref_count;
+  // True while the binding-owned public module capability remains live.
+  // Kernel graph nodes may retain the module after public unload solely to
+  // keep captured symbol storage addressable for deterministic rejection.
+  iree_atomic_int32_t public_live;
 
   // HAL executable resources.
   iree_hal_executable_t* executable;
@@ -935,6 +1013,9 @@ typedef struct iree_hal_streaming_context_import_t {
 
 // Buffer wrapper for device memory.
 typedef struct iree_hal_streaming_buffer_t {
+  // Owning allocations and graph templates retain wrappers independently.
+  iree_atomic_ref_count_t ref_count;
+
   // Device address obtained from the buffer handle.
   iree_hal_streaming_deviceptr_t device_ptr;
 
@@ -955,6 +1036,9 @@ typedef struct iree_hal_streaming_buffer_t {
 
   // Size reported by API metadata queries.
   iree_device_size_t logical_size;
+
+  // Never-reused 32-bit identity exposed by HIP pointer metadata.
+  uint32_t pointer_attribute_buffer_id;
 
   // HAL buffer (alias for hrx_buf->hal_buffer when hrx_buf is set).
   iree_hal_buffer_t* buffer;
@@ -987,6 +1071,30 @@ typedef struct iree_hal_streaming_buffer_t {
 
   // True when the allocation was created by hipMallocManaged.
   bool is_managed;
+
+  // True for an operational wrapper over a granted VMM access range. Such
+  // wrappers are valid only in their exact target context and must never be
+  // imported through the generic cross-context path.
+  bool is_virtual_memory_access;
+
+  // True while this wrapper is published in its context's pointer table.
+  bool is_published;
+
+  // True while one allocation-free table insertion is reserved for this
+  // wrapper's transactional publication or rollback.
+  bool has_reserved_insert;
+
+  // Binding-defined access mask for a VMM operational wrapper.
+  iree_hal_memory_access_t virtual_memory_allowed_access;
+
+  // Never-reused identity of the VMM permission instance backing this wrapper.
+  uint64_t virtual_memory_capability_id;
+
+  // Runtime generation in which this VMM wrapper was materialized.
+  uint64_t virtual_memory_generation;
+
+  // Target-device reset epoch in which this VMM wrapper was materialized.
+  uint64_t virtual_memory_device_epoch;
 
   // Number of managed-memory metadata pages tracked for this allocation.
   iree_host_size_t managed_page_count;
@@ -1036,10 +1144,10 @@ typedef struct iree_hal_streaming_buffer_t {
 // A buffer and an offset into it resolved from a device pointer.
 // Device pointers may reference any offset within a buffer.
 // The original device pointer is `buffer->device_ptr + offset`.
-typedef struct iree_hal_streaming_buffer_ref_t {
+struct iree_hal_streaming_buffer_ref_t {
   iree_hal_streaming_buffer_t* buffer;
   iree_device_size_t offset;
-} iree_hal_streaming_buffer_ref_t;
+};
 
 static inline iree_hal_buffer_ref_t iree_hal_streaming_convert_buffer_ref(
     iree_hal_streaming_buffer_ref_t ref) {
@@ -1102,6 +1210,15 @@ typedef struct iree_hal_streaming_graph_kernel_node_attrs_t {
   void** hip_extra;
   // Resolved executable symbol used for graph launch.
   iree_hal_streaming_symbol_t* symbol;
+  // Owning module retained for the full node lifetime. Public unload marks the
+  // module invalid immediately; this internal edge only prevents stale symbol
+  // storage from becoming a use-after-free before graph operations reject it.
+  iree_hal_streaming_module_t* module;
+  // Validator retained with captured formal device pointer metadata. Access is
+  // revalidated from the captured native bytes at every graph execution.
+  iree_hal_streaming_device_pointer_validator_t pointer_validator;
+  // Opaque value passed to |pointer_validator|.
+  void* pointer_validator_user_data;
   // Grid dimensions in workgroups.
   uint32_t grid_dim[3];
   // Block dimensions in workitems.
@@ -1186,8 +1303,21 @@ typedef struct iree_hal_streaming_graph_memcpy_driver_node_attrs_t {
 typedef struct iree_hal_streaming_graph_memcpy_node_attrs_t {
   // Destination buffer reference.
   iree_hal_streaming_buffer_ref_t dst_ref;
+  // Captured destination capability identity, or zero for ordinary memory.
+  uint64_t dst_capability_id;
+  // Exact destination address whose capability was captured. This is kept
+  // separate from HIP query metadata, which names the un-offset 3D base.
+  iree_hal_streaming_deviceptr_t dst_capability_ptr;
+  // Contiguous destination span covered by |dst_capability_id|.
+  iree_device_size_t dst_capability_size;
   // Source buffer reference.
   iree_hal_streaming_buffer_ref_t src_ref;
+  // Captured source capability identity, or zero for ordinary memory.
+  uint64_t src_capability_id;
+  // Exact source address whose capability was captured.
+  iree_hal_streaming_deviceptr_t src_capability_ptr;
+  // Contiguous source span covered by |src_capability_id|.
+  iree_device_size_t src_capability_size;
   // Number of contiguous bytes to copy.
   iree_device_size_t size;
   // Copy flags passed to HAL.
@@ -1253,6 +1383,12 @@ typedef struct iree_hal_streaming_graph_memcpy_node_attrs_t {
 typedef struct iree_hal_streaming_graph_memset_node_attrs_t {
   // Destination buffer reference.
   iree_hal_streaming_buffer_ref_t dst_ref;
+  // Captured destination capability identity, or zero for ordinary memory.
+  uint64_t dst_capability_id;
+  // Exact destination address whose capability was captured.
+  iree_hal_streaming_deviceptr_t dst_capability_ptr;
+  // Contiguous destination span covered by |dst_capability_id|.
+  iree_device_size_t dst_capability_size;
   // Fill pattern value.
   uint32_t pattern;
   // Fill pattern byte width.
@@ -1271,18 +1407,46 @@ typedef struct iree_hal_streaming_graph_memset_node_attrs_t {
   iree_device_size_t hip_pitch;
 } iree_hal_streaming_graph_memset_node_attrs_t;
 
+// Memory operand retained by a graph host-call node. The buffer wrapper keeps
+// the callback operand alive. When |capability_id| is nonzero, every
+// instantiate, update, and launch also re-resolves |device_ptr| in |context|
+// and requires the same never-reused capability identity before submission.
+typedef struct iree_hal_streaming_graph_host_memory_validation_t {
+  iree_hal_streaming_context_t* context;
+  iree_hal_streaming_buffer_t* retained_buffer;
+  iree_hal_streaming_deviceptr_t device_ptr;
+  iree_device_size_t size;
+  iree_hal_memory_access_t required_access;
+  uint64_t capability_id;
+} iree_hal_streaming_graph_host_memory_validation_t;
+
+// Host callback that transfers completion of its graph block to asynchronous
+// work by returning IREE_STATUS_DEFERRED. The callback must arrange terminal
+// completion of |context->signal_semaphore_list| exactly once before returning
+// DEFERRED; any other result leaves completion with the host-call queue.
+typedef iree_status_t (*iree_hal_streaming_graph_deferred_host_call_fn_t)(
+    void* user_data, iree_hal_host_call_context_t* context);
+
 typedef struct iree_hal_streaming_graph_host_call_node_attrs_t {
   // Host callback function.
   void (*fn)(void* user_data);
+  // Deferred-completion callback, or NULL for an ordinary host callback.
+  iree_hal_streaming_graph_deferred_host_call_fn_t deferred_fn;
   // User data passed to the host callback function.
   void* user_data;
   // Bytes of graph-owned user data to copy into graph execs, or zero.
   iree_host_size_t user_data_size;
+  // VMM operands the callback will access after queue acceptance.
+  uint8_t memory_validation_count;
+  iree_hal_streaming_graph_host_memory_validation_t memory_validations[2];
 } iree_hal_streaming_graph_host_call_node_attrs_t;
 
 typedef struct iree_hal_streaming_graph_child_graph_node_attrs_t {
   // Child graph template owned by this node while the parent graph is alive.
   iree_hal_streaming_graph_t* graph;
+  // True only after this node has been committed into its parent and charged
+  // against |graph|'s child-parent edge count.
+  bool parent_edge_counted;
 } iree_hal_streaming_graph_child_graph_node_attrs_t;
 
 typedef struct iree_hal_streaming_graph_event_node_attrs_t {
@@ -1297,11 +1461,12 @@ typedef struct iree_hal_streaming_graph_mem_alloc_node_attrs_t {
   iree_host_size_t params_size;
   // Device pointer allocated for this graph memory node.
   void* dptr;
+  // Stable shared ownership record for the exact allocation backing. Internal
+  // executable snapshots retain this record instead of copying ownership or
+  // referring back to mutable source-node attrs.
+  iree_hal_streaming_graph_mem_allocation_t* allocation;
   // Allocation size in bytes.
   iree_device_size_t bytesize;
-  // True when |dptr| is owned by this graph template and must be released with
-  // the node.
-  bool owns_device_allocation;
 } iree_hal_streaming_graph_mem_alloc_node_attrs_t;
 
 typedef struct iree_hal_streaming_graph_mem_free_node_attrs_t {
@@ -1343,6 +1508,12 @@ typedef struct iree_hal_streaming_graph_node_t {
   uint32_t clone_source_node_index;
   // Process-unique identifier used for graph debug output.
   uint64_t debug_id;
+  // Opaque public node identity represented by an executable snapshot node,
+  // or NULL for nodes in ordinary public templates and public clones.
+  const void* executable_source_node;
+  // Public compound node whose enabled state this hidden node follows, or
+  // NULL when the node has independent execution state.
+  struct iree_hal_streaming_graph_node_t* compound_owner_node;
   // Number of embedded dependency pointers in |dependencies|.
   uint32_t dependency_count;
 
@@ -1375,19 +1546,60 @@ iree_status_t iree_hal_streaming_init_global(
     const iree_hal_device_create_params_extension_t* device_extensions,
     iree_allocator_t host_allocator);
 
-// Cleans up global state and releases all resources.
+// Cleans up global state and releases all resources. Returns without mutating
+// registry/key ownership when another execution context owns TLS contexts or
+// when the caller's TLS marker cannot be cleared.
 // Synchronization: all contexts (synchronizes all active contexts).
-void iree_hal_streaming_cleanup_global(void);
+iree_status_t iree_hal_streaming_cleanup_global(void);
+
+// Pins global runtime publication while a binding resolves a device and
+// publishes a new context/TLS handle. Cleanup rejects while a pin is active
+// and prevents new pins until its precommit work either fails or commits.
+iree_status_t iree_hal_streaming_context_publication_begin(void);
+void iree_hal_streaming_context_publication_end(void);
+
+#if defined(IREE_HAL_STREAMING_TEST_INSTRUMENTATION)
+// Installs/removes a minimal registry around a test-owned device entry. No
+// device resources are initialized or destroyed by these helpers.
+void iree_hal_streaming_test_install_device_registry(
+    iree_hal_streaming_device_registry_t* registry,
+    iree_allocator_t host_allocator);
+void iree_hal_streaming_test_remove_device_registry(
+    iree_hal_streaming_device_registry_t* registry);
+#endif  // IREE_HAL_STREAMING_TEST_INSTRUMENTATION
 
 // Accessor for the global device registry.
 // Synchronization: none (read-only access).
 iree_hal_streaming_device_registry_t* iree_hal_streaming_device_registry(void);
+
+// Returns the current process generation, or zero before initialization.
+uint64_t iree_hal_streaming_runtime_generation(void);
+
+// Installs binding lifecycle and pointer-capability callbacks copied into each
+// subsequently created context. Initialization calls this before contexts can
+// be published.
+void iree_hal_streaming_set_lifecycle_hooks(
+    iree_hal_streaming_lifecycle_begin_fn_t lifecycle_begin,
+    iree_hal_streaming_lifecycle_end_fn_t lifecycle_end,
+    iree_hal_streaming_pointer_resolver_fn_t pointer_resolver, void* user_data);
 
 // Global context list management.
 // Synchronization: none (thread-safe internal locking).
 void iree_hal_streaming_register_context(iree_hal_streaming_context_t* context);
 void iree_hal_streaming_unregister_context(
     iree_hal_streaming_context_t* context);
+
+// Returns true when |context| is still published in the process context list.
+// The candidate pointer is compared under the list mutex before it is ever
+// dereferenced, so public handle validation can safely reject a stale value.
+bool iree_hal_streaming_context_is_registered(
+    const iree_hal_streaming_context_t* context);
+
+// Looks up a raw public context handle by address and retains it while still
+// holding the context-list lock. The candidate is never dereferenced before a
+// match. The caller owns the returned reference, or receives NULL.
+iree_hal_streaming_context_t* iree_hal_streaming_context_lookup_retain(
+    const iree_hal_streaming_context_t* context);
 
 //===----------------------------------------------------------------------===//
 // Device management
@@ -1462,11 +1674,43 @@ iree_status_t iree_hal_streaming_device_retain_primary_context(
     iree_hal_streaming_device_t* device,
     iree_hal_streaming_context_t** out_context);
 
+// Rolls back one unpublished primary-context retain after a binding-private
+// create transaction fails while holding exclusive lifecycle admission. This
+// restores the reference count and releases the owning reference without
+// detaching a primary context that may have predated the transaction.
+void iree_hal_streaming_device_rollback_primary_context_retain(
+    iree_hal_streaming_device_t* device,
+    iree_hal_streaming_context_t* retained_context);
+
 // Releases one primary-context reference and decrements its device-level usage
 // count. Destroys the device-owned context when the count reaches zero.
 // Synchronization: context (waits for idle when destroying).
 iree_status_t iree_hal_streaming_device_release_primary_context(
     iree_hal_streaming_device_t* device);
+
+// Resets the published primary context and all of its resources without
+// consuming callers' logical retains. Matching releases consume the retired
+// ledger before touching any primary context created after the reset.
+// Synchronization: primary-context ownership (waits for the old context idle).
+iree_status_t iree_hal_streaming_device_reset_primary_context(
+    iree_hal_streaming_device_t* device);
+
+// Commits a binding-prepared primary-context release only if the device still
+// publishes exactly |expected_context| with |expected_ref_count| retains.
+// Preparation must have quiesced a last retain while the binding-private
+// owner remained published. Successful cleanup detaches a last context.
+iree_status_t iree_hal_streaming_device_commit_primary_context_release(
+    iree_hal_streaming_device_t* device,
+    iree_hal_streaming_context_t* expected_context, int32_t expected_ref_count);
+
+// Commits the same exact prepared release after destructive native cleanup
+// failed. A last retain is consumed, ordinary allocations are drained, and
+// the device publication, global-list entry, pools, and VMM wrappers remain as
+// a teardown-visible ownership ledger until process cleanup can retry.
+iree_status_t
+iree_hal_streaming_device_commit_primary_context_release_preserving_ledger(
+    iree_hal_streaming_device_t* device,
+    iree_hal_streaming_context_t* expected_context, int32_t expected_ref_count);
 
 // Synchronization: none (sets flags for future context creation).
 iree_status_t iree_hal_streaming_device_set_primary_context_flags(
@@ -1503,6 +1747,11 @@ iree_status_t iree_hal_streaming_context_create(
 void iree_hal_streaming_context_retain(iree_hal_streaming_context_t* context);
 void iree_hal_streaming_context_release(iree_hal_streaming_context_t* context);
 
+// Removes the global-list publication created by context_create and releases
+// the caller's creator reference after a native handle fails to publish.
+void iree_hal_streaming_context_discard_unpublished(
+    iree_hal_streaming_context_t* context);
+
 // Attempts to form a reference without resurrecting a context whose final
 // release has begun. Returns false when the reference count has reached zero.
 bool iree_hal_streaming_context_try_retain(
@@ -1516,8 +1765,49 @@ iree_hal_streaming_context_flags_t iree_hal_streaming_context_flags(
 uintptr_t iree_hal_streaming_current_thread_token(void);
 
 // Synchronization: none (thread-local modification).
-void iree_hal_streaming_context_set_current(
+iree_status_t iree_hal_streaming_context_set_current(
     iree_hal_streaming_context_t* context);
+
+// Creates the permanent context thread-exit key. Global initialization calls
+// this before publishing the runtime registry.
+iree_status_t iree_hal_streaming_context_tls_initialize(void);
+
+// Deletes the permanent context TLS key once every TLS reference is gone.
+iree_status_t iree_hal_streaming_context_tls_deinitialize(void);
+
+// Returns owning context references held in TLS current/stack slots globally
+// and on the calling thread. Used by process teardown admission.
+iree_host_size_t iree_hal_streaming_context_tls_reference_count(void);
+iree_host_size_t iree_hal_streaming_context_current_thread_tls_reference_count(
+    void);
+
+// Returns current/stack owning TLS references to |context| on this thread.
+iree_host_size_t
+iree_hal_streaming_context_current_thread_tls_reference_count_for(
+    const iree_hal_streaming_context_t* context);
+
+// Returns a retained snapshot of every registered context. The caller must
+// release it with iree_hal_streaming_context_release_snapshot_all while the
+// device registry is still live.
+iree_status_t iree_hal_streaming_context_snapshot_all(
+    iree_hal_streaming_context_t*** out_contexts,
+    iree_host_size_t* out_context_count);
+void iree_hal_streaming_context_release_snapshot_all(
+    iree_hal_streaming_context_t** contexts, iree_host_size_t context_count);
+
+// Clears and releases every current/stack context owned by the calling thread.
+// A TLS marker clear failure leaves the next reference unchanged for retry.
+iree_status_t iree_hal_streaming_context_clear_current_thread(void);
+
+#if defined(IREE_HAL_STREAMING_TEST_INSTRUMENTATION)
+// Test-only control and observation for the permanent context TLS key. Reset
+// requires no current/stack references on any thread.
+bool iree_hal_streaming_context_tls_test_marker_is_set(void);
+iree_status_t iree_hal_streaming_context_tls_test_reset(void);
+
+// Fails the next default-memory-pool step after primary context creation.
+void iree_hal_streaming_device_test_fail_next_default_mem_pool(void);
+#endif  // IREE_HAL_STREAMING_TEST_INSTRUMENTATION
 
 // Synchronization: none (thread-local stack operation).
 iree_status_t iree_hal_streaming_context_push(
@@ -1625,10 +1915,94 @@ iree_status_t iree_hal_streaming_context_allocate_capture_id(
 bool iree_hal_streaming_context_has_peer_contexts(
     iree_hal_streaming_context_t* context);
 
+// Returns true only for a context from the current process generation and
+// current reset epoch of its device. Checks generation before device state.
+bool iree_hal_streaming_context_is_current(
+    const iree_hal_streaming_context_t* context);
+
+// Marks a context unable to admit further work. Existing retained references
+// remain valid only as teardown metadata.
+void iree_hal_streaming_context_retire(iree_hal_streaming_context_t* context);
+
+// Certifies that all streams were successfully quiesced after the context was
+// permanently retired. Requires exclusive lifecycle/teardown serialization.
+void iree_hal_streaming_context_mark_teardown_quiesced(
+    iree_hal_streaming_context_t* context);
+
+// Returns true only after a context has been permanently retired, all work
+// was certified quiescent, and every stream/default queue ownership edge was
+// detached while the context was still externally published. Callers use
+// this certificate to avoid introducing a new backend wait after a teardown
+// commit has made retry impossible.
+bool iree_hal_streaming_context_is_teardown_certified(
+    iree_hal_streaming_context_t* context);
+
+// Detaches and releases every stream/queue from an already-retired and
+// quiesced context while its external publication still provides a teardown
+// ledger. |abort_captures| is reserved for fail-closed inactive teardown;
+// active callers must reject captures before reaching this irreversible step.
+void iree_hal_streaming_context_detach_streams_quiesced(
+    iree_hal_streaming_context_t* context, bool abort_captures);
+
+// Marks every registered context unable to admit further work. Requires the
+// binding's exclusive lifecycle admission.
+void iree_hal_streaming_context_retire_all(void);
+
+// Certifies every registered, already-retired context after a successful
+// process-wide synchronization.
+void iree_hal_streaming_context_mark_all_teardown_quiesced(void);
+
+// Acquires/releases the binding lifecycle admission associated with a context.
+// The begin call validates generation and reset epoch after admission.
+iree_status_t iree_hal_streaming_context_operation_begin(
+    iree_hal_streaming_context_t* context);
+void iree_hal_streaming_context_operation_end(
+    iree_hal_streaming_context_t* context);
+
+// Validates one exact device reset epoch before the irreversible teardown
+// boundary. UINT64_MAX is a permanent exhausted sentinel and is never wrapped.
+iree_status_t iree_hal_streaming_device_prepare_epoch_advance(
+    iree_hal_streaming_device_ordinal_t device_ordinal,
+    uint64_t* out_expected_epoch, uint64_t* out_next_epoch);
+
+// Commits an exact prevalidated epoch after the irreversible boundary. A
+// violated expected value latches exhaustion instead of publishing a reusable
+// identity. Exclusive lifecycle admission makes that branch unreachable.
+void iree_hal_streaming_device_commit_epoch_advance(
+    iree_hal_streaming_device_ordinal_t device_ordinal, uint64_t expected_epoch,
+    uint64_t next_epoch);
+
+// Flushes and waits every registered context on one device. The snapshot
+// retains each context exactly once under the list lock and releases all
+// references after dropping that lock.
+iree_status_t iree_hal_streaming_context_synchronize_device(
+    iree_hal_streaming_device_ordinal_t device_ordinal);
+
 // Waits for all streams in the context to become idle.
 // Synchronization: all streams in context (blocking wait).
 iree_status_t iree_hal_streaming_context_wait_idle(
     iree_hal_streaming_context_t* context, iree_timeout_t timeout);
+
+// Called without context or stream locks immediately before teardown waits an
+// accepted stream frontier. Instrumented callers must not reenter the binding.
+typedef void (*iree_hal_streaming_teardown_wait_observer_t)(
+    void* user_data, iree_hal_streaming_stream_t* stream);
+
+// Flushes and waits the exact accepted frontier of every stream and event
+// record in |context| during exclusive binding teardown. A terminal semaphore
+// failure proves that frontier can no longer execute and is returned separately
+// through |out_execution_status|. Snapshot, flush, or wait failures that cannot
+// be confirmed as terminal remain the returned status. |wait_observer| is
+// called immediately before each non-empty stream wait, or may be NULL.
+iree_status_t iree_hal_streaming_context_quiesce_for_teardown(
+    iree_hal_streaming_context_t* context,
+    iree_hal_streaming_teardown_wait_observer_t wait_observer,
+    void* wait_observer_user_data, iree_status_t* out_execution_status);
+
+// Retains and quiesces every registered context under exclusive binding
+// teardown admission. See |iree_hal_streaming_context_quiesce_for_teardown|.
+iree_status_t iree_hal_streaming_context_quiesce_all_for_teardown(
+    iree_status_t* out_execution_status);
 
 // Flushes pending command buffers in all streams in the context without
 // waiting for completion.
@@ -1694,6 +2068,12 @@ iree_status_t iree_hal_streaming_module_create_from_file(
 
 void iree_hal_streaming_module_retain(iree_hal_streaming_module_t* module);
 void iree_hal_streaming_module_release(iree_hal_streaming_module_t* module);
+// Atomically invalidates the public module capability. Existing internal graph
+// ownership may delay physical reclamation but cannot make the capability live
+// again.
+void iree_hal_streaming_module_invalidate(iree_hal_streaming_module_t* module);
+bool iree_hal_streaming_module_is_live(
+    const iree_hal_streaming_module_t* module);
 
 // Synchronization: none (queries symbol metadata).
 iree_status_t iree_hal_streaming_module_symbol(
@@ -1744,6 +2124,18 @@ iree_status_t iree_hal_streaming_stream_create(
 void iree_hal_streaming_stream_retain(iree_hal_streaming_stream_t* stream);
 void iree_hal_streaming_stream_release(iree_hal_streaming_stream_t* stream);
 
+// Detaches a stream from an already-quiesced context without synchronizing.
+// Removes the context's stream-list reference and releases queue ownership;
+// the caller still owns and must release its stream/context references.
+void iree_hal_streaming_stream_detach_quiesced(
+    iree_hal_streaming_context_t* context, iree_hal_streaming_stream_t* stream);
+
+// Clears capture ownership without submitting work. The caller has already
+// quiesced and retired the attached context and holds exclusive lifecycle
+// teardown admission. Owned graph destruction occurs before this returns.
+void iree_hal_streaming_stream_abort_capture_quiesced(
+    iree_hal_streaming_stream_t* stream);
+
 // Begins command buffer recording.
 // Synchronization: none (begins recording).
 iree_status_t iree_hal_streaming_stream_begin(
@@ -1774,6 +2166,15 @@ iree_status_t iree_hal_streaming_stream_synchronize_flushed(
 // Does NOT flush in-progress recordings - safe to call from other threads.
 iree_status_t iree_hal_streaming_stream_wait_submitted(
     iree_hal_streaming_stream_t* stream);
+
+// Waits the exact accepted stream frontier without flushing. A sticky
+// semaphore failure is a completed terminal outcome and is returned separately
+// through |out_execution_status|. Failures to perform or verify the wait are
+// returned normally.
+iree_status_t iree_hal_streaming_stream_wait_submitted_or_terminal(
+    iree_hal_streaming_stream_t* stream,
+    iree_hal_streaming_teardown_wait_observer_t wait_observer,
+    void* wait_observer_user_data, iree_status_t* out_execution_status);
 
 // Waits for an event on a stream.
 // Synchronization: none (enqueues wait operation, non-blocking).
@@ -1850,6 +2251,19 @@ IREE_MUST_USE_RESULT iree_hal_streaming_graph_t*
 iree_hal_streaming_event_commit_recorded_point(
     iree_hal_streaming_event_t* event,
     iree_hal_streaming_recorded_point_t point);
+
+// Adopts |point| exactly as iree_hal_streaming_event_commit_recorded_point
+// does, but transfers the previously owned point to |out_previous_point|
+// instead of releasing it. This is the commit primitive for callers holding an
+// outer lock beneath which a recorded-point release must not run. The caller
+// releases the returned graph and |out_previous_point| after dropping that
+// outer lock. Synchronization: event (event mutex held while replacing the
+// point).
+IREE_MUST_USE_RESULT iree_hal_streaming_graph_t*
+iree_hal_streaming_event_commit_recorded_point_deferred(
+    iree_hal_streaming_event_t* event,
+    iree_hal_streaming_recorded_point_t point,
+    iree_hal_streaming_recorded_point_t* out_previous_point);
 
 // Makes |stream| the stream whose capture state |event| belongs to, taking a
 // reference to it, and transfers the previously referenced stream to the
@@ -2018,6 +2432,15 @@ typedef enum iree_hal_streaming_memory_flag_bits_e {
 iree_hal_streaming_deviceptr_t iree_hal_streaming_buffer_device_pointer(
     iree_hal_streaming_buffer_t* buffer);
 
+// Graph templates use independent wrapper references so alias unpublication
+// cannot invalidate host metadata retained by a node.
+void iree_hal_streaming_buffer_retain(iree_hal_streaming_buffer_t* buffer);
+void iree_hal_streaming_buffer_release(iree_hal_streaming_buffer_t* buffer);
+
+// Allocates one non-zero process-unique identity with the public HIP ABI width.
+iree_status_t iree_hal_streaming_allocate_pointer_buffer_id(
+    uint32_t* out_buffer_id);
+
 // Looks up a buffer by device pointer.
 // Returns a borrowed reference to the buffer (does not transfer ownership).
 // Returns an error if the device pointer is not found.
@@ -2036,6 +2459,15 @@ iree_status_t iree_hal_streaming_memory_lookup_range(
     iree_hal_streaming_context_t* context,
     iree_hal_streaming_deviceptr_t device_ptr, iree_device_size_t size,
     iree_hal_streaming_buffer_ref_t* out_ref);
+
+// Resolves a range for a specific operational access. VMM misses may lazily
+// materialize an exact-context capability; ordinary buffers return capability
+// identity zero. The returned wrapper is borrowed under lifecycle admission.
+iree_status_t iree_hal_streaming_memory_lookup_range_with_access(
+    iree_hal_streaming_context_t* context,
+    iree_hal_streaming_deviceptr_t device_ptr, iree_device_size_t size,
+    iree_hal_memory_access_t required_access,
+    iree_hal_streaming_buffer_ref_t* out_ref, uint64_t* out_capability_id);
 
 // Looks up the context and buffer that contain the specified address range.
 // On success, |out_context| receives a retained context reference that the
@@ -2182,6 +2614,17 @@ iree_status_t iree_hal_streaming_memcpy_device_to_host(
     iree_hal_streaming_deviceptr_t src, iree_device_size_t size,
     iree_hal_streaming_stream_t* stream);
 
+// Private variants for queue host callbacks that were validated and accepted
+// under a graph-launch lifecycle reader. They deliberately do not reacquire
+// reader admission: a reset/revoke writer closes admission before quiescing
+// queues, and accepted callbacks must be able to drain while the writer waits.
+iree_status_t iree_hal_streaming_memcpy_host_to_device_accepted(
+    iree_hal_streaming_context_t* context, iree_hal_streaming_deviceptr_t dst,
+    const void* src, iree_device_size_t size);
+iree_status_t iree_hal_streaming_memcpy_device_to_host_accepted(
+    iree_hal_streaming_context_t* context, void* dst,
+    iree_hal_streaming_deviceptr_t src, iree_device_size_t size);
+
 // Enqueues a pitched D2H copy through queue-visible staging. A stream-ordered
 // host call scatters the packed staging rows into |dst| after the device copies
 // complete.
@@ -2285,6 +2728,11 @@ iree_status_t iree_hal_streaming_graph_clone(
     iree_hal_streaming_graph_t* source_graph,
     iree_hal_streaming_graph_t** out_graph);
 
+// Verifies that every kernel node (including nested child graphs) still names
+// a publicly live module.
+iree_status_t iree_hal_streaming_graph_validate_kernel_modules(
+    const iree_hal_streaming_graph_t* graph);
+
 // Synchronization: none (reference counting).
 void iree_hal_streaming_graph_retain(iree_hal_streaming_graph_t* graph);
 void iree_hal_streaming_graph_release(iree_hal_streaming_graph_t* graph);
@@ -2348,6 +2796,13 @@ iree_status_t iree_hal_streaming_graph_add_host_call_node(
     iree_host_size_t dependency_count, void (*fn)(void*), void* user_data,
     iree_hal_streaming_graph_node_t** out_node);
 
+iree_status_t iree_hal_streaming_graph_add_deferred_host_call_node(
+    iree_hal_streaming_graph_t* graph,
+    iree_hal_streaming_graph_node_t** dependencies,
+    iree_host_size_t dependency_count,
+    iree_hal_streaming_graph_deferred_host_call_fn_t fn, void* user_data,
+    iree_hal_streaming_graph_node_t** out_node);
+
 iree_status_t iree_hal_streaming_graph_add_event_node(
     iree_hal_streaming_graph_t* graph,
     iree_hal_streaming_graph_node_t** dependencies,
@@ -2378,6 +2833,16 @@ iree_status_t iree_hal_streaming_graph_set_batch_mem_op_node_params(
 iree_status_t iree_hal_streaming_graph_destroy_node(
     iree_hal_streaming_graph_node_t* node);
 
+// Removes a node created by an operation that has not yet published the node
+// to its caller. Unlike the public destroy path, this is permitted while the
+// graph contains memory nodes because it only rolls back the exact node added
+// by the still-uncommitted operation.
+//
+// The caller must hold exclusive graph-operation admission and must prove that
+// |node| has never been returned as a public graph-node handle.
+iree_status_t iree_hal_streaming_graph_rollback_unpublished_node(
+    iree_hal_streaming_graph_node_t* node);
+
 // Synchronization: none (creates executable graph).
 iree_status_t iree_hal_streaming_graph_instantiate(
     iree_hal_streaming_graph_t* graph,
@@ -2391,12 +2856,108 @@ void iree_hal_streaming_graph_exec_release(
     iree_hal_streaming_graph_exec_t* exec);
 bool iree_hal_streaming_graph_exec_try_retain_live(
     iree_hal_streaming_graph_exec_t* exec);
-bool iree_hal_streaming_graph_exec_is_live(
+
+// Serializes access to all mutable executable state. The caller must hold a
+// live owning reference to |exec| for the entire guard lifetime. Context and
+// binding lifecycle admission, when required, must be acquired before this
+// guard. A rebuild guard preallocates its retirement record before locking so
+// no cleanup allocation can fail after a source-template mutation begins.
+typedef struct iree_hal_streaming_graph_exec_state_guard_t {
+  // Borrowed executable whose mutex this guard holds, or NULL when inactive.
+  iree_hal_streaming_graph_exec_t* exec;
+  // Owned rebuild retirement record, or NULL for a read-only state guard.
+  void* deferred_cleanup;
+} iree_hal_streaming_graph_exec_state_guard_t;
+
+// Instrumentation callback invoked under executable state serialization just
+// before an active launch wait drops that serialization. It must not reenter
+// the executable or binding API.
+typedef iree_status_t (
+    *iree_hal_streaming_graph_exec_active_launch_wait_callback_t)(
+    void* user_data);
+
+iree_status_t iree_hal_streaming_graph_exec_state_begin(
+    iree_hal_streaming_graph_exec_t* exec,
+    iree_hal_streaming_graph_exec_state_guard_t* out_guard);
+bool iree_hal_streaming_graph_exec_state_try_begin(
+    iree_hal_streaming_graph_exec_t* exec,
+    iree_hal_streaming_graph_exec_state_guard_t* out_guard);
+iree_status_t iree_hal_streaming_graph_exec_rebuild_state_begin(
+    iree_hal_streaming_graph_exec_t* exec,
+    iree_hal_streaming_graph_exec_active_launch_wait_callback_t wait_callback,
+    void* wait_callback_user_data,
+    iree_hal_streaming_graph_exec_state_guard_t* out_guard);
+iree_status_t iree_hal_streaming_graph_exec_destroy_handle_with_wait_callback(
+    iree_hal_streaming_graph_exec_t* exec,
+    iree_hal_streaming_graph_exec_active_launch_wait_callback_t wait_callback,
+    void* wait_callback_user_data);
+void iree_hal_streaming_graph_exec_state_end(
+    iree_hal_streaming_graph_exec_state_guard_t* guard);
+
+// Resolves an untrusted raw node address without dereferencing it. The returned
+// node is borrowed and valid only until |guard| ends.
+iree_hal_streaming_graph_node_t*
+iree_hal_streaming_graph_exec_state_resolve_node(
+    iree_hal_streaming_graph_exec_state_guard_t* guard,
+    const void* node_address);
+
+iree_hal_streaming_graph_instantiate_flags_t
+iree_hal_streaming_graph_exec_state_flags(
+    const iree_hal_streaming_graph_exec_state_guard_t* guard);
+bool iree_hal_streaming_graph_exec_state_node_is_enabled(
+    const iree_hal_streaming_graph_exec_state_guard_t* guard,
+    const iree_hal_streaming_graph_node_t* node);
+iree_status_t iree_hal_streaming_graph_exec_state_set_node_enabled(
+    iree_hal_streaming_graph_exec_state_guard_t* guard,
+    iree_hal_streaming_graph_node_t* node, bool enabled);
+iree_status_t iree_hal_streaming_graph_exec_state_rebuild(
+    iree_hal_streaming_graph_exec_state_guard_t* guard);
+iree_status_t iree_hal_streaming_graph_exec_state_update(
+    iree_hal_streaming_graph_exec_state_guard_t* guard,
+    iree_hal_streaming_graph_t* graph,
+    iree_hal_streaming_graph_node_t** out_error_node,
+    iree_hal_streaming_graph_exec_update_result_t* out_result);
+iree_status_t iree_hal_streaming_graph_exec_state_set_batch_mem_op_node_params(
+    iree_hal_streaming_graph_exec_state_guard_t* guard,
+    iree_hal_streaming_graph_node_t* node, const void* params,
+    iree_host_size_t params_size, const void* param_array,
+    iree_host_size_t param_array_size);
+iree_status_t iree_hal_streaming_graph_exec_state_set_event_node_event(
+    iree_hal_streaming_graph_exec_state_guard_t* guard,
+    iree_hal_streaming_graph_node_t* node,
+    iree_hal_streaming_graph_node_type_t type,
+    iree_hal_streaming_event_t* event,
+    iree_hal_streaming_event_t** out_old_event);
+iree_status_t iree_hal_streaming_graph_exec_state_set_child_graph(
+    iree_hal_streaming_graph_exec_state_guard_t* guard,
+    iree_hal_streaming_graph_node_t* node,
+    iree_hal_streaming_graph_t* child_snapshot,
+    iree_hal_streaming_graph_t** out_graph_to_release);
+
+// Returns an owning reference to the immutable context of |exec|. The caller
+// must already hold an owning reference to |exec|.
+iree_hal_streaming_context_t* iree_hal_streaming_graph_exec_retain_context(
     iree_hal_streaming_graph_exec_t* exec);
+
+// Adds an upper bound on user-object release callbacks reachable from the
+// exact compiled executable tree, including child execs retargeted away from
+// their mutable source-template nodes. Returns resource exhausted on overflow.
+// The caller must hold the lifecycle writer after it has drained admissions
+// for the exact context/tree; this quiesced traversal takes no exec state lock.
+iree_status_t iree_hal_streaming_graph_exec_add_user_callback_capacity(
+    iree_hal_streaming_graph_exec_t* exec, iree_host_size_t* inout_capacity);
+
 iree_status_t iree_hal_streaming_graph_exec_destroy_handle(
     iree_hal_streaming_graph_exec_t* exec);
 
-// Synchronization: none (queries immutable instantiation flags).
+// Commits destruction of an executable whose exact context was already
+// retired, detached, and teardown-certified by a lifecycle writer. Performs no
+// synchronization; all descendant active-stream references are discharged
+// before the public ownership edge is released.
+iree_status_t iree_hal_streaming_graph_exec_destroy_handle_quiesced(
+    iree_hal_streaming_graph_exec_t* exec);
+
+// Synchronization: graph exec.
 iree_hal_streaming_graph_instantiate_flags_t
 iree_hal_streaming_graph_exec_flags(iree_hal_streaming_graph_exec_t* exec);
 
@@ -2416,6 +2977,14 @@ bool iree_hal_streaming_graph_exec_node_is_enabled(
 iree_status_t iree_hal_streaming_graph_exec_set_node_enabled(
     iree_hal_streaming_graph_exec_t* exec,
     iree_hal_streaming_graph_node_t* node, bool enabled);
+
+// Transactionally applies batch-memory parameters to the source node, rebuilds
+// |exec|, and restores the source graph template on every path.
+iree_status_t iree_hal_streaming_graph_exec_set_batch_mem_op_node_params(
+    iree_hal_streaming_graph_exec_t* exec,
+    iree_hal_streaming_graph_node_t* node, const void* params,
+    iree_host_size_t params_size, const void* param_array,
+    iree_host_size_t param_array_size);
 
 // Synchronization: stream (launches graph async on stream).
 iree_status_t iree_hal_streaming_graph_exec_launch(

@@ -61,6 +61,17 @@ iree_status_t iree_hal_amdgpu_feedback_channel_initialize(
 void iree_hal_amdgpu_feedback_channel_deinitialize(
     iree_hal_amdgpu_feedback_channel_t* channel);
 
+// Acquire-loads the monotonic byte position one past all packet reservations.
+// This is used to bracket executable source-owner holds around published GPU
+// work; it does not imply that any reservation is ready for host consumption.
+uint64_t iree_hal_amdgpu_feedback_channel_query_reservation_head(
+    const iree_hal_amdgpu_feedback_channel_t* channel);
+
+// Acquire-loads the monotonic byte position through which the host has fully
+// consumed packets and returned their storage to producers.
+uint64_t iree_hal_amdgpu_feedback_channel_query_read_tail(
+    const iree_hal_amdgpu_feedback_channel_t* channel);
+
 // Drains up to |max_packet_count| ready packets in reservation order.
 //
 // The callback observes packet storage that remains valid for the duration of

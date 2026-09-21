@@ -156,7 +156,7 @@ iree_runtime_cc_library(
     ],
     deps = [
         ":headers",
-        "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa",
+        "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa_headers",
         "//runtime/src/iree/hal/drivers/amdgpu/util:loaded_code_object",
         "//runtime/src/iree/hal/drivers/amdgpu/util:pm4_dispatch",
     ],
@@ -194,6 +194,7 @@ iree_runtime_cc_test(
         "//runtime/src/iree/base/internal",
         "//runtime/src/iree/hal/drivers/amdgpu/util:device_library",
         "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa",
+        "//runtime/src/iree/hal/drivers/amdgpu/util:libhsa_headers",
         "//runtime/src/iree/hal/drivers/amdgpu/util:packet",
         "//runtime/src/iree/hal/drivers/amdgpu/util:queue_primitives",
         "//runtime/src/iree/hal/drivers/amdgpu/util:topology",

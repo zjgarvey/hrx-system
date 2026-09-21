@@ -677,6 +677,107 @@ iree_status_t hrx_iree_exact_pool_create(iree_hal_allocator_t* allocator,
                                          iree_hal_buffer_params_t params,
                                          iree_hal_pool_t** out_pool);
 
+// Reserves virtual address space with optional alignment and address hints.
+// |minimum_alignment| may be zero to select the allocator default. A non-zero
+// value must be a power of two no smaller than the minimum page size reported
+// by hrx_allocator_query_virtual_memory. A requested address is advisory and
+// the returned buffer may use another address when the requested range is
+// unavailable.
+hrx_status_t hrx_allocator_virtual_memory_reserve_at(
+    hrx_allocator_t allocator, hrx_queue_affinity_t affinity, size_t size,
+    size_t minimum_alignment, uintptr_t requested_address,
+    hrx_buffer_t* virtual_buffer);
+
+// Creates a target-device HRX wrapper over a mapped VMM interval. The returned
+// alias retains the reservation but owns no native VMM resources.
+hrx_status_t hrx_allocator_virtual_memory_alias(
+    hrx_allocator_t allocator, hrx_buffer_t virtual_buffer,
+    size_t virtual_offset, size_t size, hrx_memory_access_t allowed_access,
+    hrx_buffer_t* out_alias_buffer);
+
+// Applies native device access through the reservation owner to exactly the
+// logical GPU group represented by |access_allocator|.
+hrx_status_t hrx_allocator_virtual_memory_protect_peer(
+    hrx_allocator_t reservation_allocator, hrx_allocator_t access_allocator,
+    hrx_buffer_t virtual_buffer, size_t virtual_offset, size_t size,
+    hrx_memory_protection_t protection);
+
+// Opaque prevalidated native VMM journal entry used by binding teardown.
+typedef struct hrx_vmm_native_operation_s* hrx_vmm_native_operation_t;
+
+// Fixed raw backend status returned without allocating status storage.
+typedef uint32_t hrx_vmm_native_status_t;
+
+// Prepares an exact access mutation after validating every mapped physical
+// owner and pool against the exact requested access target.
+hrx_status_t hrx_allocator_vmm_native_operation_prepare_access(
+    hrx_allocator_t reservation_allocator,
+    hrx_allocator_t access_allocator_or_null, hrx_buffer_t virtual_buffer,
+    size_t virtual_offset, size_t size, hrx_queue_affinity_t affinity,
+    hrx_virtual_memory_access_scope_t access_scope,
+    hrx_memory_protection_t protection, size_t physical_memory_count,
+    hrx_physical_memory_t const* physical_memories,
+    hrx_vmm_native_operation_t* out_operation);
+
+hrx_status_t hrx_allocator_vmm_native_operation_prepare_unmap(
+    hrx_allocator_t reservation_allocator, hrx_buffer_t virtual_buffer,
+    size_t virtual_offset, size_t size,
+    hrx_vmm_native_operation_t* out_operation);
+
+hrx_status_t hrx_allocator_vmm_native_operation_prepare_release_reservation(
+    hrx_allocator_t reservation_allocator, hrx_buffer_t virtual_buffer,
+    hrx_vmm_native_operation_t* out_operation);
+
+hrx_status_t hrx_allocator_vmm_native_operation_prepare_free_physical(
+    hrx_allocator_t creator_allocator, hrx_physical_memory_t physical_memory,
+    hrx_vmm_native_operation_t* out_operation);
+
+// Applies exactly one native operation without allocating. Only the native
+// success result advances the journal cursor.
+hrx_vmm_native_status_t hrx_vmm_native_operation_apply(
+    hrx_vmm_native_operation_t operation);
+bool hrx_vmm_native_status_is_success(hrx_vmm_native_status_t status);
+bool hrx_vmm_native_operation_may_invoke_callbacks(
+    hrx_vmm_native_operation_t operation);
+void hrx_vmm_native_operation_destroy(hrx_vmm_native_operation_t operation);
+
+// Disposes wrappers after successful native ownership consumption without
+// issuing another VMM call.
+void hrx_allocator_virtual_memory_dispose_consumed_reservation(
+    hrx_allocator_t reservation_allocator, hrx_buffer_t virtual_buffer);
+void hrx_allocator_physical_memory_dispose_consumed(
+    hrx_allocator_t creator_allocator, hrx_physical_memory_t physical_memory);
+
+// Cleanup-only ownership transfers used after a higher-level publication
+// failure. The supplied owner is consumed even when native cleanup fails; the
+// lower AMDGPU domain then retains the exact owner for retry.
+hrx_status_t hrx_allocator_virtual_memory_release_or_quarantine(
+    hrx_allocator_t reservation_allocator, hrx_buffer_t virtual_buffer);
+hrx_status_t hrx_allocator_physical_memory_free_or_quarantine(
+    hrx_allocator_t creator_allocator, hrx_physical_memory_t physical_memory);
+
+// Retries the shared-domain quarantine. A failure leaves every unsuccessful
+// owner queued and must abort lifecycle teardown before device/state release.
+hrx_status_t hrx_allocator_vmm_quarantine_drain(hrx_allocator_t allocator);
+
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION) || \
+    defined(IREE_HIP_VMM_TESTING)
+void hrx_allocator_test_fail_virtual_reserve_after_hal_native_once(void);
+void hrx_allocator_test_reset_vmm_quarantine_observability(void);
+void hrx_allocator_test_fail_lower_virtual_reserve_after_native_once(void);
+uint64_t hrx_allocator_test_last_virtual_reserve_address(void);
+uint64_t hrx_allocator_test_last_virtual_reserve_alignment(void);
+void hrx_allocator_test_fail_lower_cleanup_count(bool physical_memory,
+                                                 int failure_count);
+uint64_t hrx_allocator_test_vmm_quarantine_count(void);
+uint64_t hrx_allocator_test_vmm_cleanup_attempt_count(bool physical_memory);
+uint32_t hrx_allocator_test_vmm_last_cleanup_status(bool physical_memory);
+void hrx_allocator_test_arm_vmm_quarantine_drain_pause(void);
+void hrx_allocator_test_wait_vmm_quarantine_drain_paused(void);
+void hrx_allocator_test_release_vmm_quarantine_drain_pause(void);
+int hrx_allocator_test_vmm_quarantine_drain_attempt_kind(int attempt_ordinal);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION || IREE_HIP_VMM_TESTING
+
 #ifdef __cplusplus
 }
 #endif

@@ -352,17 +352,29 @@ static void iree_hal_amdgpu_transfer_publish_signals(
 
   iree_hal_amdgpu_wait_resolution_t resolution;
   memset(&resolution, 0, sizeof(resolution));
+#if defined(IREE_HAL_AMDGPU_TEST_INSTRUMENTATION)
+  iree_hal_amdgpu_host_queue_test_notify_phase(
+      transaction->queue,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_SUBJECT_PUBLISHER_SUBMISSION_REVALIDATION,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PHASE_BEFORE_PUBLISHER_SUBMISSION_LOCK,
+      IREE_HAL_AMDGPU_HOST_QUEUE_TEST_PUBLISHER_PATH_TRANSFER_SIGNAL_BARRIER,
+      /*value1=*/0);
+#endif  // IREE_HAL_AMDGPU_TEST_INSTRUMENTATION
   iree_slim_mutex_lock(&transaction->queue->locks.submission_mutex);
   bool ready = false;
-  status = iree_hal_amdgpu_host_queue_try_submit_barrier(
-      transaction->queue, &resolution, transaction->signal_semaphore_list,
-      (iree_hal_amdgpu_reclaim_action_t){0},
-      /*operation_resources=*/NULL, /*operation_resource_count=*/0,
-      /*profile_event_info=*/NULL,
-      iree_hal_amdgpu_host_queue_post_commit_callback_null(),
-      /*resource_set=*/NULL,
-      IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES, &ready,
-      /*out_submission_id=*/NULL);
+  status = iree_hal_amdgpu_host_queue_revalidate_submission_locked(
+      transaction->queue);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_amdgpu_host_queue_try_submit_barrier(
+        transaction->queue, &resolution, transaction->signal_semaphore_list,
+        (iree_hal_amdgpu_reclaim_action_t){0},
+        /*operation_resources=*/NULL, /*operation_resource_count=*/0,
+        /*profile_event_info=*/NULL,
+        iree_hal_amdgpu_host_queue_post_commit_callback_null(),
+        /*resource_set=*/NULL,
+        IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_RETAIN_RESOURCES, &ready,
+        /*out_submission_id=*/NULL);
+  }
   if (iree_status_is_ok(status) && !ready) {
     iree_hal_resource_retain(&transaction->resource);
     iree_hal_amdgpu_host_queue_enqueue_post_drain_action(
@@ -525,9 +537,12 @@ static void iree_hal_amdgpu_transfer_enqueue_capacity_retry(
 static iree_status_t iree_hal_amdgpu_transfer_start(
     iree_hal_amdgpu_transfer_transaction_t* transaction) {
   iree_slim_mutex_lock(&transaction->queue->locks.submission_mutex);
-  if (IREE_UNLIKELY(transaction->queue->is_shutting_down)) {
+  iree_status_t terminal_status =
+      iree_hal_amdgpu_host_queue_revalidate_submission_locked(
+          transaction->queue);
+  if (!iree_status_is_ok(terminal_status)) {
     iree_slim_mutex_unlock(&transaction->queue->locks.submission_mutex);
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return terminal_status;
   }
   for (iree_host_size_t i = 0; i < transaction->operation_count; ++i) {
     iree_hal_amdgpu_transfer_child_t* child = &transaction->children[i];

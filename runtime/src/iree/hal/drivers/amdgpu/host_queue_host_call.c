@@ -32,6 +32,14 @@ typedef struct iree_hal_amdgpu_host_call_state_t {
 
   // Cloned signal list retained until the reclaim action runs.
   iree_hal_semaphore_list_t signal_semaphore_list;
+
+  // Defers arbitrary user code to the queue-owned safe epilogue after the
+  // serialized completion runner has captured stable reclaim state.
+  iree_hal_amdgpu_host_queue_post_drain_action_t post_drain_action;
+
+  // Code-only snapshot of the reclaim status. Reconstructing it after the
+  // drain avoids retaining a borrowed status or allocating while sealing.
+  iree_status_code_t completion_status_code;
 } iree_hal_amdgpu_host_call_state_t;
 
 static void iree_hal_amdgpu_host_call_state_destroy(
@@ -139,16 +147,15 @@ static void iree_hal_amdgpu_host_call_consume_unobservable_status(
   iree_status_free(status);
 }
 
-static void iree_hal_amdgpu_host_call_execute(
-    iree_hal_amdgpu_reclaim_entry_t* entry, void* user_data,
-    const iree_status_t status) {
-  (void)entry;
+static void iree_hal_amdgpu_host_call_execute_post_drain(void* user_data) {
   iree_hal_amdgpu_host_call_state_t* state =
       (iree_hal_amdgpu_host_call_state_t*)user_data;
+  iree_status_t status = iree_status_from_code(state->completion_status_code);
 
   if (!iree_status_is_ok(status)) {
     iree_hal_amdgpu_host_call_fail_with_borrowed_status(
         state->signal_semaphore_list, status);
+    iree_hal_resource_release(&state->resource);
     return;
   }
 
@@ -159,6 +166,7 @@ static void iree_hal_amdgpu_host_call_execute(
         state->signal_semaphore_list, /*frontier=*/NULL);
     if (!iree_status_is_ok(signal_status)) {
       iree_hal_semaphore_list_fail(state->signal_semaphore_list, signal_status);
+      iree_hal_resource_release(&state->resource);
       return;
     }
   }
@@ -180,6 +188,25 @@ static void iree_hal_amdgpu_host_call_execute(
   } else {
     iree_hal_semaphore_list_fail(state->signal_semaphore_list, call_status);
   }
+  iree_hal_resource_release(&state->resource);
+}
+
+// Reclaim lane C captures only stable state, then enqueues arbitrary user code
+// for the queue-owned safe epilogue. The explicit retain spans the reclaim
+// entry's lane-E resource release, which occurs before the post-drain action
+// runs. The completion wrapper's lifetime claim pins both queue and logical
+// device until the post-drain callback and its final state release return.
+static void iree_hal_amdgpu_host_call_execute(
+    iree_hal_amdgpu_reclaim_entry_t* entry, void* user_data,
+    const iree_status_t status) {
+  (void)entry;
+  iree_hal_amdgpu_host_call_state_t* state =
+      (iree_hal_amdgpu_host_call_state_t*)user_data;
+  state->completion_status_code = iree_status_code(status);
+  iree_hal_resource_retain(&state->resource);
+  iree_hal_amdgpu_host_queue_enqueue_post_drain_action(
+      (iree_hal_amdgpu_host_queue_t*)state->queue, &state->post_drain_action,
+      iree_hal_amdgpu_host_call_execute_post_drain, state);
 }
 
 iree_status_t iree_hal_amdgpu_host_queue_submit_host_call(
@@ -191,7 +218,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_host_call(
   IREE_ASSERT_ARGUMENT(out_ready);
   *out_ready = false;
   if (IREE_UNLIKELY(queue->is_shutting_down)) {
-    return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+    return iree_status_from_code(IREE_STATUS_CANCELLED);
   }
 
   iree_hal_amdgpu_host_call_state_t* state = NULL;

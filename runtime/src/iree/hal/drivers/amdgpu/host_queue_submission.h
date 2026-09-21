@@ -448,6 +448,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_ib(
     const uint32_t* ib_dwords, uint32_t ib_dword_count,
     iree_hsa_signal_t publication_signal,
     iree_hal_amdgpu_reclaim_action_t publication_retire_action,
+    iree_hal_amdgpu_feedback_source_batch_t** inout_feedback_source_batch,
     iree_hal_resource_t* const* operation_resources,
     iree_host_size_t operation_resource_count,
     const iree_hal_amdgpu_host_queue_profile_event_info_t*
@@ -472,6 +473,7 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_pm4_ib_with_binding_table_fixup(
     const uint32_t* ib_dwords, uint32_t ib_dword_count,
     iree_hsa_signal_t publication_signal,
     iree_hal_amdgpu_reclaim_action_t publication_retire_action,
+    iree_hal_amdgpu_feedback_source_batch_t** inout_feedback_source_batch,
     iree_hal_resource_t* const* operation_resources,
     iree_host_size_t operation_resource_count,
     iree_hal_resource_set_t** inout_resource_set,

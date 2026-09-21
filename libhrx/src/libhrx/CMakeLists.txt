@@ -15,6 +15,7 @@ if(IREE_HAL_DRIVER_AMDGPU)
 endif()
 set(_hrx_static_platform_deps "")
 if(IREE_HAL_DRIVER_AMDGPU)
+  list(APPEND _hrx_static_platform_deps iree::hal::drivers::amdgpu)
   list(APPEND _hrx_static_platform_deps iree::hal::drivers::amdgpu::registration)
   list(APPEND _hrx_static_platform_deps iree::hal::drivers::amdgpu::target::selection)
 endif()
@@ -86,8 +87,88 @@ iree_cc_library(
   PUBLIC
 )
 
+set(_hrx_static_vmm_test_instrumented_platform_copts "")
+if(IREE_HAL_DRIVER_AMDGPU)
+  list(APPEND _hrx_static_vmm_test_instrumented_platform_copts "-DHRX_HAS_IREE_AMDGPU_DRIVER")
+endif()
+set(_hrx_static_vmm_test_instrumented_platform_deps "")
+if(IREE_HAL_DRIVER_AMDGPU)
+  list(APPEND _hrx_static_vmm_test_instrumented_platform_deps iree::hal::drivers::amdgpu::amdgpu_test_instrumented)
+  list(APPEND _hrx_static_vmm_test_instrumented_platform_deps iree::hal::drivers::amdgpu::registration::registration_vmm_test_instrumented)
+  list(APPEND _hrx_static_vmm_test_instrumented_platform_deps iree::hal::drivers::amdgpu::target::selection)
+endif()
+iree_cc_library(
+  NAME
+    hrx_static_vmm_test_instrumented
+  COPTS
+    ${_hrx_static_vmm_test_instrumented_platform_copts}
+  HDRS
+    "${LIBHRX_SOURCE_DIR}/src/iree_hal_compat.h"
+    "buffer_table.h"
+    "hrx_internal.h"
+    "mem_pool.h"
+    "transfer.h"
+  SRCS
+    "allocator.c"
+    "buffer.c"
+    "buffer_table.c"
+    "buffer_view.c"
+    "device.c"
+    "event.c"
+    "executable.c"
+    "fence.c"
+    "graph.c"
+    "graph_analysis.c"
+    "graph_exec.c"
+    "host_allocator.c"
+    "mem_pool.c"
+    "pool.c"
+    "queue_ops.c"
+    "runtime.c"
+    "semaphore.c"
+    "status.c"
+    "stream.c"
+    "transfer.c"
+    "vmm_slab_provider.c"
+    "vmm_slab_provider.h"
+  DEPS
+    ${CMAKE_DL_LIBS}
+    iree::async
+    iree::async::util::proactor_pool
+    iree::base
+    iree::base::core_headers
+    iree::base::internal
+    iree::base::internal::arena
+    iree::base::threading
+    iree::hal
+    iree::hal::drivers::task::driver
+    iree::hal::drivers::task::executable::loaders::registration
+    iree::hal::memory::asan
+    iree::hal::memory::passthrough_pool
+    iree::hal::memory::slab_provider
+    iree::hal::memory::tlsf_pool
+    iree::hal::utils::profile_file
+    iree::hal::utils::resource_set
+    iree::io::file_handle
+    iree::task::api
+    libhrx_defs
+    ${_hrx_static_vmm_test_instrumented_platform_deps}
+  DEFINES
+    "HRX_STATIC"
+  TESTONLY
+  INCLUDES
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/.>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/.>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/..>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../include>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../../include>"
+  PUBLIC
+)
+
 set(_hrx_platform_deps "")
 if(IREE_HAL_DRIVER_AMDGPU)
+  list(APPEND _hrx_platform_deps iree::hal::drivers::amdgpu)
   list(APPEND _hrx_platform_deps iree::hal::drivers::amdgpu::registration)
   list(APPEND _hrx_platform_deps iree::hal::drivers::amdgpu::target::selection)
 endif()

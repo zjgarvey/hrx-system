@@ -14,7 +14,9 @@ extern "C" {
 #endif  // __cplusplus
 
 // Starts multi-block command-buffer replay. Caller must hold
-// |queue->locks.submission_mutex|.
+// |queue->locks.submission_mutex|. Returns the initial replay owner through
+// |out_cleanup_resource| on every path that allocated one; its final release
+// must occur only after submission_mutex is dropped.
 iree_status_t iree_hal_amdgpu_command_buffer_replay_start_under_lock(
     iree_hal_amdgpu_host_queue_t* queue,
     const iree_hal_amdgpu_wait_resolution_t* resolution,
@@ -22,7 +24,8 @@ iree_status_t iree_hal_amdgpu_command_buffer_replay_start_under_lock(
     iree_hal_command_buffer_t* command_buffer,
     iree_hal_buffer_binding_table_t binding_table,
     iree_hal_queue_execute_flags_t execute_flags,
-    iree_hal_resource_set_t** inout_binding_resource_set);
+    iree_hal_resource_set_t** inout_binding_resource_set,
+    iree_hal_resource_t** out_cleanup_resource);
 
 #ifdef __cplusplus
 }  // extern "C"

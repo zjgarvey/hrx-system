@@ -160,7 +160,15 @@ static void iree_thread_delete(iree_thread_t* thread) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_thread_resume(thread);
-  pthread_join(thread->handle, NULL);
+  if (pthread_equal(pthread_self(), thread->handle)) {
+    // The start trampoline copies entry/entry_arg before invoking user code
+    // and does not touch |thread| after the entry returns. Detach the native
+    // thread so its resources are reclaimed when that return occurs instead
+    // of attempting to join ourselves.
+    pthread_detach(thread->handle);
+  } else {
+    pthread_join(thread->handle, NULL);
+  }
 
   iree_allocator_free(thread->allocator, thread);
 

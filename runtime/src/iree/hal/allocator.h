@@ -516,7 +516,25 @@ IREE_API_EXPORT iree_status_t iree_hal_allocator_virtual_memory_reserve(
     iree_device_size_t size,
     iree_hal_buffer_t** IREE_RESTRICT out_virtual_buffer);
 
-// Releases a virtual address reservation created by virtual_memory_reserve.
+// Reserves a contiguous virtual address range with optional placement hints.
+//
+// |minimum_alignment| may be zero to select the allocator default. A non-zero
+// value must be a supported power-of-two alignment no smaller than the minimum
+// page size returned by iree_hal_allocator_virtual_memory_query_granularity.
+// |requested_address| may be zero when no address is preferred. A backend may
+// return another address when the requested range is unavailable.
+//
+// Returns IREE_STATUS_UNIMPLEMENTED when non-default placement hints are
+// requested but the allocator cannot accept them.
+IREE_API_EXPORT iree_status_t iree_hal_allocator_virtual_memory_reserve_at(
+    iree_hal_allocator_t* IREE_RESTRICT allocator,
+    iree_hal_queue_family_affinity_t queue_family_affinity,
+    iree_device_size_t size, iree_device_size_t minimum_alignment,
+    iree_device_size_t requested_address,
+    iree_hal_buffer_t** IREE_RESTRICT out_virtual_buffer);
+
+// Releases a virtual address reservation created by virtual_memory_reserve or
+// virtual_memory_reserve_at.
 //
 // All physical memory must be unmapped before releasing. The |virtual_buffer|
 // must not be used after this call.
@@ -747,6 +765,16 @@ typedef struct iree_hal_allocator_vtable_t {
       iree_device_size_t virtual_offset, iree_device_size_t size,
       iree_hal_queue_family_affinity_t queue_family_affinity,
       iree_hal_memory_advice_t advice);
+  // Optional placement-aware reservation operation. This remains last so
+  // older positional vtable initializers preserve their existing layout.
+  // Callers must use iree_hal_allocator_virtual_memory_reserve_at so a missing
+  // implementation is reported instead of calling a NULL function pointer.
+  iree_status_t(IREE_API_PTR* virtual_memory_reserve_at)(
+      iree_hal_allocator_t* IREE_RESTRICT allocator,
+      iree_hal_queue_family_affinity_t queue_family_affinity,
+      iree_device_size_t size, iree_device_size_t minimum_alignment,
+      iree_device_size_t requested_address,
+      iree_hal_buffer_t** IREE_RESTRICT out_virtual_buffer);
 } iree_hal_allocator_vtable_t;
 IREE_HAL_ASSERT_VTABLE_LAYOUT(iree_hal_allocator_vtable_t);
 

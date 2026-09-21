@@ -79,6 +79,15 @@ iree_status_t iree_hip_stream_publish(iree_hal_streaming_stream_t* stream,
 // when the handle is not registered.
 bool iree_hip_stream_lookup_retain(hipStream_t handle, hipStream_t* out_handle);
 
+// Takes an allocation-owning snapshot of every live explicit stream attached
+// to one of |contexts|. Each returned handle has one retained reference and
+// must be released with iree_hip_stream_release. The lifecycle writer must be
+// held so the two-pass exact snapshot cannot change between count and retain.
+iree_status_t iree_hip_stream_snapshot_retain_for_contexts(
+    iree_hal_streaming_context_t* const* contexts,
+    iree_host_size_t context_count, hipStream_t** out_handles,
+    iree_host_size_t* out_handle_count);
+
 // Removes a live explicit stream handle and transfers its public ownership to
 // the caller. |out_handle| is unchanged when the handle is not registered.
 bool iree_hip_stream_take(hipStream_t handle, hipStream_t* out_handle);

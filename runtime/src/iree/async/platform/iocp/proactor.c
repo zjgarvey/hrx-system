@@ -390,10 +390,12 @@ iree_status_t iree_async_proactor_create_iocp(
 
   // Detect and apply capabilities.
   // MULTISHOT is supported via re-arm emulation (no kernel support needed).
-  proactor->capabilities = IREE_ASYNC_PROACTOR_CAPABILITY_REGISTERED_BUFFERS |
-                           IREE_ASYNC_PROACTOR_CAPABILITY_ABSOLUTE_TIMEOUT |
-                           IREE_ASYNC_PROACTOR_CAPABILITY_LINKED_OPERATIONS |
-                           IREE_ASYNC_PROACTOR_CAPABILITY_MULTISHOT;
+  proactor->capabilities =
+      IREE_ASYNC_PROACTOR_CAPABILITY_REGISTERED_BUFFERS |
+      IREE_ASYNC_PROACTOR_CAPABILITY_ABSOLUTE_TIMEOUT |
+      IREE_ASYNC_PROACTOR_CAPABILITY_LINKED_OPERATIONS |
+      IREE_ASYNC_PROACTOR_CAPABILITY_MULTISHOT |
+      IREE_ASYNC_PROACTOR_CAPABILITY_FILE_OPERATION_CANCELLATION;
   if (nt_wait_api_detected) {
     proactor->capabilities |=
         IREE_ASYNC_PROACTOR_CAPABILITY_WAIT_COMPLETION_PACKET;

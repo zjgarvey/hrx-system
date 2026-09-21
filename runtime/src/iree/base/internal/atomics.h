@@ -143,6 +143,24 @@ typedef iree_atomic_int32_t iree_atomic_ref_count_t;
     iree_atomic_fetch_add((count_ptr), 1, iree_memory_order_relaxed); \
   } while (false)
 
+// Attempts to retain an object without resurrecting a reference count that
+// has already reached zero. The storage containing |count_ptr| must remain
+// addressable for the duration of this call through some independent lifetime
+// guarantee. Returns true only when this call linearized before the final
+// decrement from one to zero.
+static inline bool iree_atomic_ref_count_try_inc(
+    iree_atomic_ref_count_t* count_ptr) {
+  int32_t old_count = iree_atomic_load(count_ptr, iree_memory_order_relaxed);
+  while (old_count > 0) {
+    if (iree_atomic_compare_exchange_weak(count_ptr, &old_count, old_count + 1,
+                                          iree_memory_order_relaxed,
+                                          iree_memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // For now we stick to acq_rel order. TODO: should we follow Boost's advice?
 // https://www.boost.org/doc/libs/1_57_0/doc/html/atomic/usage_examples.html#boost_atomic.usage_examples.example_reference_counters.discussion
 // > It would be possible to use memory_order_acq_rel for the fetch_sub

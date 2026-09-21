@@ -153,6 +153,24 @@ void iree_hal_amdgpu_feedback_channel_deinitialize(
   IREE_TRACE_ZONE_END(z0);
 }
 
+uint64_t iree_hal_amdgpu_feedback_channel_query_reservation_head(
+    const iree_hal_amdgpu_feedback_channel_t* channel) {
+  IREE_ASSERT_ARGUMENT(channel);
+  IREE_ASSERT_ARGUMENT(channel->control);
+  return iree_amdgpu_scoped_atomic_load(
+      (iree_amdgpu_scoped_atomic_uint64_t*)&channel->control->reservation_head,
+      iree_amdgpu_memory_order_acquire, iree_amdgpu_memory_scope_system);
+}
+
+uint64_t iree_hal_amdgpu_feedback_channel_query_read_tail(
+    const iree_hal_amdgpu_feedback_channel_t* channel) {
+  IREE_ASSERT_ARGUMENT(channel);
+  IREE_ASSERT_ARGUMENT(channel->control);
+  return iree_amdgpu_scoped_atomic_load(
+      (iree_amdgpu_scoped_atomic_uint64_t*)&channel->control->read_tail,
+      iree_amdgpu_memory_order_acquire, iree_amdgpu_memory_scope_system);
+}
+
 iree_status_t iree_hal_amdgpu_feedback_channel_drain(
     iree_hal_amdgpu_feedback_channel_t* channel,
     iree_host_size_t max_packet_count,

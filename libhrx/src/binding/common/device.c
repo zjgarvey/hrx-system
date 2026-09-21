@@ -12,6 +12,18 @@
 // Device management
 //===----------------------------------------------------------------------===//
 
+#if defined(IREE_HAL_STREAMING_TEST_INSTRUMENTATION)
+static iree_atomic_int32_t
+    iree_hal_streaming_device_test_default_mem_pool_failure_armed =
+        IREE_ATOMIC_VAR_INIT(0);
+
+void iree_hal_streaming_device_test_fail_next_default_mem_pool(void) {
+  iree_atomic_store(
+      &iree_hal_streaming_device_test_default_mem_pool_failure_armed, 1,
+      iree_memory_order_release);
+}
+#endif  // IREE_HAL_STREAMING_TEST_INSTRUMENTATION
+
 iree_status_t iree_hal_streaming_device_count(iree_host_size_t* out_count) {
   IREE_ASSERT_ARGUMENT(out_count);
   iree_hal_streaming_device_registry_t* device_registry =
@@ -365,14 +377,26 @@ static iree_status_t iree_hal_streaming_device_create_primary_context_locked(
       device, device->primary_context_flags, device_registry->host_allocator,
       &context);
   if (iree_status_is_ok(status)) {
+#if defined(IREE_HAL_STREAMING_TEST_INSTRUMENTATION)
+    if (iree_atomic_exchange(
+            &iree_hal_streaming_device_test_default_mem_pool_failure_armed, 0,
+            iree_memory_order_acq_rel)) {
+      status = iree_make_status(IREE_STATUS_UNAVAILABLE,
+                                "injected default memory pool failure");
+    } else {
+      status = iree_hal_streaming_device_ensure_default_mem_pool_locked(device);
+    }
+#else
     status = iree_hal_streaming_device_ensure_default_mem_pool_locked(device);
+#endif  // IREE_HAL_STREAMING_TEST_INSTRUMENTATION
   }
   if (iree_status_is_ok(status)) {
+    context->is_primary = true;
     device->primary_context = context;
     return iree_ok_status();
   }
 
-  iree_hal_streaming_context_release(context);
+  iree_hal_streaming_context_discard_unpublished(context);
   if (!had_current_mem_pool) {
     hrx_mem_pool_release(device->current_mem_pool);
     device->current_mem_pool = NULL;
@@ -414,7 +438,12 @@ iree_status_t iree_hal_streaming_device_retain_primary_context(
 
   iree_hal_streaming_context_t* retained_context = NULL;
   iree_status_t status = iree_ok_status();
-  if (device->primary_context_ref_count == INT32_MAX) {
+  const int64_t total_ref_count =
+      (int64_t)device->primary_context_ref_count +
+      (int64_t)device->retired_primary_context_ref_count;
+  IREE_ASSERT(device->primary_context_ref_count >= 0);
+  IREE_ASSERT(device->retired_primary_context_ref_count >= 0);
+  if (total_ref_count >= INT32_MAX) {
     status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
                               "primary context reference count overflow");
   } else {
@@ -436,44 +465,255 @@ iree_status_t iree_hal_streaming_device_retain_primary_context(
   return status;
 }
 
+void iree_hal_streaming_device_rollback_primary_context_retain(
+    iree_hal_streaming_device_t* device,
+    iree_hal_streaming_context_t* retained_context) {
+  IREE_ASSERT_ARGUMENT(device);
+  IREE_ASSERT_ARGUMENT(retained_context);
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  iree_slim_mutex_lock(&device->primary_context_mutex);
+  IREE_ASSERT(device->primary_context == retained_context);
+  IREE_ASSERT(device->primary_context_ref_count > 0);
+  --device->primary_context_ref_count;
+  iree_slim_mutex_unlock(&device->primary_context_mutex);
+
+  // Balance only the owning reference returned by retain. Device publication,
+  // its list reference, and its pools may all predate this transaction and are
+  // intentionally left untouched.
+  iree_hal_streaming_context_release(retained_context);
+  IREE_TRACE_ZONE_END(z0);
+}
+
 iree_status_t iree_hal_streaming_device_release_primary_context(
     iree_hal_streaming_device_t* device) {
   IREE_ASSERT_ARGUMENT(device);
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  iree_hal_streaming_context_t* retained_context = NULL;
+  bool detach_context = false;
+  hrx_mem_pool_t current_mem_pool = NULL;
+  hrx_mem_pool_t default_mem_pool = NULL;
   iree_slim_mutex_lock(&device->primary_context_mutex);
-
   iree_status_t status = iree_ok_status();
-  if (device->primary_context_ref_count == 0) {
+  if (device->retired_primary_context_ref_count > 0) {
+    // Reset-retired retains name no live object generation. Consume them first
+    // so an old caller's delayed release cannot detach a newly retained
+    // primary context.
+    --device->retired_primary_context_ref_count;
+  } else if (device->primary_context_ref_count == 0) {
     status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                               "primary context not retained");
   } else {
-    iree_hal_streaming_context_t* retained_context = device->primary_context;
-    --device->primary_context_ref_count;
-
-    if (device->primary_context_ref_count == 0) {
-      status = iree_hal_streaming_context_wait_idle(retained_context,
+    iree_hal_streaming_context_t* candidate = device->primary_context;
+    if (device->primary_context_ref_count == 1) {
+      // This is the precommit boundary. A wait failure leaves the count,
+      // publication, pools, and every ownership reference untouched so the
+      // caller may safely retry or fail closed at a higher lifecycle layer.
+      status = iree_hal_streaming_context_wait_idle(candidate,
                                                     iree_infinite_timeout());
-
-      if (iree_hal_streaming_context_current() == retained_context) {
-        iree_hal_streaming_context_set_current(NULL);
-      }
-
-      // Release the device's primary-context ownership.
-      iree_hal_streaming_context_release(retained_context);
-      device->primary_context = NULL;
-
-      hrx_mem_pool_release(device->current_mem_pool);
-      device->current_mem_pool = NULL;
-      hrx_mem_pool_release(device->default_mem_pool);
-      device->default_mem_pool = NULL;
+    }
+    if (iree_status_is_ok(status)) {
+      retained_context = candidate;
+      // Pin across list unregistration and every release performed after the
+      // primary mutex is dropped.
+      iree_hal_streaming_context_retain(retained_context);
+      --device->primary_context_ref_count;
     }
 
+    if (iree_status_is_ok(status) && device->primary_context_ref_count == 0) {
+      iree_hal_streaming_context_retire(retained_context);
+      device->primary_context = NULL;
+      detach_context = true;
+      current_mem_pool = device->current_mem_pool;
+      device->current_mem_pool = NULL;
+      default_mem_pool = device->default_mem_pool;
+      device->default_mem_pool = NULL;
+    }
+  }
+  iree_slim_mutex_unlock(&device->primary_context_mutex);
+
+  if (retained_context) {
+    if (detach_context) {
+      iree_hal_streaming_context_mark_teardown_quiesced(retained_context);
+      iree_hal_streaming_context_detach_streams_quiesced(
+          retained_context, /*abort_captures=*/true);
+      // The table owns one wrapper reference per published allocation, and
+      // each wrapper retains this context. Break that ownership cycle while
+      // the context is quiesced and before dropping its publication refs.
+      iree_hal_streaming_memory_release_context_allocations(retained_context);
+      iree_hal_streaming_unregister_context(retained_context);
+      // Release the device's primary-context ownership.
+      iree_hal_streaming_context_release(retained_context);
+      hrx_mem_pool_release(current_mem_pool);
+      hrx_mem_pool_release(default_mem_pool);
+    }
     // Release the owning reference returned by the matching retain call.
     iree_hal_streaming_context_release(retained_context);
+    // Drop the function-local pin after all detach releases.
+    iree_hal_streaming_context_release(retained_context);
   }
-
-  iree_slim_mutex_unlock(&device->primary_context_mutex);
   IREE_TRACE_ZONE_END(z0);
   return status;
+}
+
+iree_status_t iree_hal_streaming_device_reset_primary_context(
+    iree_hal_streaming_device_t* device) {
+  IREE_ASSERT_ARGUMENT(device);
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  iree_hal_streaming_context_t* primary_context = NULL;
+  int32_t detached_ref_count = 0;
+  hrx_mem_pool_t current_mem_pool = NULL;
+  hrx_mem_pool_t default_mem_pool = NULL;
+  iree_slim_mutex_lock(&device->primary_context_mutex);
+  iree_status_t status = iree_ok_status();
+  primary_context = device->primary_context;
+  if (primary_context) {
+    // The CUDA contract places exclusion of concurrent context use on the
+    // reset caller. This mutex additionally serializes the complete ownership
+    // transaction against create, retain, release, and another reset.
+    status = iree_hal_streaming_context_wait_idle(primary_context,
+                                                  iree_infinite_timeout());
+    if (iree_status_is_ok(status) &&
+        iree_hal_streaming_context_current() == primary_context) {
+      // Clearing caller TLS is the last fallible mutation. It runs while the
+      // device, list, and explicit retain references still pin the old object,
+      // so failure leaves every device ownership field unchanged for retry.
+      status = iree_hal_streaming_context_set_current(NULL);
+    }
+    if (iree_status_is_ok(status)) {
+      iree_hal_streaming_context_retain(primary_context);
+      iree_hal_streaming_context_retire(primary_context);
+      detached_ref_count = device->primary_context_ref_count;
+      IREE_ASSERT(detached_ref_count >= 0);
+      IREE_ASSERT(device->retired_primary_context_ref_count <=
+                  INT32_MAX - detached_ref_count);
+      device->retired_primary_context_ref_count += detached_ref_count;
+      device->primary_context_ref_count = 0;
+      device->primary_context = NULL;
+      current_mem_pool = device->current_mem_pool;
+      device->current_mem_pool = NULL;
+      default_mem_pool = device->default_mem_pool;
+      device->default_mem_pool = NULL;
+    }
+  }
+  iree_slim_mutex_unlock(&device->primary_context_mutex);
+
+  if (iree_status_is_ok(status) && primary_context) {
+    // The successful wait above certified the retired generation. Detach its
+    // streams now so a stale TLS stack reference keeps only inert handle
+    // storage alive; popping it cannot retain backend queue resources or
+    // require another wait after the device publication is gone.
+    iree_hal_streaming_context_mark_teardown_quiesced(primary_context);
+    iree_hal_streaming_context_detach_streams_quiesced(primary_context,
+                                                       /*abort_captures=*/true);
+    iree_hal_streaming_memory_release_context_allocations(primary_context);
+    iree_hal_streaming_unregister_context(primary_context);
+    // Drop the device publication after removing the list publication.
+    iree_hal_streaming_context_release(primary_context);
+    for (int32_t i = 0; i < detached_ref_count; ++i) {
+      // Drop each object reference formerly paired with a logical retain. The
+      // logical retain itself remains in the reset-retired ledger above.
+      iree_hal_streaming_context_release(primary_context);
+    }
+    // Drop the transaction pin after every old-generation edge is gone.
+    iree_hal_streaming_context_release(primary_context);
+    hrx_mem_pool_release(current_mem_pool);
+    hrx_mem_pool_release(default_mem_pool);
+  }
+
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
+static iree_status_t
+iree_hal_streaming_device_commit_primary_context_release_impl(
+    iree_hal_streaming_device_t* device,
+    iree_hal_streaming_context_t* expected_context, int32_t expected_ref_count,
+    bool preserve_ledger_on_last) {
+  IREE_ASSERT_ARGUMENT(device);
+  IREE_ASSERT_ARGUMENT(expected_context);
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  iree_hal_streaming_context_t* retained_context = NULL;
+  bool detach_context = false;
+  bool preserve_ledger = false;
+  hrx_mem_pool_t current_mem_pool = NULL;
+  hrx_mem_pool_t default_mem_pool = NULL;
+  iree_slim_mutex_lock(&device->primary_context_mutex);
+  iree_status_t status = iree_ok_status();
+  if (expected_ref_count <= 0 || device->primary_context != expected_context ||
+      device->primary_context_ref_count != expected_ref_count) {
+    status = iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "prepared primary-context release no longer matches device state");
+  } else if (expected_ref_count == 1 && !preserve_ledger_on_last &&
+             iree_hal_streaming_context_current() == expected_context) {
+    // Prepared release is still retryable until this thread's last marker is
+    // cleared. Do that before consuming the expected device publication.
+    status = iree_hal_streaming_context_set_current(NULL);
+  }
+  if (iree_status_is_ok(status)) {
+    retained_context = expected_context;
+    // Pin every object named below until publication and retain ownership have
+    // been resolved outside the primary mutex.
+    iree_hal_streaming_context_retain(retained_context);
+    --device->primary_context_ref_count;
+    if (device->primary_context_ref_count == 0) {
+      if (preserve_ledger_on_last) {
+        preserve_ledger = true;
+      } else {
+        device->primary_context = NULL;
+        detach_context = true;
+        current_mem_pool = device->current_mem_pool;
+        device->current_mem_pool = NULL;
+        default_mem_pool = device->default_mem_pool;
+        device->default_mem_pool = NULL;
+      }
+    }
+  }
+  iree_slim_mutex_unlock(&device->primary_context_mutex);
+
+  if (retained_context) {
+    if (detach_context) {
+      iree_hal_streaming_memory_release_context_allocations(retained_context);
+      iree_hal_streaming_unregister_context(retained_context);
+      // Drop the device publication after removing the list publication.
+      iree_hal_streaming_context_release(retained_context);
+      hrx_mem_pool_release(current_mem_pool);
+      hrx_mem_pool_release(default_mem_pool);
+    } else if (preserve_ledger) {
+      // Every remaining table entry is a registry-named VMM wrapper. Each
+      // retains the context, while the device and list publications keep the
+      // context discoverable by global teardown ownership validation.
+      iree_hal_streaming_memory_release_context_owned_ordinary_allocations(
+          retained_context);
+    }
+    // Consume the exact retain represented by |expected_ref_count|.
+    iree_hal_streaming_context_release(retained_context);
+    // Drop the function-local pin.
+    iree_hal_streaming_context_release(retained_context);
+  }
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
+iree_status_t iree_hal_streaming_device_commit_primary_context_release(
+    iree_hal_streaming_device_t* device,
+    iree_hal_streaming_context_t* expected_context,
+    int32_t expected_ref_count) {
+  return iree_hal_streaming_device_commit_primary_context_release_impl(
+      device, expected_context, expected_ref_count,
+      /*preserve_ledger_on_last=*/false);
+}
+
+iree_status_t
+iree_hal_streaming_device_commit_primary_context_release_preserving_ledger(
+    iree_hal_streaming_device_t* device,
+    iree_hal_streaming_context_t* expected_context,
+    int32_t expected_ref_count) {
+  return iree_hal_streaming_device_commit_primary_context_release_impl(
+      device, expected_context, expected_ref_count,
+      /*preserve_ledger_on_last=*/true);
 }

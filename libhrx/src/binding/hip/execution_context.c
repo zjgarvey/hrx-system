@@ -9,6 +9,7 @@
 #include "binding/hip/execution_resource.h"
 #include "binding/hip/execution_resource_descriptor.h"
 #include "binding/hip/stream.h"
+#include "binding/hip/vmm.h"
 #include "common/internal.h"
 #include "common/stream.h"
 #include "iree/base/threading/call_once.h"
@@ -92,6 +93,9 @@ static iree_once_flag iree_hip_execution_context_registry_once =
 static iree_hip_execution_context_registry_t
     iree_hip_execution_context_registry;
 
+static hipError_t iree_hip_execution_context_destroy_preflight(
+    hipExecutionCtx_t context);
+
 // Next process-unique context identifier. Zero permanently marks exhaustion.
 static iree_atomic_uint64_t iree_hip_next_execution_context_id =
     IREE_ATOMIC_VAR_INIT(1);
@@ -156,22 +160,11 @@ static void iree_hip_execution_context_release(hipExecutionCtx_t context) {
   iree_allocator_free(context->host_allocator, context);
 }
 
-static hipError_t iree_hip_execution_context_release_primary(
-    iree_hal_streaming_device_t* device,
-    iree_hal_streaming_context_t* primary_context) {
-  if (!primary_context) return hipSuccess;
-  iree_status_t status =
-      iree_hal_streaming_device_release_primary_context(device);
-  return iree_status_is_ok(status)
-             ? hipSuccess
-             : iree_hip_execution_context_consume_status(status);
-}
-
-static hipError_t iree_hip_execution_context_deinitialize(
-    hipExecutionCtx_t context) {
+// Detaches an execution context after its caller has synchronously quiesced
+// every stream and event record while the handle remained published.
+static void iree_hip_execution_context_deinitialize(hipExecutionCtx_t context,
+                                                    bool abort_captures) {
   iree_slim_mutex_lock(&context->mutex);
-  iree_hal_streaming_device_t* device = context->device;
-  iree_hal_streaming_context_t* primary_context = context->primary_context;
   iree_hal_fence_t* stream_wait_frontier = context->stream_wait_frontier;
   iree_hal_streaming_operation_timeline_t event_record_timeline =
       context->event_record_timeline;
@@ -195,7 +188,6 @@ static hipError_t iree_hip_execution_context_deinitialize(
   iree_slim_mutex_unlock(&context->mutex);
   iree_hal_fence_release(stream_wait_frontier);
 
-  hipError_t result = hipSuccess;
   while (stream_head) {
     hipStream_t stream = stream_head;
     stream_head = stream->next_execution_context_stream;
@@ -204,15 +196,14 @@ static hipError_t iree_hip_execution_context_deinitialize(
     iree_hal_streaming_context_t* common_context = NULL;
     if (iree_hip_stream_detach(stream, &common_stream, &common_context)) {
       if (common_context) {
-        iree_status_t status =
-            iree_hal_streaming_stream_synchronize(common_stream);
-        if (!iree_status_is_ok(status)) {
-          const hipError_t synchronize_result =
-              iree_hip_execution_context_consume_status(status);
-          if (result == hipSuccess) result = synchronize_result;
+        if (abort_captures) {
+          iree_hal_streaming_stream_abort_capture_quiesced(common_stream);
         }
-        iree_hal_streaming_context_unregister_stream(common_context,
-                                                     common_stream);
+        // A final dynamic-queue release may synchronously wait in the backend.
+        // This entire detach runs before the public execution handle is taken.
+        iree_hip_vmm_test_notify_execution_context_queue_release(common_stream);
+        iree_hal_streaming_stream_detach_quiesced(common_context,
+                                                  common_stream);
       }
       iree_hal_streaming_stream_release(common_stream);
       iree_hal_streaming_context_release(common_context);
@@ -221,24 +212,7 @@ static hipError_t iree_hip_execution_context_deinitialize(
     iree_hip_stream_release(stream);
   }
 
-  if (event_record_timeline.pending_value > 0) {
-    iree_status_t status = iree_hal_semaphore_wait(
-        event_record_timeline.semaphore, event_record_timeline.pending_value,
-        iree_infinite_timeout(), IREE_ASYNC_WAIT_FLAG_NONE);
-    if (!iree_status_is_ok(status)) {
-      const hipError_t synchronize_result =
-          iree_hip_execution_context_consume_status(status);
-      if (result == hipSuccess) result = synchronize_result;
-    }
-  }
   iree_hal_semaphore_release(event_record_timeline.semaphore);
-
-  if (context->kind == IREE_HIP_EXECUTION_CONTEXT_KIND_RESOURCE_PARTITIONED) {
-    const hipError_t primary_result =
-        iree_hip_execution_context_release_primary(device, primary_context);
-    if (result == hipSuccess) result = primary_result;
-  }
-  return result;
 }
 
 // Resolves |handle| against the live registry and returns a retained context.
@@ -272,7 +246,7 @@ static void iree_hip_execution_context_publish(hipExecutionCtx_t context) {
 }
 
 static hipExecutionCtx_t iree_hip_execution_context_take_partitioned(
-    hipExecutionCtx_t handle) {
+    hipExecutionCtx_t handle, hipExecutionCtx_t expected_context) {
   if (!handle) return NULL;
   iree_call_once(&iree_hip_execution_context_registry_once,
                  iree_hip_execution_context_registry_initialize);
@@ -283,7 +257,7 @@ static hipExecutionCtx_t iree_hip_execution_context_take_partitioned(
   while (*link && *link != handle) {
     link = &(*link)->next_live_context;
   }
-  if (*link &&
+  if (*link == expected_context &&
       (*link)->kind == IREE_HIP_EXECUTION_CONTEXT_KIND_RESOURCE_PARTITIONED) {
     owned_context = *link;
     *link = owned_context->next_live_context;
@@ -431,6 +405,9 @@ hipError_t iree_hip_execution_context_create(
       result = iree_hip_execution_context_consume_status(status);
     }
   }
+  if (result == hipSuccess) {
+    result = iree_hip_vmm_green_context_post_retain_checkpoint();
+  }
 
   iree_hal_semaphore_t* event_record_semaphore = NULL;
   if (result == hipSuccess) {
@@ -502,21 +479,136 @@ hipError_t iree_hip_execution_context_create(
 
   iree_allocator_free(host_allocator, context);
   iree_hal_semaphore_release(event_record_semaphore);
-  const hipError_t primary_release_result =
-      iree_hip_execution_context_release_primary(device, primary_context);
-  if (primary_release_result != hipSuccess) result = primary_release_result;
+  if (primary_context) {
+    iree_hal_streaming_device_rollback_primary_context_retain(device,
+                                                              primary_context);
+  }
   iree_hip_execution_resource_descriptor_release(owned_descriptor);
   iree_hip_execution_resource_descriptor_release(retained_descriptor);
   return result;
 }
 
 hipError_t iree_hip_execution_context_destroy(hipExecutionCtx_t context) {
+  hipError_t result = iree_hip_vmm_launch_begin();
+  if (result != hipSuccess) return result;
+  hipExecutionCtx_t retained_context =
+      iree_hip_execution_context_resolve_live(context);
+  if (!retained_context ||
+      retained_context->kind !=
+          IREE_HIP_EXECUTION_CONTEXT_KIND_RESOURCE_PARTITIONED) {
+    iree_hip_execution_context_release(retained_context);
+    iree_hip_vmm_launch_end();
+    return hipErrorInvalidValue;
+  }
+  iree_hip_vmm_test_notify_context_resolved(retained_context);
+  const hipDevice_t device_ordinal = retained_context->device_ordinal;
+  iree_hal_streaming_device_t* admitted_device = NULL;
+  result =
+      iree_hip_vmm_device_reset_handoff_begin(device_ordinal, &admitted_device);
+  if (result != hipSuccess) {
+    iree_hip_execution_context_release(retained_context);
+    return result;
+  }
+  IREE_ASSERT((hipDevice_t)admitted_device->ordinal == device_ordinal);
+
+  // The raw handle was pinned before joining the writer queue. A preceding
+  // destroy may have consumed its public mapping while this caller waited, so
+  // revalidate that the registry still names this exact retained incarnation
+  // before reading or mutating any of its teardown state.
+  hipExecutionCtx_t revalidated_context =
+      iree_hip_execution_context_resolve_live(context);
+  const bool exact_public_incarnation =
+      revalidated_context == retained_context &&
+      revalidated_context->kind ==
+          IREE_HIP_EXECUTION_CONTEXT_KIND_RESOURCE_PARTITIONED;
+  iree_hip_execution_context_release(revalidated_context);
+  if (!exact_public_incarnation) {
+    iree_hip_execution_context_release(retained_context);
+    iree_hip_vmm_device_reset_end(/*cleanup_committed=*/false,
+                                  /*reset_succeeded=*/false);
+    return hipErrorInvalidValue;
+  }
+
+  // A captured member may own a graph whose destruction performs fallible
+  // pageable-host cleanup. Reject it before any wait, release preparation, or
+  // state mutation so the caller can end/abort capture and retry. Lifecycle
+  // writer admission keeps this capture-free snapshot stable through take.
+  result = iree_hip_execution_context_destroy_preflight(retained_context);
+  if (result != hipSuccess) {
+    iree_hip_execution_context_release(retained_context);
+    iree_hip_vmm_device_reset_end(/*cleanup_committed=*/false,
+                                  /*reset_succeeded=*/false);
+    return result;
+  }
+
+  iree_hal_streaming_context_t* expected_primary_context = NULL;
+  iree_slim_mutex_lock(&retained_context->mutex);
+  expected_primary_context = retained_context->primary_context;
+  iree_slim_mutex_unlock(&retained_context->mutex);
+
+  // Every fallible stream and event wait is precommit and runs with the exact
+  // public handle still discoverable. Failure leaves its handle, membership,
+  // streams, primary retain, and runtime admission unchanged.
+  result = iree_hip_execution_context_synchronize(retained_context);
+  if (result != hipSuccess) {
+    iree_hip_execution_context_release(retained_context);
+    iree_hip_vmm_device_reset_end(/*cleanup_committed=*/false,
+                                  /*reset_succeeded=*/false);
+    return result;
+  }
+
+  // Quiesce a possible last retain while the exact handle and all of its
+  // streams remain published. A preparation failure therefore leaves every
+  // observable execution-context and primary-context field unchanged.
+  iree_hip_vmm_primary_release_t primary_release = {0};
+  result = iree_hip_vmm_prepare_primary_context_release(
+      device_ordinal, expected_primary_context, &primary_release);
+  if (result != hipSuccess) {
+    iree_hip_execution_context_release(retained_context);
+    iree_hip_vmm_device_reset_end(/*cleanup_committed=*/false,
+                                  /*reset_succeeded=*/false);
+    return result;
+  }
+
+  // A last-primary commit may release the primary/default queue and enter the
+  // same backend path. Queue sealing is the first irreversible transition;
+  // keep the exact execution handle and all member ownership published until
+  // the primary/VMM plan has crossed that boundary.
+  iree_hip_vmm_test_notify_execution_context_queue_release(
+      primary_release.context);
+  bool cleanup_committed = false;
+  iree_hip_context_teardown_t* teardown = NULL;
+  result = iree_hip_vmm_commit_primary_context_release(
+      &primary_release, &cleanup_committed, &teardown);
+
+  // The prepared primary teardown has now sealed/detached target queues (or a
+  // non-last retain required no seal). Consume the partitioned member ledger
+  // without placing a queue release ahead of the fail-closed boundary.
+  iree_hip_execution_context_deinitialize(retained_context,
+                                          /*abort_captures=*/false);
+
   hipExecutionCtx_t owned_context =
-      iree_hip_execution_context_take_partitioned(context);
-  if (!owned_context) return hipErrorInvalidValue;
-  const hipError_t result =
-      iree_hip_execution_context_deinitialize(owned_context);
+      iree_hip_execution_context_take_partitioned(context, retained_context);
+  iree_hip_vmm_test_notify_execution_context_taken(owned_context);
+  IREE_ASSERT(owned_context == retained_context,
+              "writer-held execution handle changed during commit");
+  if (!owned_context) {
+    // This is unreachable under writer admission. Fail closed rather than
+    // restoring an already-detached public object and consumed ownership.
+    iree_hip_execution_context_release(retained_context);
+    iree_hip_vmm_device_reset_end(/*cleanup_committed=*/true,
+                                  /*reset_succeeded=*/false);
+    iree_hip_context_teardown_finish(teardown);
+    return hipErrorInvalidValue;
+  }
+  iree_hip_execution_context_release(retained_context);
+  // Taking the handle completes binding-state commit. All potentially waiting
+  // execution stream, queue, timeline, and primary teardown happened while
+  // the handle remained published. Only reference release remains.
   iree_hip_execution_context_release(owned_context);
+  iree_hip_vmm_device_reset_end(/*cleanup_committed=*/true,
+                                result == hipSuccess);
+  iree_hip_context_teardown_finish(teardown);
   return result;
 }
 
@@ -765,6 +857,31 @@ static void iree_hip_execution_context_release_snapshot(
       snapshot->common_context, snapshot->streams, snapshot->stream_count);
   iree_hal_streaming_context_release(snapshot->common_context);
   *snapshot = (iree_hip_execution_context_stream_snapshot_t){0};
+}
+
+static hipError_t iree_hip_execution_context_destroy_preflight(
+    hipExecutionCtx_t context) {
+  iree_hip_execution_context_stream_snapshot_t snapshot = {0};
+  iree_slim_mutex_lock(&context->mutex);
+  iree_status_t status =
+      iree_hip_execution_context_snapshot_locked(context, &snapshot);
+  iree_slim_mutex_unlock(&context->mutex);
+  if (!iree_status_is_ok(status)) {
+    return iree_hip_execution_context_consume_status(status);
+  }
+
+  bool has_capture = false;
+  for (iree_host_size_t i = 0; i < snapshot.stream_count; ++i) {
+    iree_hal_streaming_stream_t* stream = snapshot.streams[i];
+    iree_slim_mutex_lock(&stream->mutex);
+    has_capture =
+        stream->capture_status != IREE_HAL_STREAMING_CAPTURE_STATUS_NONE ||
+        stream->capture_graph || stream->capture_graph_owned;
+    iree_slim_mutex_unlock(&stream->mutex);
+    if (has_capture) break;
+  }
+  iree_hip_execution_context_release_snapshot(&snapshot);
+  return has_capture ? hipErrorStreamCaptureUnsupported : hipSuccess;
 }
 
 // Invalidates every capture represented in |snapshot| and returns whether any
@@ -1053,43 +1170,124 @@ hipError_t iree_hip_execution_context_get_id(
   return hipSuccess;
 }
 
-static hipError_t iree_hip_execution_context_reset_matching(
-    bool reset_all, hipDevice_t device) {
+static hipError_t iree_hip_execution_context_prepare_reset_matching(
+    bool reset_all, hipDevice_t device,
+    iree_hip_execution_context_reset_t* out_reset) {
+  IREE_ASSERT_ARGUMENT(out_reset);
+  *out_reset = (iree_hip_execution_context_reset_t){0};
   iree_call_once(&iree_hip_execution_context_registry_once,
                  iree_hip_execution_context_registry_initialize);
 
-  hipExecutionCtx_t reset_head = NULL;
+  // Prepare a complete owning snapshot before mutating any handle. Allocation
+  // failure therefore leaves registry visibility, streams, queues, and primary
+  // retains unchanged.
+  iree_host_size_t reset_count = 0;
   iree_slim_mutex_lock(&iree_hip_execution_context_registry.mutex);
-  hipExecutionCtx_t* link = &iree_hip_execution_context_registry.head;
-  while (*link) {
-    hipExecutionCtx_t context = *link;
+  for (hipExecutionCtx_t context = iree_hip_execution_context_registry.head;
+       context; context = context->next_live_context) {
     if (!reset_all && context->device_ordinal != device) {
-      link = &context->next_live_context;
       continue;
     }
-    *link = context->next_live_context;
-    context->next_live_context = reset_head;
-    reset_head = context;
+    if (IREE_UNLIKELY(
+            !iree_host_size_checked_add(reset_count, 1, &reset_count))) {
+      iree_slim_mutex_unlock(&iree_hip_execution_context_registry.mutex);
+      return hipErrorOutOfMemory;
+    }
   }
   iree_slim_mutex_unlock(&iree_hip_execution_context_registry.mutex);
 
-  hipError_t result = hipSuccess;
-  while (reset_head) {
-    hipExecutionCtx_t context = reset_head;
-    reset_head = context->next_live_context;
-    context->next_live_context = NULL;
-    const hipError_t deinitialize_result =
-        iree_hip_execution_context_deinitialize(context);
-    if (result == hipSuccess) result = deinitialize_result;
-    iree_hip_execution_context_release(context);
+  size_t allocation_size = 0;
+  hipExecutionCtx_t* reset_contexts = NULL;
+  if (reset_count > 0) {
+    if (!iree_host_size_checked_mul(reset_count, sizeof(reset_contexts[0]),
+                                    &allocation_size)) {
+      return hipErrorOutOfMemory;
+    }
+    iree_status_t allocation_status = iree_allocator_malloc(
+        iree_allocator_system(), allocation_size, (void**)&reset_contexts);
+    if (!iree_status_is_ok(allocation_status)) {
+      iree_status_ignore(allocation_status);
+      return hipErrorOutOfMemory;
+    }
   }
-  return result;
+
+  iree_host_size_t snapshot_count = 0;
+  iree_slim_mutex_lock(&iree_hip_execution_context_registry.mutex);
+  for (hipExecutionCtx_t context = iree_hip_execution_context_registry.head;
+       context; context = context->next_live_context) {
+    if (!reset_all && context->device_ordinal != device) continue;
+    IREE_ASSERT(snapshot_count < reset_count);
+    iree_hip_execution_context_retain(context);
+    reset_contexts[snapshot_count++] = context;
+  }
+  iree_slim_mutex_unlock(&iree_hip_execution_context_registry.mutex);
+  IREE_ASSERT(snapshot_count == reset_count,
+              "lifecycle writer must stabilize execution handles");
+
+  out_reset->contexts = reset_contexts;
+  out_reset->count = reset_count;
+  return hipSuccess;
 }
 
-hipError_t iree_hip_execution_context_reset_device(hipDevice_t device) {
-  return iree_hip_execution_context_reset_matching(/*reset_all=*/false, device);
+void iree_hip_execution_context_commit_reset(
+    iree_hip_execution_context_reset_t* reset) {
+  if (!reset) return;
+  hipExecutionCtx_t* reset_contexts = reset->contexts;
+  const iree_host_size_t reset_count = reset->count;
+  // Dynamic queue destruction may synchronously enter a backend wait. Drain
+  // every such release while the exact public handle is still registered as
+  // the teardown ledger.
+  for (iree_host_size_t i = 0; i < reset_count; ++i) {
+    iree_hip_execution_context_deinitialize(reset_contexts[i],
+                                            /*abort_captures=*/true);
+  }
+
+  // With preparation and potentially waiting teardown complete, atomically
+  // consume only the exact pinned incarnations. Writer admission makes a
+  // mismatch impossible; assert instead of restoring detached state.
+  iree_slim_mutex_lock(&iree_hip_execution_context_registry.mutex);
+  for (iree_host_size_t i = 0; i < reset_count; ++i) {
+    hipExecutionCtx_t* link = &iree_hip_execution_context_registry.head;
+    while (*link && *link != reset_contexts[i]) {
+      link = &(*link)->next_live_context;
+    }
+    IREE_ASSERT(*link == reset_contexts[i],
+                "prepared execution handle changed under lifecycle writer");
+    if (*link == reset_contexts[i]) {
+      *link = reset_contexts[i]->next_live_context;
+      reset_contexts[i]->next_live_context = NULL;
+    }
+  }
+  iree_slim_mutex_unlock(&iree_hip_execution_context_registry.mutex);
+
+  for (iree_host_size_t i = 0; i < reset_count; ++i) {
+    iree_hip_vmm_test_notify_execution_context_taken(reset_contexts[i]);
+    // Drop the transferred registry ownership and the preparation pin.
+    iree_hip_execution_context_release(reset_contexts[i]);
+    iree_hip_execution_context_release(reset_contexts[i]);
+  }
+  iree_allocator_free(iree_allocator_system(), reset_contexts);
+  *reset = (iree_hip_execution_context_reset_t){0};
 }
 
-hipError_t iree_hip_execution_context_reset_all(void) {
-  return iree_hip_execution_context_reset_matching(/*reset_all=*/true, 0);
+void iree_hip_execution_context_cancel_reset(
+    iree_hip_execution_context_reset_t* reset) {
+  if (!reset) return;
+  for (size_t i = 0; i < reset->count; ++i) {
+    iree_hip_execution_context_release(reset->contexts[i]);
+  }
+  iree_allocator_free(iree_allocator_system(), reset->contexts);
+  *reset = (iree_hip_execution_context_reset_t){0};
+}
+
+hipError_t iree_hip_execution_context_prepare_reset_device(
+    hipDevice_t device, iree_hip_execution_context_reset_t* out_reset) {
+  return iree_hip_execution_context_prepare_reset_matching(
+      /*reset_all=*/false, device, out_reset);
+}
+
+hipError_t iree_hip_execution_context_prepare_reset_all(
+    iree_hip_execution_context_reset_t* out_reset) {
+  return iree_hip_execution_context_prepare_reset_matching(
+      /*reset_all=*/true, 0, out_reset);
 }

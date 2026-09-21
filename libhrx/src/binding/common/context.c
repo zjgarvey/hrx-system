@@ -8,16 +8,213 @@
 
 #include "common/internal.h"
 #include "common/stream.h"
+#include "common/tls.h"
 #include "iree/base/internal/math.h"
+#include "iree/base/threading/call_once.h"
 
 //===----------------------------------------------------------------------===//
 // Global state
 //===----------------------------------------------------------------------===//
 
-// Thread-local current context.
-static IREE_THREAD_LOCAL iree_hal_streaming_context_t*
-    iree_hal_streaming_current_context = NULL;
+// Stable OS-thread identity used for capture and per-thread-stream ownership.
+// Context state itself is stored through the binding TLS key below; on Windows
+// that makes it coherently fiber-local with its FLS destructor.
 static IREE_THREAD_LOCAL int iree_hal_streaming_thread_token_storage;
+
+// Counts owning context references held in every TLS current slot and push/pop
+// stack, plus short-lived teardown sentinels. Global teardown uses this to
+// reject while another execution context could still release an old-generation
+// context through a retired registry.
+static iree_atomic_int32_t iree_hal_streaming_tls_context_reference_count =
+    IREE_ATOMIC_VAR_INIT(0);
+
+typedef struct iree_hal_streaming_context_stack_t {
+  iree_hal_streaming_context_t** contexts;
+  iree_host_size_t depth;
+  iree_host_size_t capacity;
+  iree_allocator_t allocator;
+} iree_hal_streaming_context_stack_t;
+
+// Complete context state associated with one binding TLS value. Keeping the
+// current slot, stack, and reference ledger in the same object is required on
+// Windows, where FLS destructors can run on fiber deletion as well as thread
+// exit. A destructor must never act on unrelated compiler thread-local state.
+typedef struct iree_hal_streaming_context_tls_state_t {
+  iree_hal_streaming_context_t* current_context;
+  iree_hal_streaming_context_stack_t stack;
+  int32_t context_reference_count;
+} iree_hal_streaming_context_tls_state_t;
+
+#if !defined(IREE_PLATFORM_WINDOWS) || IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+// pthread TLS is used only as the exit callback trigger. Ordinary context
+// lookup remains a single compiler-TLS load on platforms where a thread and
+// the destructor execution context have the same lifetime.
+static IREE_THREAD_LOCAL iree_hal_streaming_context_tls_state_t
+    iree_hal_streaming_context_local_state;
+#endif  // !IREE_PLATFORM_WINDOWS || IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+
+// A non-NULL state in this key arranges to release every current/stack context
+// reference when its execution context exits. Without this cleanup a
+// short-lived submission thread or fiber could permanently pin an old runtime
+// generation and make process deinitialization either unsafe or impossible.
+static iree_once_flag iree_hal_streaming_context_tls_key_mutex_once =
+    IREE_ONCE_FLAG_INIT;
+static iree_slim_mutex_t iree_hal_streaming_context_tls_key_mutex;
+static iree_hal_streaming_tls_key_t iree_hal_streaming_context_tls_key =
+    IREE_HAL_STREAMING_TLS_KEY_INVALID;
+
+static void iree_hal_streaming_context_tls_state_cleanup_detached(
+    iree_hal_streaming_context_tls_state_t* state);
+
+static void iree_hal_streaming_context_tls_destroy(void* value) {
+  iree_hal_streaming_context_tls_state_cleanup_detached(
+      (iree_hal_streaming_context_tls_state_t*)value);
+}
+
+static void iree_hal_streaming_context_tls_key_mutex_initialize(void) {
+  iree_slim_mutex_initialize(&iree_hal_streaming_context_tls_key_mutex);
+}
+
+iree_status_t iree_hal_streaming_context_tls_initialize(void) {
+  iree_call_once(&iree_hal_streaming_context_tls_key_mutex_once,
+                 iree_hal_streaming_context_tls_key_mutex_initialize);
+  iree_slim_mutex_lock(&iree_hal_streaming_context_tls_key_mutex);
+  iree_status_t status = iree_ok_status();
+  if (iree_hal_streaming_context_tls_key ==
+      IREE_HAL_STREAMING_TLS_KEY_INVALID) {
+    status = iree_hal_streaming_tls_key_create(
+        &iree_hal_streaming_context_tls_key,
+        iree_hal_streaming_context_tls_destroy);
+  }
+  iree_slim_mutex_unlock(&iree_hal_streaming_context_tls_key_mutex);
+  return status;
+}
+
+iree_status_t iree_hal_streaming_context_tls_deinitialize(void) {
+  iree_call_once(&iree_hal_streaming_context_tls_key_mutex_once,
+                 iree_hal_streaming_context_tls_key_mutex_initialize);
+  iree_slim_mutex_lock(&iree_hal_streaming_context_tls_key_mutex);
+  iree_status_t status = iree_ok_status();
+  if (iree_hal_streaming_context_tls_key !=
+      IREE_HAL_STREAMING_TLS_KEY_INVALID) {
+    IREE_ASSERT(iree_hal_streaming_context_tls_reference_count() == 0);
+    status =
+        iree_hal_streaming_tls_key_delete(iree_hal_streaming_context_tls_key);
+    if (iree_status_is_ok(status)) {
+      iree_hal_streaming_context_tls_key = IREE_HAL_STREAMING_TLS_KEY_INVALID;
+    }
+  }
+  iree_slim_mutex_unlock(&iree_hal_streaming_context_tls_key_mutex);
+  return status;
+}
+
+static iree_hal_streaming_context_tls_state_t*
+iree_hal_streaming_context_tls_state(void) {
+#if defined(IREE_PLATFORM_WINDOWS) && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+  if (iree_hal_streaming_context_tls_key ==
+      IREE_HAL_STREAMING_TLS_KEY_INVALID) {
+    return NULL;
+  }
+  return (iree_hal_streaming_context_tls_state_t*)iree_hal_streaming_tls_get(
+      iree_hal_streaming_context_tls_key);
+#else
+  return iree_hal_streaming_context_local_state.context_reference_count > 0
+             ? &iree_hal_streaming_context_local_state
+             : NULL;
+#endif  // IREE_PLATFORM_WINDOWS && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+}
+
+// Returns the installed state, or an uninstalled empty state the caller must
+// either commit with reference_add or free with state_discard_empty.
+static iree_status_t iree_hal_streaming_context_tls_state_prepare(
+    iree_hal_streaming_context_tls_state_t** out_state,
+    bool* out_state_is_new) {
+  IREE_ASSERT_ARGUMENT(out_state);
+  IREE_ASSERT_ARGUMENT(out_state_is_new);
+  *out_state = iree_hal_streaming_context_tls_state();
+  *out_state_is_new = *out_state == NULL;
+  if (!*out_state_is_new) return iree_ok_status();
+#if defined(IREE_PLATFORM_WINDOWS) && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+      iree_allocator_system(), sizeof(**out_state), (void**)out_state));
+  memset(*out_state, 0, sizeof(**out_state));
+#else
+  *out_state = &iree_hal_streaming_context_local_state;
+#endif  // IREE_PLATFORM_WINDOWS && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+  return iree_ok_status();
+}
+
+static void iree_hal_streaming_context_tls_state_discard_empty(
+    iree_hal_streaming_context_tls_state_t* state) {
+  IREE_ASSERT(state->current_context == NULL);
+  IREE_ASSERT(state->stack.depth == 0);
+  IREE_ASSERT(state->context_reference_count == 0);
+  iree_allocator_free(state->stack.allocator, state->stack.contexts);
+#if defined(IREE_PLATFORM_WINDOWS) && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+  iree_allocator_free(iree_allocator_system(), state);
+#else
+  *state = (iree_hal_streaming_context_tls_state_t){0};
+#endif  // IREE_PLATFORM_WINDOWS && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+}
+
+// Releases only the backing object for a state that was detached and reset
+// before invoking callbacks. Compiler-TLS state may already have been reused
+// reentrantly and must not be inspected or cleared here.
+static void iree_hal_streaming_context_tls_state_free_detached(
+    iree_hal_streaming_context_tls_state_t* state) {
+#if defined(IREE_PLATFORM_WINDOWS) && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+  iree_allocator_free(iree_allocator_system(), state);
+#else
+  (void)state;
+#endif  // IREE_PLATFORM_WINDOWS && !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
+}
+
+static iree_status_t iree_hal_streaming_context_tls_reference_add(
+    iree_hal_streaming_context_tls_state_t* state, bool state_is_new) {
+  IREE_ASSERT(state);
+  IREE_ASSERT(state_is_new == (state->context_reference_count == 0));
+  if (state_is_new) {
+    IREE_RETURN_IF_ERROR(
+        iree_hal_streaming_tls_set(iree_hal_streaming_context_tls_key, state));
+  }
+  ++state->context_reference_count;
+  iree_atomic_fetch_add(&iree_hal_streaming_tls_context_reference_count, 1,
+                        iree_memory_order_acq_rel);
+  return iree_ok_status();
+}
+
+static void iree_hal_streaming_context_tls_reference_remove_committed(
+    iree_hal_streaming_context_tls_state_t* state) {
+  IREE_ASSERT(state->context_reference_count > 0);
+  --state->context_reference_count;
+  iree_atomic_fetch_sub(&iree_hal_streaming_tls_context_reference_count, 1,
+                        iree_memory_order_acq_rel);
+}
+
+// Removes one TLS reference. When this is the last reference, a teardown
+// sentinel keeps global cleanup excluded until the caller has released the
+// detached context and freed the detached state.
+static iree_status_t iree_hal_streaming_context_tls_reference_remove(
+    iree_hal_streaming_context_tls_state_t* state,
+    bool* out_teardown_sentinel_held) {
+  IREE_ASSERT(state->context_reference_count > 0);
+  IREE_ASSERT_ARGUMENT(out_teardown_sentinel_held);
+  *out_teardown_sentinel_held = false;
+  if (state->context_reference_count == 1) {
+    IREE_RETURN_IF_ERROR(
+        iree_hal_streaming_tls_set(iree_hal_streaming_context_tls_key, NULL));
+    iree_atomic_fetch_add(&iree_hal_streaming_tls_context_reference_count, 1,
+                          iree_memory_order_acq_rel);
+    *out_teardown_sentinel_held = true;
+  }
+  iree_hal_streaming_context_tls_reference_remove_committed(state);
+  return iree_ok_status();
+}
+
+static void iree_hal_streaming_context_tls_release_teardown_sentinel(void) {
+  iree_atomic_fetch_sub(&iree_hal_streaming_tls_context_reference_count, 1,
+                        iree_memory_order_acq_rel);
+}
 
 // Stream IDs identify timeline dependencies that can outlive the context that
 // created them. Keeping the namespace process-wide prevents a dependency from
@@ -25,19 +222,12 @@ static IREE_THREAD_LOCAL int iree_hal_streaming_thread_token_storage;
 static iree_atomic_uint64_t iree_hal_streaming_next_stream_id =
     IREE_ATOMIC_VAR_INIT(1);
 
-typedef struct iree_hal_streaming_context_stack_t {
-  iree_hal_streaming_context_t** contexts;
-  iree_host_size_t depth;
-  iree_host_size_t capacity;
-} iree_hal_streaming_context_stack_t;
-
-// Thread-local context stack for push/pop.
-static IREE_THREAD_LOCAL iree_hal_streaming_context_stack_t
-    iree_hal_streaming_context_stack = {
-        .contexts = NULL,
-        .depth = 0,
-        .capacity = 0,
-};
+static void iree_hal_streaming_context_stack_free_storage(
+    iree_hal_streaming_context_stack_t* stack) {
+  IREE_ASSERT(stack->depth == 0);
+  iree_allocator_free(stack->allocator, stack->contexts);
+  *stack = (iree_hal_streaming_context_stack_t){0};
+}
 
 //===----------------------------------------------------------------------===//
 // Context management
@@ -109,9 +299,15 @@ iree_status_t iree_hal_streaming_context_create(
       z0, iree_allocator_malloc(host_allocator, sizeof(*context),
                                 (void**)&context));
   iree_atomic_ref_count_init(&context->ref_count);
+  iree_atomic_store(&context->accepting_work, 1, iree_memory_order_relaxed);
+  iree_atomic_store(&context->teardown_quiesced, 0, iree_memory_order_relaxed);
   context->device = device_entry->hal_device;
   context->device_ordinal = device_entry->ordinal;
   context->device_entry = device_entry;
+  context->is_primary = false;
+  context->runtime_generation = device_entry->runtime_generation;
+  context->device_epoch =
+      iree_atomic_load(&device_entry->reset_epoch, iree_memory_order_acquire);
   context->queue = NULL;
   context->device_allocator =
       iree_hal_device_allocator(device_entry->hal_device);
@@ -157,6 +353,16 @@ iree_status_t iree_hal_streaming_context_create(
   context->limits.dev_runtime_pending_launch_count = 2048;  // 2048 launches
   context->limits.max_l2_fetch_granularity = 128;           // 128 bytes
   context->limits.persisting_l2_cache_size = 0;             // 0 = default
+  iree_hal_streaming_device_registry_t* device_registry =
+      iree_hal_streaming_device_registry();
+  context->lifecycle_begin =
+      device_registry ? device_registry->lifecycle_begin : NULL;
+  context->lifecycle_end =
+      device_registry ? device_registry->lifecycle_end : NULL;
+  context->pointer_resolver =
+      device_registry ? device_registry->pointer_resolver : NULL;
+  context->lifecycle_user_data =
+      device_registry ? device_registry->lifecycle_user_data : NULL;
 
   // Retain the HAL device.
   iree_hal_device_retain(context->device);
@@ -236,14 +442,18 @@ static void iree_hal_streaming_context_destroy(
     iree_allocator_free(context->host_allocator, context->peer_contexts);
   }
 
-  // Synchronize all streams before detaching them from the context; pending
-  // command buffers require the context/device to flush correctly.
-  iree_status_t status = iree_hal_streaming_context_synchronize(context);
-  if (!iree_status_is_ok(status)) {
-    iree_status_fprint(stderr, status);
-    iree_status_free(status);
+  // Prepared teardown certifies this wait while the last public owner is still
+  // published. Other destruction paths retain the conservative wait.
+  if (iree_atomic_load(&context->teardown_quiesced,
+                       iree_memory_order_acquire) == 0) {
+    iree_status_t status = iree_hal_streaming_context_synchronize(context);
+    if (!iree_status_is_ok(status)) {
+      iree_status_fprint(stderr, status);
+      iree_status_free(status);
+    }
   }
-  status = iree_hal_streaming_memory_release_terminal_async_frees(context);
+  iree_status_t status =
+      iree_hal_streaming_memory_release_terminal_async_frees(context);
   if (!iree_status_is_ok(status)) {
     iree_status_fprint(stderr, status);
     iree_status_free(status);
@@ -377,6 +587,17 @@ void iree_hal_streaming_context_release(iree_hal_streaming_context_t* context) {
   }
 }
 
+void iree_hal_streaming_context_discard_unpublished(
+    iree_hal_streaming_context_t* context) {
+  if (!context) return;
+  // Context creation publishes an owning global-list edge before returning.
+  // A caller that fails before publishing its native handle must remove that
+  // edge before dropping the creator edge or the list will pin an unreachable
+  // context indefinitely.
+  iree_hal_streaming_unregister_context(context);
+  iree_hal_streaming_context_release(context);
+}
+
 iree_hal_streaming_context_flags_t iree_hal_streaming_context_flags(
     iree_hal_streaming_context_t* context) {
   IREE_ASSERT_ARGUMENT(context);
@@ -384,28 +605,64 @@ iree_hal_streaming_context_flags_t iree_hal_streaming_context_flags(
 }
 
 iree_hal_streaming_context_t* iree_hal_streaming_context_current(void) {
-  iree_hal_streaming_context_t* context = iree_hal_streaming_current_context;
-  return context;
+  iree_hal_streaming_context_tls_state_t* state =
+      iree_hal_streaming_context_tls_state();
+  return state ? state->current_context : NULL;
 }
 
 uintptr_t iree_hal_streaming_current_thread_token(void) {
   return (uintptr_t)&iree_hal_streaming_thread_token_storage;
 }
 
-void iree_hal_streaming_context_set_current(
+iree_status_t iree_hal_streaming_context_set_current(
     iree_hal_streaming_context_t* context) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
-  // Retain new context and release old one.
+  iree_hal_streaming_context_tls_state_t* state =
+      iree_hal_streaming_context_tls_state();
   iree_hal_streaming_context_t* old_context =
-      iree_hal_streaming_current_context;
+      state ? state->current_context : NULL;
+  bool state_is_new = false;
+  bool teardown_sentinel_held = false;
+  iree_status_t status = iree_ok_status();
+  if (!old_context && context) {
+    status =
+        iree_hal_streaming_context_tls_state_prepare(&state, &state_is_new);
+    if (iree_status_is_ok(status)) {
+      status =
+          iree_hal_streaming_context_tls_reference_add(state, state_is_new);
+    }
+  } else if (old_context && !context) {
+    status = iree_hal_streaming_context_tls_reference_remove(
+        state, &teardown_sentinel_held);
+  }
+  if (!iree_status_is_ok(status)) {
+    if (state_is_new) {
+      iree_hal_streaming_context_tls_state_discard_empty(state);
+    }
+    IREE_TRACE_ZONE_END(z0);
+    return status;
+  }
   if (context) {
     iree_hal_streaming_context_retain(context);
   }
-  iree_hal_streaming_current_context = context;
+  iree_hal_streaming_context_stack_t detached_stack = {0};
+  if (teardown_sentinel_held) {
+    detached_stack = state->stack;
+    state->current_context = NULL;
+    state->stack = (iree_hal_streaming_context_stack_t){0};
+  } else if (state) {
+    state->current_context = context;
+  }
   iree_hal_streaming_context_release(old_context);
+  if (teardown_sentinel_held) {
+    iree_hal_streaming_context_stack_free_storage(&detached_stack);
+    iree_hal_streaming_context_tls_state_free_detached(state);
+    iree_hal_streaming_context_tls_release_teardown_sentinel();
+  }
 
   IREE_TRACE_ZONE_END(z0);
+  return iree_ok_status();
 }
 
 iree_status_t iree_hal_streaming_context_push(
@@ -413,31 +670,55 @@ iree_status_t iree_hal_streaming_context_push(
   IREE_ASSERT_ARGUMENT(context);
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  iree_hal_streaming_context_tls_state_t* state = NULL;
+  bool state_is_new = false;
+  iree_status_t status =
+      iree_hal_streaming_context_tls_state_prepare(&state, &state_is_new);
+  if (!iree_status_is_ok(status)) {
+    IREE_TRACE_ZONE_END(z0);
+    return status;
+  }
+
   // Grow stack if needed.
-  if (iree_hal_streaming_context_stack.depth >=
-      iree_hal_streaming_context_stack.capacity) {
+  if (state->stack.depth >= state->stack.capacity) {
     iree_host_size_t new_capacity =
-        iree_hal_streaming_context_stack.capacity
-            ? iree_hal_streaming_context_stack.capacity * 2
-            : 8;
-    IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_allocator_realloc(
-                context->host_allocator,
-                new_capacity * sizeof(iree_hal_streaming_context_t*),
-                (void**)&iree_hal_streaming_context_stack.contexts));
-    iree_hal_streaming_context_stack.capacity = new_capacity;
+        state->stack.capacity ? state->stack.capacity * 2 : 8;
+    const iree_allocator_t stack_allocator = state->stack.capacity
+                                                 ? state->stack.allocator
+                                                 : context->host_allocator;
+    status = iree_allocator_realloc(
+        stack_allocator, new_capacity * sizeof(iree_hal_streaming_context_t*),
+        (void**)&state->stack.contexts);
+    if (!iree_status_is_ok(status)) {
+      if (state_is_new) {
+        iree_hal_streaming_context_tls_state_discard_empty(state);
+      }
+      IREE_TRACE_ZONE_END(z0);
+      return status;
+    }
+    state->stack.capacity = new_capacity;
+    state->stack.allocator = stack_allocator;
+  }
+
+  // Install the thread-exit marker before adding the first owning TLS
+  // reference. A failure leaves the current slot and stack unchanged.
+  status = iree_hal_streaming_context_tls_reference_add(state, state_is_new);
+  if (!iree_status_is_ok(status)) {
+    if (state_is_new) {
+      iree_hal_streaming_context_tls_state_discard_empty(state);
+    }
+    IREE_TRACE_ZONE_END(z0);
+    return status;
   }
 
   // Push current context onto stack.
-  if (iree_hal_streaming_current_context) {
-    iree_hal_streaming_context_stack
-        .contexts[iree_hal_streaming_context_stack.depth++] =
-        iree_hal_streaming_current_context;
+  if (state->current_context) {
+    state->stack.contexts[state->stack.depth++] = state->current_context;
   }
 
   // Set new current context.
   iree_hal_streaming_context_retain(context);
-  iree_hal_streaming_current_context = context;
+  state->current_context = context;
 
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
@@ -448,27 +729,204 @@ iree_status_t iree_hal_streaming_context_pop(
   IREE_TRACE_ZONE_BEGIN(z0);
   if (out_context) *out_context = NULL;
 
-  // Release current context.
-  if (iree_hal_streaming_current_context) {
-    if (out_context) {
-      *out_context = iree_hal_streaming_current_context;
-    } else {
-      iree_hal_streaming_context_release(iree_hal_streaming_current_context);
-    }
+  iree_hal_streaming_context_tls_state_t* state =
+      iree_hal_streaming_context_tls_state();
+  if (!state) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_ok_status();
   }
 
-  // Pop from stack.
-  if (iree_hal_streaming_context_stack.depth > 0) {
-    iree_hal_streaming_current_context =
-        iree_hal_streaming_context_stack
-            .contexts[--iree_hal_streaming_context_stack.depth];
-  } else {
-    iree_hal_streaming_current_context = NULL;
+  // Release current context.
+  if (state->current_context) {
+    iree_hal_streaming_context_t* popped_context = state->current_context;
+    bool teardown_sentinel_held = false;
+    iree_status_t status = iree_hal_streaming_context_tls_reference_remove(
+        state, &teardown_sentinel_held);
+    if (!iree_status_is_ok(status)) {
+      IREE_TRACE_ZONE_END(z0);
+      return status;
+    }
+    if (state->stack.depth > 0) {
+      state->current_context = state->stack.contexts[--state->stack.depth];
+    } else {
+      state->current_context = NULL;
+    }
+    if (out_context) {
+      // Public context handles are non-owning values backed by their normal
+      // registry/public ownership. Popping only removes the TLS ownership; it
+      // must not silently transfer that reference to an untracked raw handle.
+      *out_context = popped_context;
+    }
+    iree_hal_streaming_context_stack_t detached_stack = {0};
+    if (teardown_sentinel_held) {
+      detached_stack = state->stack;
+      state->stack = (iree_hal_streaming_context_stack_t){0};
+    }
+    iree_hal_streaming_context_release(popped_context);
+    if (teardown_sentinel_held) {
+      iree_hal_streaming_context_stack_free_storage(&detached_stack);
+      iree_hal_streaming_context_tls_state_free_detached(state);
+      iree_hal_streaming_context_tls_release_teardown_sentinel();
+    }
+  } else if (state->stack.depth > 0) {
+    // A caller may explicitly clear the current slot while pushed contexts
+    // remain. Move the top stack ownership into the current slot without
+    // changing the number of TLS references.
+    state->current_context = state->stack.contexts[--state->stack.depth];
   }
 
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
 }
+
+iree_host_size_t iree_hal_streaming_context_tls_reference_count(void) {
+  const int32_t count =
+      iree_atomic_load(&iree_hal_streaming_tls_context_reference_count,
+                       iree_memory_order_acquire);
+  IREE_ASSERT(count >= 0);
+  return (iree_host_size_t)count;
+}
+
+iree_host_size_t iree_hal_streaming_context_current_thread_tls_reference_count(
+    void) {
+  iree_hal_streaming_context_tls_state_t* state =
+      iree_hal_streaming_context_tls_state();
+  IREE_ASSERT(!state || state->context_reference_count > 0);
+  return state ? (iree_host_size_t)state->context_reference_count : 0;
+}
+
+iree_host_size_t
+iree_hal_streaming_context_current_thread_tls_reference_count_for(
+    const iree_hal_streaming_context_t* context) {
+  if (!context) return 0;
+  iree_hal_streaming_context_tls_state_t* state =
+      iree_hal_streaming_context_tls_state();
+  if (!state) return 0;
+  iree_host_size_t count = state->current_context == context ? 1 : 0;
+  for (iree_host_size_t i = 0; i < state->stack.depth; ++i) {
+    if (state->stack.contexts[i] == context) ++count;
+  }
+  return count;
+}
+
+iree_status_t iree_hal_streaming_context_snapshot_all(
+    iree_hal_streaming_context_t*** out_contexts,
+    iree_host_size_t* out_context_count) {
+  IREE_ASSERT_ARGUMENT(out_contexts);
+  IREE_ASSERT_ARGUMENT(out_context_count);
+  *out_contexts = NULL;
+  *out_context_count = 0;
+  iree_hal_streaming_device_registry_t* registry =
+      iree_hal_streaming_device_registry();
+  if (!registry) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "HAL stream layer not initialized");
+  }
+
+  iree_host_size_t count = 0;
+  iree_slim_mutex_lock(&registry->context_list.mutex);
+  for (iree_hal_streaming_context_t* context = registry->context_list.head;
+       context; context = context->context_list_entry.next) {
+    ++count;
+  }
+  iree_hal_streaming_context_t** contexts = NULL;
+  iree_status_t status = iree_ok_status();
+  if (count > 0) {
+    iree_host_size_t allocation_size = 0;
+    if (IREE_UNLIKELY(!iree_host_size_checked_mul(count, sizeof(contexts[0]),
+                                                  &allocation_size))) {
+      status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                "context snapshot size overflow");
+    } else {
+      status = iree_allocator_malloc(iree_allocator_system(), allocation_size,
+                                     (void**)&contexts);
+    }
+  }
+  if (iree_status_is_ok(status)) {
+    iree_host_size_t index = 0;
+    for (iree_hal_streaming_context_t* context = registry->context_list.head;
+         context; context = context->context_list_entry.next) {
+      contexts[index++] = context;
+      iree_hal_streaming_context_retain(context);
+    }
+    *out_contexts = contexts;
+    *out_context_count = index;
+  }
+  iree_slim_mutex_unlock(&registry->context_list.mutex);
+  return status;
+}
+
+void iree_hal_streaming_context_release_snapshot_all(
+    iree_hal_streaming_context_t** contexts, iree_host_size_t context_count) {
+  for (iree_host_size_t i = 0; i < context_count; ++i) {
+    iree_hal_streaming_context_release(contexts[i]);
+  }
+  iree_allocator_free(iree_allocator_system(), contexts);
+}
+
+iree_status_t iree_hal_streaming_context_clear_current_thread(void) {
+  iree_hal_streaming_context_tls_state_t* state =
+      iree_hal_streaming_context_tls_state();
+  if (!state) return iree_ok_status();
+
+  // This is the only fallible transition. Until the complete state has been
+  // detached from the key, no current pointer, stack entry, owning reference,
+  // count, or allocation is mutated, so a clear failure is exactly retryable.
+  IREE_RETURN_IF_ERROR(
+      iree_hal_streaming_tls_set(iree_hal_streaming_context_tls_key, NULL));
+  iree_hal_streaming_context_tls_state_cleanup_detached(state);
+  return iree_ok_status();
+}
+
+static void iree_hal_streaming_context_tls_state_cleanup_detached(
+    iree_hal_streaming_context_tls_state_t* state) {
+  if (!state) return;
+
+  const int32_t reference_count = state->context_reference_count;
+  IREE_ASSERT(reference_count > 0);
+  IREE_ASSERT((iree_host_size_t)reference_count ==
+              state->stack.depth + (state->current_context ? 1 : 0));
+
+  // The old references still exclude global teardown while the sentinel is
+  // installed. Subtract them only after the sentinel is visible, ensuring the
+  // global count cannot pass through zero before release/destruction finishes.
+  iree_atomic_fetch_add(&iree_hal_streaming_tls_context_reference_count, 1,
+                        iree_memory_order_acq_rel);
+
+  iree_hal_streaming_context_t* current_context = state->current_context;
+  iree_hal_streaming_context_stack_t stack = state->stack;
+  state->current_context = NULL;
+  state->stack = (iree_hal_streaming_context_stack_t){0};
+  state->context_reference_count = 0;
+  iree_atomic_fetch_sub(&iree_hal_streaming_tls_context_reference_count,
+                        reference_count, iree_memory_order_acq_rel);
+
+  // The TLS key and complete local state were detached before any release.
+  // Reentrant callbacks therefore create and install a distinct valid state.
+  iree_hal_streaming_context_release(current_context);
+  while (stack.depth > 0) {
+    iree_hal_streaming_context_release(stack.contexts[--stack.depth]);
+  }
+  iree_hal_streaming_context_stack_free_storage(&stack);
+  iree_hal_streaming_context_tls_state_free_detached(state);
+
+  // Keep teardown excluded through context destruction and stack/state frees.
+  iree_hal_streaming_context_tls_release_teardown_sentinel();
+}
+
+#if defined(IREE_HAL_STREAMING_TEST_INSTRUMENTATION)
+bool iree_hal_streaming_context_tls_test_marker_is_set(void) {
+  return iree_hal_streaming_context_tls_state() != NULL;
+}
+
+iree_status_t iree_hal_streaming_context_tls_test_reset(void) {
+  IREE_ASSERT(iree_hal_streaming_context_tls_state() == NULL);
+  IREE_ASSERT(iree_hal_streaming_context_tls_reference_count() == 0);
+  iree_hal_streaming_tls_test_inject_failures(
+      IREE_HAL_STREAMING_TLS_TEST_FAILURE_NONE);
+  return iree_hal_streaming_context_tls_deinitialize();
+}
+#endif  // IREE_HAL_STREAMING_TEST_INSTRUMENTATION
 
 iree_status_t iree_hal_streaming_context_limit(
     iree_hal_streaming_context_t* context,
@@ -1067,6 +1525,129 @@ iree_status_t iree_hal_streaming_context_wait_idle(
       /*flush_before_wait=*/true);
 }
 
+iree_status_t iree_hal_streaming_context_quiesce_for_teardown(
+    iree_hal_streaming_context_t* context,
+    iree_hal_streaming_teardown_wait_observer_t wait_observer,
+    void* wait_observer_user_data, iree_status_t* out_execution_status) {
+  IREE_ASSERT_ARGUMENT(context);
+  IREE_ASSERT_ARGUMENT(out_execution_status);
+  *out_execution_status = iree_ok_status();
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  // Exclusive binding teardown prevents new submissions. Retain the complete
+  // stream set before flushing so destruction cannot invalidate a wait target.
+  iree_hal_streaming_stream_t** streams = NULL;
+  iree_host_size_t stream_count = 0;
+  iree_status_t status = iree_hal_streaming_context_snapshot_streams(
+      context, &streams, &stream_count);
+  if (!iree_status_is_ok(status)) {
+    IREE_TRACE_ZONE_END(z0);
+    return status;
+  }
+
+  // Flush every stream even if one flush fails. A flush error remains fatal:
+  // unlike a verified terminal wait result it does not prove that accepted
+  // but unsubmitted work has reached a terminal state.
+  for (iree_host_size_t i = 0; i < stream_count; ++i) {
+    if (streams[i]) {
+      status =
+          iree_status_join(status, iree_hal_streaming_stream_flush(streams[i]));
+    }
+  }
+  if (context->default_stream) {
+    status = iree_status_join(
+        status, iree_hal_streaming_stream_flush(context->default_stream));
+  }
+
+  // Wait every captured frontier regardless of prior stream results. This is
+  // teardown: returning the first error early could leave another stream
+  // executing against storage the caller is about to retire.
+  for (iree_host_size_t i = 0; i < stream_count; ++i) {
+    if (!streams[i]) continue;
+    iree_status_t execution_status = iree_ok_status();
+    status = iree_status_join(
+        status, iree_hal_streaming_stream_wait_submitted_or_terminal(
+                    streams[i], wait_observer, wait_observer_user_data,
+                    &execution_status));
+    *out_execution_status =
+        iree_status_join(*out_execution_status, execution_status);
+  }
+  if (context->default_stream) {
+    iree_status_t execution_status = iree_ok_status();
+    status = iree_status_join(
+        status, iree_hal_streaming_stream_wait_submitted_or_terminal(
+                    context->default_stream, wait_observer,
+                    wait_observer_user_data, &execution_status));
+    *out_execution_status =
+        iree_status_join(*out_execution_status, execution_status);
+  }
+
+  // Context event records are outside the ordinary stream list but may still
+  // reference teardown resources. Their terminal failure has the same
+  // completed-frontier meaning as a stream timeline failure.
+  iree_hal_semaphore_t* event_semaphore = NULL;
+  uint64_t event_value = 0;
+  iree_slim_mutex_lock(&context->event_record_mutex);
+  if (context->event_record_timeline.pending_value > 0) {
+    event_semaphore = context->event_record_timeline.semaphore;
+    event_value = context->event_record_timeline.pending_value;
+    iree_hal_semaphore_retain(event_semaphore);
+  }
+  iree_slim_mutex_unlock(&context->event_record_mutex);
+  if (event_semaphore) {
+    iree_status_t wait_status = iree_hal_semaphore_wait(
+        event_semaphore, event_value, iree_infinite_timeout(),
+        IREE_ASYNC_WAIT_FLAG_NONE);
+    if (!iree_status_is_ok(wait_status)) {
+      uint64_t current_value = 0;
+      iree_status_t query_status =
+          iree_hal_semaphore_query(event_semaphore, &current_value);
+      if (iree_status_is_ok(query_status)) {
+        status = iree_status_join(status, wait_status);
+      } else {
+        iree_status_ignore(wait_status);
+        *out_execution_status =
+            iree_status_join(*out_execution_status, query_status);
+      }
+    }
+  }
+  iree_hal_semaphore_release(event_semaphore);
+
+  iree_hal_streaming_context_release_stream_snapshot(context, streams,
+                                                     stream_count);
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
+iree_status_t iree_hal_streaming_context_quiesce_all_for_teardown(
+    iree_status_t* out_execution_status) {
+  IREE_ASSERT_ARGUMENT(out_execution_status);
+  *out_execution_status = iree_ok_status();
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  iree_hal_streaming_context_t** contexts = NULL;
+  iree_host_size_t context_count = 0;
+  iree_status_t status =
+      iree_hal_streaming_context_snapshot_all(&contexts, &context_count);
+  if (!iree_status_is_ok(status)) {
+    IREE_TRACE_ZONE_END(z0);
+    return status;
+  }
+
+  for (iree_host_size_t i = 0; i < context_count; ++i) {
+    iree_status_t execution_status = iree_ok_status();
+    status = iree_status_join(status,
+                              iree_hal_streaming_context_quiesce_for_teardown(
+                                  contexts[i], NULL, NULL, &execution_status));
+    *out_execution_status =
+        iree_status_join(*out_execution_status, execution_status);
+  }
+
+  iree_hal_streaming_context_release_snapshot_all(contexts, context_count);
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
 iree_status_t iree_hal_streaming_context_flush(
     iree_hal_streaming_context_t* context) {
   IREE_ASSERT_ARGUMENT(context);
@@ -1317,6 +1898,229 @@ iree_status_t iree_hal_streaming_context_synchronize_all(void) {
     iree_allocator_free(device_registry->host_allocator, contexts);
   }
 
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
+bool iree_hal_streaming_context_is_current(
+    const iree_hal_streaming_context_t* context) {
+  if (!context || iree_atomic_load(&context->accepting_work,
+                                   iree_memory_order_acquire) == 0) {
+    return false;
+  }
+  iree_hal_streaming_device_registry_t* registry =
+      iree_hal_streaming_device_registry();
+  // Common-layer tests and embedders may construct a context directly from an
+  // unregistered device entry. Runtime generations start at one, so zero is
+  // the explicit standalone domain with no process reset epoch to compare.
+  if (!registry && context->runtime_generation == 0) return true;
+  if (!registry ||
+      context->runtime_generation != registry->runtime_generation ||
+      context->device_ordinal >= registry->device_count) {
+    return false;
+  }
+  const iree_hal_streaming_device_t* device =
+      &registry->devices[context->device_ordinal];
+  return context->device_epoch ==
+         iree_atomic_load(&device->reset_epoch, iree_memory_order_acquire);
+}
+
+void iree_hal_streaming_context_retire(iree_hal_streaming_context_t* context) {
+  if (context) {
+    iree_atomic_store(&context->accepting_work, 0, iree_memory_order_release);
+  }
+}
+
+void iree_hal_streaming_context_mark_teardown_quiesced(
+    iree_hal_streaming_context_t* context) {
+  if (!context) return;
+  IREE_ASSERT(iree_atomic_load(&context->accepting_work,
+                               iree_memory_order_acquire) == 0);
+  iree_atomic_store(&context->teardown_quiesced, 1, iree_memory_order_release);
+}
+
+bool iree_hal_streaming_context_is_teardown_certified(
+    iree_hal_streaming_context_t* context) {
+  if (!context ||
+      iree_atomic_load(&context->accepting_work, iree_memory_order_acquire) !=
+          0 ||
+      iree_atomic_load(&context->teardown_quiesced,
+                       iree_memory_order_acquire) == 0 ||
+      iree_atomic_load(&context->capture_stream_count,
+                       iree_memory_order_acquire) != 0) {
+    return false;
+  }
+
+  iree_slim_mutex_lock(&context->stream_list_mutex);
+  const bool streams_detached = context->stream_count == 0 &&
+                                context->default_stream == NULL &&
+                                context->stream_wait_frontier == NULL;
+  iree_slim_mutex_unlock(&context->stream_list_mutex);
+  return streams_detached;
+}
+
+void iree_hal_streaming_context_detach_streams_quiesced(
+    iree_hal_streaming_context_t* context, bool abort_captures) {
+  if (!context) return;
+  IREE_ASSERT(iree_atomic_load(&context->accepting_work,
+                               iree_memory_order_acquire) == 0);
+  IREE_ASSERT(iree_atomic_load(&context->teardown_quiesced,
+                               iree_memory_order_acquire) != 0);
+
+  iree_slim_mutex_lock(&context->stream_list_mutex);
+  const iree_host_size_t stream_count = context->stream_count;
+  context->stream_count = 0;
+  iree_hal_streaming_stream_t* default_stream = context->default_stream;
+  context->default_stream = NULL;
+  iree_hal_fence_t* stream_wait_frontier = context->stream_wait_frontier;
+  context->stream_wait_frontier = NULL;
+  iree_slim_mutex_unlock(&context->stream_list_mutex);
+
+  for (iree_host_size_t i = 0; i < stream_count; ++i) {
+    iree_hal_streaming_stream_t* stream = context->streams[i];
+    if (abort_captures) {
+      iree_hal_streaming_stream_abort_capture_quiesced(stream);
+    }
+    iree_hal_streaming_stream_detach_quiesced(context, stream);
+  }
+  for (iree_host_size_t i = 0; i < stream_count; ++i) {
+    iree_hal_streaming_stream_release(context->streams[i]);
+  }
+  iree_hal_fence_release(stream_wait_frontier);
+  iree_hal_streaming_stream_release(default_stream);
+}
+
+iree_status_t iree_hal_streaming_context_operation_begin(
+    iree_hal_streaming_context_t* context) {
+  if (!context) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "context is required");
+  }
+  if (context->lifecycle_begin) {
+    return context->lifecycle_begin(context->lifecycle_user_data, context);
+  }
+  return iree_hal_streaming_context_is_current(context)
+             ? iree_ok_status()
+             : iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                                "context belongs to a retired runtime epoch");
+}
+
+void iree_hal_streaming_context_operation_end(
+    iree_hal_streaming_context_t* context) {
+  if (context && context->lifecycle_end) {
+    context->lifecycle_end(context->lifecycle_user_data);
+  }
+}
+
+iree_status_t iree_hal_streaming_device_prepare_epoch_advance(
+    iree_hal_streaming_device_ordinal_t device_ordinal,
+    uint64_t* out_expected_epoch, uint64_t* out_next_epoch) {
+  IREE_ASSERT_ARGUMENT(out_expected_epoch);
+  IREE_ASSERT_ARGUMENT(out_next_epoch);
+  *out_expected_epoch = 0;
+  *out_next_epoch = 0;
+  iree_hal_streaming_device_t* device =
+      iree_hal_streaming_device_entry(device_ordinal);
+  if (!device) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "invalid device ordinal");
+  }
+  const uint64_t expected_epoch =
+      iree_atomic_load(&device->reset_epoch, iree_memory_order_acquire);
+  // UINT64_MAX is the permanently invalid sentinel. Never publish it as a
+  // successful next epoch: the final usable value is UINT64_MAX - 1 and a
+  // reset starting there is already exhausted.
+  if (expected_epoch >= UINT64_MAX - 1) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "device reset epoch is exhausted");
+  }
+  *out_expected_epoch = expected_epoch;
+  *out_next_epoch = expected_epoch + 1;
+  return iree_ok_status();
+}
+
+void iree_hal_streaming_device_commit_epoch_advance(
+    iree_hal_streaming_device_ordinal_t device_ordinal, uint64_t expected_epoch,
+    uint64_t next_epoch) {
+  iree_hal_streaming_device_t* device =
+      iree_hal_streaming_device_entry(device_ordinal);
+  IREE_ASSERT(device);
+  IREE_ASSERT(expected_epoch < UINT64_MAX - 1);
+  IREE_ASSERT(next_epoch == expected_epoch + 1);
+  IREE_ASSERT(next_epoch != UINT64_MAX);
+  uint64_t observed_epoch = expected_epoch;
+  const bool exchanged = iree_atomic_compare_exchange_strong(
+      &device->reset_epoch, &observed_epoch, next_epoch,
+      iree_memory_order_acq_rel, iree_memory_order_acquire);
+  IREE_ASSERT(exchanged,
+              "device reset epoch changed after teardown preparation");
+  if (IREE_UNLIKELY(!exchanged)) {
+    iree_atomic_store(&device->reset_epoch, UINT64_MAX,
+                      iree_memory_order_release);
+  }
+}
+
+iree_status_t iree_hal_streaming_context_synchronize_device(
+    iree_hal_streaming_device_ordinal_t device_ordinal) {
+  IREE_TRACE_ZONE_BEGIN(z0);
+  iree_hal_streaming_device_registry_t* registry =
+      iree_hal_streaming_device_registry();
+  if (!registry || device_ordinal >= registry->device_count) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "invalid device ordinal");
+  }
+
+  iree_hal_streaming_context_t** contexts = NULL;
+  iree_host_size_t context_count = 0;
+  iree_host_size_t retained_count = 0;
+  iree_status_t status = iree_ok_status();
+  iree_slim_mutex_lock(&registry->context_list.mutex);
+  for (iree_hal_streaming_context_t* context = registry->context_list.head;
+       context; context = context->context_list_entry.next) {
+    if (context->runtime_generation == registry->runtime_generation &&
+        context->device_ordinal == device_ordinal) {
+      ++context_count;
+    }
+  }
+  if (context_count > 0) {
+    iree_host_size_t contexts_size = 0;
+    if (!iree_host_size_checked_mul(context_count, sizeof(contexts[0]),
+                                    &contexts_size)) {
+      status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                "context snapshot size overflow");
+    } else {
+      status = iree_allocator_malloc(registry->host_allocator, contexts_size,
+                                     (void**)&contexts);
+    }
+  }
+  if (iree_status_is_ok(status)) {
+    for (iree_hal_streaming_context_t* context = registry->context_list.head;
+         context; context = context->context_list_entry.next) {
+      if (context->runtime_generation != registry->runtime_generation ||
+          context->device_ordinal != device_ordinal) {
+        continue;
+      }
+      contexts[retained_count++] = context;
+      iree_hal_streaming_context_retain(context);
+    }
+    IREE_ASSERT(retained_count == context_count);
+  }
+  iree_slim_mutex_unlock(&registry->context_list.mutex);
+
+  for (iree_host_size_t i = 0; i < retained_count && iree_status_is_ok(status);
+       ++i) {
+    status = iree_hal_streaming_context_flush(contexts[i]);
+  }
+  for (iree_host_size_t i = 0; i < retained_count && iree_status_is_ok(status);
+       ++i) {
+    status = iree_hal_streaming_context_wait_idle(contexts[i],
+                                                  iree_infinite_timeout());
+  }
+  for (iree_host_size_t i = 0; i < retained_count; ++i) {
+    iree_hal_streaming_context_release(contexts[i]);
+  }
+  iree_allocator_free(registry->host_allocator, contexts);
   IREE_TRACE_ZONE_END(z0);
   return status;
 }

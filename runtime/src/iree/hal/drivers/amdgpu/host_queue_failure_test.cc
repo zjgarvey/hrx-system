@@ -405,7 +405,7 @@ TEST_F(HostQueueFailureTest, SubmissionAfterQueueFailureIsRejected) {
   const iree_hal_semaphore_list_t late_signal_list =
       MakeSemaphoreList(&late_signal_semaphore_ptr, &late_signal_value);
   IREE_EXPECT_STATUS_IS(
-      IREE_STATUS_CANCELLED,
+      kInjectedFailureCode,
       iree_hal_queue_fill(test_device.queue(), iree_hal_semaphore_list_empty(),
                           late_signal_list, target_buffer,
                           /*target_offset=*/0, sizeof(pattern), &pattern,
@@ -436,26 +436,54 @@ struct TeardownWaitHook {
   iree_atomic_int32_t armed;
   // Set once that wait has been reached.
   iree_atomic_int32_t reached;
+  // Number of armed teardown waits that entered the real HSA wait.
+  iree_atomic_int32_t wait_count;
+  // When set, an observed teardown wait remains inside the hook after the real
+  // HSA wait returns until |allow_wait_return| is published. This lets the
+  // failure thread prove failure delivery while the sealer is still unable to
+  // consume the queue-owned error status.
+  iree_atomic_int32_t hold_after_wait;
+  // Set once the failure thread has finished its pre-consumption observations.
+  iree_atomic_int32_t allow_wait_return;
   // Posted with |reached|.
   iree_notification_t reached_notification;
 };
 
 TeardownWaitHook g_teardown_wait_hook;
 
+static bool TeardownWaitMayReturn(void* user_data) {
+  TeardownWaitHook* hook = (TeardownWaitHook*)user_data;
+  return iree_atomic_load(&hook->allow_wait_return,
+                          iree_memory_order_acquire) != 0;
+}
+
 static uint32_t HSA_API TeardownWaitHookEntry(
     uint32_t signal_count, hsa_signal_t* signals, hsa_signal_condition_t* conds,
     hsa_signal_value_t* values, uint64_t timeout_hint,
     hsa_wait_state_t wait_hint, hsa_signal_value_t* satisfying_value) {
-  if (std::this_thread::get_id() == g_teardown_wait_hook.thread &&
+  const bool observed_teardown_wait =
+      std::this_thread::get_id() == g_teardown_wait_hook.thread &&
       iree_atomic_exchange(&g_teardown_wait_hook.armed, 0,
-                           iree_memory_order_acq_rel) != 0) {
+                           iree_memory_order_acq_rel) != 0;
+  if (observed_teardown_wait) {
+    iree_atomic_fetch_add(&g_teardown_wait_hook.wait_count, 1,
+                          iree_memory_order_acq_rel);
     iree_atomic_store(&g_teardown_wait_hook.reached, 1,
                       iree_memory_order_release);
     iree_notification_post(&g_teardown_wait_hook.reached_notification,
                            IREE_ALL_WAITERS);
   }
-  return g_teardown_wait_hook.next(signal_count, signals, conds, values,
-                                   timeout_hint, wait_hint, satisfying_value);
+  const uint32_t result =
+      g_teardown_wait_hook.next(signal_count, signals, conds, values,
+                                timeout_hint, wait_hint, satisfying_value);
+  if (observed_teardown_wait &&
+      iree_atomic_load(&g_teardown_wait_hook.hold_after_wait,
+                       iree_memory_order_acquire) != 0) {
+    iree_notification_await(&g_teardown_wait_hook.reached_notification,
+                            TeardownWaitMayReturn, &g_teardown_wait_hook,
+                            iree_infinite_timeout());
+  }
+  return result;
 }
 
 static bool TeardownWaitWasReached(void* user_data) {
@@ -489,6 +517,12 @@ TEST_F(HostQueueFailureTest, FailureDuringTeardownWaitReleasesIt) {
   g_teardown_wait_hook.thread = std::this_thread::get_id();
   iree_atomic_store(&g_teardown_wait_hook.armed, 0, iree_memory_order_release);
   iree_atomic_store(&g_teardown_wait_hook.reached, 0,
+                    iree_memory_order_release);
+  iree_atomic_store(&g_teardown_wait_hook.wait_count, 0,
+                    iree_memory_order_release);
+  iree_atomic_store(&g_teardown_wait_hook.hold_after_wait, 1,
+                    iree_memory_order_release);
+  iree_atomic_store(&g_teardown_wait_hook.allow_wait_return, 0,
                     iree_memory_order_release);
   iree_notification_initialize(&g_teardown_wait_hook.reached_notification);
   hooked_libhsa.hsa_amd_signal_wait_any = TeardownWaitHookEntry;
@@ -532,6 +566,8 @@ TEST_F(HostQueueFailureTest, FailureDuringTeardownWaitReleasesIt) {
 
   // Stands in for the delivery path: a thread outside teardown recording the
   // failure, held until the wait it has to release has reached HSA.
+  iree_status_code_t published_signal_status = IREE_STATUS_UNKNOWN;
+  iree_status_code_t retained_queue_error_status = IREE_STATUS_UNKNOWN;
   std::thread failing_thread([&]() {
     iree_notification_await(&g_teardown_wait_hook.reached_notification,
                             TeardownWaitWasReached, &g_teardown_wait_hook,
@@ -539,6 +575,22 @@ TEST_F(HostQueueFailureTest, FailureDuringTeardownWaitReleasesIt) {
     iree_hal_amdgpu_host_queue_record_failure(
         queue,
         iree_make_status(kInjectedFailureCode, "injected queue failure"));
+
+    // The main thread remains inside TeardownWaitHookEntry after the stop
+    // signal wakes HSA. The completion service must therefore publish the
+    // recorded failure to this exact signal semaphore while the queue still
+    // retains the status that supplies it.
+    iree_status_t signal_status = iree_hal_semaphore_wait(
+        signal_semaphore, signal_value, iree_infinite_timeout(),
+        IREE_ASYNC_WAIT_FLAG_NONE);
+    published_signal_status = iree_status_code(signal_status);
+    iree_status_free(signal_status);
+    retained_queue_error_status = HostQueueErrorStatusCode(queue);
+
+    iree_atomic_store(&g_teardown_wait_hook.allow_wait_return, 1,
+                      iree_memory_order_release);
+    iree_notification_post(&g_teardown_wait_hook.reached_notification,
+                           IREE_ALL_WAITERS);
   });
 
   // Nothing has failed the queue yet, so the call below has no early exit and
@@ -568,14 +620,202 @@ TEST_F(HostQueueFailureTest, FailureDuringTeardownWaitReleasesIt) {
   iree_notification_post(&g_teardown_wait_hook.reached_notification,
                          IREE_ALL_WAITERS);
   failing_thread.join();
-  EXPECT_EQ(HostQueueErrorStatusCode(queue), kInjectedFailureCode);
-  IREE_EXPECT_STATUS_IS(kInjectedFailureCode,
-                        iree_hal_semaphore_wait(signal_semaphore, signal_value,
-                                                iree_infinite_timeout(),
-                                                IREE_ASYNC_WAIT_FLAG_NONE));
+  EXPECT_EQ(iree_atomic_load(&g_teardown_wait_hook.wait_count,
+                             iree_memory_order_acquire),
+            1);
+  EXPECT_EQ(published_signal_status, kInjectedFailureCode);
+  EXPECT_EQ(retained_queue_error_status, kInjectedFailureCode);
+  EXPECT_EQ(HostQueueErrorStatusCode(queue), IREE_STATUS_OK);
 
-  iree_hsa_signal_store_screlease(IREE_LIBHSA(&libhsa_), blocker_signal, 0);
-  WaitForSubmittedEpoch(&libhsa_, queue);
+  // Terminal seal has retired the native queue and consumed the failed epoch;
+  // no CP packet remains that could reference or decrement |blocker_signal|.
+  // Waiting for that discarded epoch would be unbounded by construction.
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  EXPECT_TRUE(queue->hardware_queue_retired);
+  EXPECT_EQ(queue->hardware_queue, nullptr);
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+  IREE_EXPECT_OK(
+      iree_hsa_signal_destroy(IREE_LIBHSA(&libhsa_), blocker_signal));
+  iree_notification_deinitialize(&g_teardown_wait_hook.reached_notification);
+  iree_hal_amdgpu_libhsa_deinitialize(&hooked_libhsa);
+}
+
+// Sealing closes admission before capturing the final epoch. A deferred
+// operation released while the final-epoch wait is blocked must fail rather
+// than publish a later epoch, and final release must accept the resulting exact
+// certificate without entering another backend wait.
+TEST_F(HostQueueFailureTest,
+       SealFreezesDeferredPublicationAndCertifiesFinalEpoch) {
+  iree_hal_amdgpu_logical_device_options_t options;
+  iree_hal_amdgpu_logical_device_options_initialize(&options);
+  options.preallocate_pools = 0;
+
+  iree_hal_amdgpu_libhsa_t hooked_libhsa;
+  IREE_ASSERT_OK(iree_hal_amdgpu_libhsa_copy(&libhsa_, &hooked_libhsa));
+  g_teardown_wait_hook.next = hooked_libhsa.hsa_amd_signal_wait_any;
+  g_teardown_wait_hook.thread = std::this_thread::get_id();
+  iree_atomic_store(&g_teardown_wait_hook.armed, 0, iree_memory_order_release);
+  iree_atomic_store(&g_teardown_wait_hook.reached, 0,
+                    iree_memory_order_release);
+  iree_atomic_store(&g_teardown_wait_hook.wait_count, 0,
+                    iree_memory_order_release);
+  iree_atomic_store(&g_teardown_wait_hook.hold_after_wait, 0,
+                    iree_memory_order_release);
+  iree_atomic_store(&g_teardown_wait_hook.allow_wait_return, 1,
+                    iree_memory_order_release);
+  iree_notification_initialize(&g_teardown_wait_hook.reached_notification);
+  hooked_libhsa.hsa_amd_signal_wait_any = TeardownWaitHookEntry;
+
+  TestLogicalDevice test_device;
+  IREE_ASSERT_OK(test_device.Initialize(&options, &hooked_libhsa, &topology_,
+                                        host_allocator_));
+  const iree_hal_queue_family_t* queue_family =
+      iree_hal_device_queue_family(test_device.base_device(),
+                                   /*family_ordinal=*/0);
+  ASSERT_NE(queue_family, nullptr);
+  iree_hal_queue_params_t queue_params;
+  iree_hal_queue_params_initialize(&queue_params);
+  Ref<iree_hal_queue_t> dynamic_queue;
+  IREE_ASSERT_OK(iree_hal_device_acquire_queue(test_device.base_device(),
+                                               queue_family, &queue_params,
+                                               dynamic_queue.out()));
+  auto* queue = (iree_hal_amdgpu_host_queue_t*)dynamic_queue.get();
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  EXPECT_FALSE(queue->idle_certificate_valid);
+  EXPECT_EQ(queue->idle_certificate_epoch, 0u);
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+
+  Ref<iree_hal_buffer_t> target_buffer;
+  IREE_ASSERT_OK(CreateHostVisibleTransferBuffer(
+      test_device.allocator(), sizeof(uint32_t), target_buffer.out()));
+
+  hsa_signal_t blocker_signal = iree_hsa_signal_null();
+  IREE_ASSERT_OK(iree_hsa_amd_signal_create(
+      IREE_LIBHSA(&libhsa_), /*initial_value=*/1, /*num_consumers=*/0,
+      /*consumers=*/NULL, /*attributes=*/0, &blocker_signal));
+  EnqueueRawBlockingBarrier(queue, blocker_signal);
+
+  Ref<iree_hal_semaphore_t> submitted_semaphore;
+  IREE_ASSERT_OK(
+      CreateSemaphore(test_device.base_device(), submitted_semaphore.out()));
+  uint64_t submitted_value = 1;
+  iree_hal_semaphore_t* submitted_semaphore_ptr = submitted_semaphore.get();
+  const iree_hal_semaphore_list_t submitted_list =
+      MakeSemaphoreList(&submitted_semaphore_ptr, &submitted_value);
+  const uint32_t submitted_pattern = 0xCACE1105u;
+  IREE_ASSERT_OK(iree_hal_queue_fill(
+      dynamic_queue, iree_hal_semaphore_list_empty(), submitted_list,
+      target_buffer,
+      /*target_offset=*/0, sizeof(submitted_pattern), &submitted_pattern,
+      sizeof(submitted_pattern), IREE_HAL_FILL_FLAG_NONE));
+
+  Ref<iree_hal_semaphore_t> deferred_wait_semaphore;
+  IREE_ASSERT_OK(CreateSemaphore(test_device.base_device(),
+                                 deferred_wait_semaphore.out()));
+  uint64_t deferred_wait_value = 1;
+  iree_hal_semaphore_t* deferred_wait_semaphore_ptr =
+      deferred_wait_semaphore.get();
+  const iree_hal_semaphore_list_t deferred_wait_list =
+      MakeSemaphoreList(&deferred_wait_semaphore_ptr, &deferred_wait_value);
+  Ref<iree_hal_semaphore_t> deferred_signal_semaphore;
+  IREE_ASSERT_OK(CreateSemaphore(test_device.base_device(),
+                                 deferred_signal_semaphore.out()));
+  uint64_t deferred_signal_value = 1;
+  iree_hal_semaphore_t* deferred_signal_semaphore_ptr =
+      deferred_signal_semaphore.get();
+  const iree_hal_semaphore_list_t deferred_signal_list =
+      MakeSemaphoreList(&deferred_signal_semaphore_ptr, &deferred_signal_value);
+  const uint32_t deferred_pattern = 0xCACE1106u;
+  IREE_ASSERT_OK(iree_hal_queue_fill(
+      dynamic_queue, deferred_wait_list, deferred_signal_list, target_buffer,
+      /*target_offset=*/0, sizeof(deferred_pattern), &deferred_pattern,
+      sizeof(deferred_pattern), IREE_HAL_FILL_FLAG_NONE));
+  EXPECT_TRUE(HostQueueHasPendingOps(queue));
+
+  uint64_t expected_final_epoch = 0;
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  expected_final_epoch = queue->notification_ring.epoch.next_submission;
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+  EXPECT_GT(expected_final_epoch, 0u);
+
+  iree_status_code_t readiness_status_code = IREE_STATUS_UNKNOWN;
+  iree_status_code_t deferred_status_code = IREE_STATUS_UNKNOWN;
+  uint64_t blocked_next_submission = UINT64_MAX;
+  std::thread deferred_thread([&]() {
+    iree_notification_await(&g_teardown_wait_hook.reached_notification,
+                            TeardownWaitWasReached, &g_teardown_wait_hook,
+                            iree_infinite_timeout());
+
+    iree_status_t readiness_status = iree_hal_semaphore_signal(
+        deferred_wait_semaphore, deferred_wait_value, /*frontier=*/NULL);
+    readiness_status_code = iree_status_code(readiness_status);
+    if (iree_status_is_ok(readiness_status)) {
+      iree_status_t deferred_status = iree_hal_semaphore_wait(
+          deferred_signal_semaphore, deferred_signal_value,
+          iree_infinite_timeout(), IREE_ASYNC_WAIT_FLAG_NONE);
+      deferred_status_code = iree_status_code(deferred_status);
+      iree_status_free(deferred_status);
+    }
+    iree_status_free(readiness_status);
+
+    iree_slim_mutex_lock(&queue->locks.submission_mutex);
+    blocked_next_submission = queue->notification_ring.epoch.next_submission;
+    iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+
+    // Every outcome releases the hardware and lets seal and teardown finish.
+    iree_hsa_signal_store_screlease(IREE_LIBHSA(&libhsa_), blocker_signal, 0);
+  });
+  iree_atomic_store(&g_teardown_wait_hook.armed, 1, iree_memory_order_release);
+
+  iree_hal_amdgpu_host_queue_seal(queue);
+
+  EXPECT_EQ(iree_atomic_exchange(&g_teardown_wait_hook.armed, 0,
+                                 iree_memory_order_acq_rel),
+            0);
+  iree_atomic_store(&g_teardown_wait_hook.reached, 1,
+                    iree_memory_order_release);
+  iree_notification_post(&g_teardown_wait_hook.reached_notification,
+                         IREE_ALL_WAITERS);
+  deferred_thread.join();
+  EXPECT_EQ(iree_atomic_load(&g_teardown_wait_hook.wait_count,
+                             iree_memory_order_acquire),
+            1);
+  EXPECT_EQ(readiness_status_code, IREE_STATUS_OK);
+  EXPECT_EQ(deferred_status_code, IREE_STATUS_CANCELLED);
+  EXPECT_EQ(blocked_next_submission, expected_final_epoch);
+  EXPECT_FALSE(HostQueueHasPendingOps(queue));
+
+  uint64_t certified_epoch = 0;
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  EXPECT_TRUE(queue->is_shutting_down);
+  EXPECT_TRUE(queue->idle_certificate_valid);
+  certified_epoch = queue->idle_certificate_epoch;
+  EXPECT_EQ(certified_epoch, expected_final_epoch);
+  EXPECT_EQ(certified_epoch, queue->notification_ring.epoch.next_submission);
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+  EXPECT_GT(certified_epoch, 0u);
+
+  // A second seal is idempotent after hardware teardown and must not enter
+  // another backend wait or attempt to reconstruct the sole certificate.
+  iree_hal_amdgpu_host_queue_seal(queue);
+  EXPECT_EQ(iree_atomic_load(&g_teardown_wait_hook.wait_count,
+                             iree_memory_order_acquire),
+            1);
+  iree_slim_mutex_lock(&queue->locks.submission_mutex);
+  EXPECT_TRUE(queue->idle_certificate_valid);
+  EXPECT_EQ(queue->idle_certificate_epoch, certified_epoch);
+  EXPECT_EQ(queue->notification_ring.epoch.next_submission, certified_epoch);
+  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
+
+  iree_atomic_store(&g_teardown_wait_hook.armed, 1, iree_memory_order_release);
+  dynamic_queue.reset();
+  EXPECT_EQ(iree_atomic_exchange(&g_teardown_wait_hook.armed, 0,
+                                 iree_memory_order_acq_rel),
+            1);
+  EXPECT_EQ(iree_atomic_load(&g_teardown_wait_hook.wait_count,
+                             iree_memory_order_acquire),
+            1);
+
   IREE_EXPECT_OK(
       iree_hsa_signal_destroy(IREE_LIBHSA(&libhsa_), blocker_signal));
   iree_notification_deinitialize(&g_teardown_wait_hook.reached_notification);
@@ -775,18 +1015,28 @@ TEST_F(HostQueueFailureTest, ProducerDuringTheFailureDrainIsRejected) {
   RacingProducer producer;
   producer.queue = queue;
   producer.target_buffer = target_buffer;
+
+  // Hold runner admission across action publication and failure admission.
+  // The raw hardware barrier leaves the completion service asleep, and the
+  // test starts no other publisher in this interval, so this lock order has no
+  // competing submission-to-completion owner. Once released, the service
+  // observes both the queued producer and the already-closed submission gate.
+  iree_slim_mutex_lock(&queue->locks.completion_drain_mutex);
   iree_hal_amdgpu_host_queue_enqueue_post_drain_action(
       queue, &producer.action, RacingProducerSubmit, &producer);
 
   iree_hal_amdgpu_host_queue_record_failure(
       queue, iree_make_status(kInjectedFailureCode, "injected queue failure"));
+  iree_slim_mutex_unlock(&queue->locks.completion_drain_mutex);
 
   iree_notification_await(&producer.ran, RacingProducerHasRun, &producer,
                           iree_infinite_timeout());
 
   // Admission was already closed when the flush reached the producer, so its
   // submission never joined a published state the drain had finished with.
-  IREE_EXPECT_STATUS_IS(IREE_STATUS_CANCELLED, producer.submit_status);
+  // The recorded sticky failure outranks generic closure while it remains
+  // published and gives every operation settled by this transition one cause.
+  IREE_EXPECT_STATUS_IS(kInjectedFailureCode, producer.submit_status);
   iree_status_free(producer.submit_status);
   EXPECT_EQ(HostQueueErrorStatusCode(queue), kInjectedFailureCode);
   IREE_EXPECT_STATUS_IS(kInjectedFailureCode,
@@ -819,14 +1069,22 @@ TEST_F(HostQueueFailureTest, TeardownReleasesTheRecordedQueueFailure) {
       queue, iree_make_status(kInjectedFailureCode, "injected queue failure"));
   ASSERT_EQ(HostQueueErrorStatusCode(queue), kInjectedFailureCode);
 
-  // Frontier deassignment is the teardown the device destructor performs, and
-  // the queue storage is inline in the physical device, so the slot is still
-  // readable after the queue it belongs to has been torn down.
-  iree_hal_amdgpu_physical_device_deassign_frontier(
-      test_device.logical_device()->physical_devices[0]);
+  // Seal joins the completion service and its transient lifetime claim before
+  // inspecting the inline queue storage. Calling physical-device deassignment
+  // directly here would bypass its no-outstanding-queue-users precondition and
+  // race the completion service awakened by record_failure.
+  iree_hal_amdgpu_host_queue_seal(queue);
 
   EXPECT_EQ(iree_atomic_load(&queue->error_status, iree_memory_order_acquire),
             0);
+  EXPECT_EQ(queue->completion.thread, nullptr);
+  EXPECT_TRUE(queue->hardware_queue_retired);
+  EXPECT_EQ(queue->hardware_queue, nullptr);
+  iree_slim_mutex_lock(&queue->locks.post_drain_mutex);
+  EXPECT_FALSE(queue->post_drain.runner_active);
+  EXPECT_EQ(queue->post_drain.head, nullptr);
+  EXPECT_EQ(queue->post_drain.tail, nullptr);
+  iree_slim_mutex_unlock(&queue->locks.post_drain_mutex);
 }
 
 }  // namespace

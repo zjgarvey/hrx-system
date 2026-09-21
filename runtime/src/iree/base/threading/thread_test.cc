@@ -230,6 +230,64 @@ TEST(ThreadTest, ReleaseWaitsForCompletion) {
   EXPECT_EQ(100, value.load(std::memory_order_acquire));
 }
 
+TEST(ThreadTest, FinalReferenceMayBeReleasedByEntry) {
+  iree_thread_create_params_t params;
+  memset(&params, 0, sizeof(params));
+  params.create_suspended = true;
+
+  struct entry_data_t {
+    std::atomic<iree_thread_t*> thread{nullptr};
+    std::atomic<bool> release_returned{false};
+    std::atomic<bool> post_returned{false};
+    iree_notification_t done;
+  } entry_data;
+  iree_notification_initialize(&entry_data.done);
+
+  iree_thread_entry_t entry_fn = +[](void* entry_arg) -> int {
+    auto* entry_data = reinterpret_cast<struct entry_data_t*>(entry_arg);
+    iree_thread_t* thread = entry_data->thread.load(std::memory_order_acquire);
+    IREE_ASSERT(thread != nullptr);
+
+    // This is the sole thread-handle reference. Self-release must detach the
+    // native thread, free the wrapper, and return to the copied trampoline.
+    iree_thread_release(thread);
+
+    entry_data->release_returned.store(true, std::memory_order_release);
+    iree_notification_post(&entry_data->done, IREE_ALL_WAITERS);
+    // This must be the final access to entry_data: the test may destroy the
+    // stack notification as soon as it observes this release store.
+    entry_data->post_returned.store(true, std::memory_order_release);
+    return 0;
+  };
+
+  iree_thread_t* thread = nullptr;
+  IREE_ASSERT_OK(iree_thread_create(entry_fn, &entry_data, params,
+                                    iree_allocator_system(), &thread));
+  entry_data.thread.store(thread, std::memory_order_release);
+
+  // Transfer the sole reference to the suspended entry. After resume the
+  // caller never reads |thread| again because the entry may already free it.
+  iree_thread_resume(thread);
+  thread = nullptr;
+
+  ASSERT_TRUE(iree_notification_await(
+      &entry_data.done,
+      +[](void* entry_arg) -> bool {
+        auto* entry_data = reinterpret_cast<struct entry_data_t*>(entry_arg);
+        return entry_data->release_returned.load(std::memory_order_acquire);
+      },
+      &entry_data, iree_infinite_timeout()));
+
+  // The predicate above proves self-release returned, but the notifying
+  // thread may still be inside notification_post. Wait for its final store
+  // before deinitializing the stack notification; the outer test timeout
+  // diagnoses a broken self-release path.
+  while (!entry_data.post_returned.load(std::memory_order_acquire)) {
+    iree_thread_yield();
+  }
+  iree_notification_deinitialize(&entry_data.done);
+}
+
 TEST(ThreadTest, NamedThread) {
   iree_thread_create_params_t params;
   memset(&params, 0, sizeof(params));

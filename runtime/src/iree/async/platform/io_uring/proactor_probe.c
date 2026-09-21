@@ -120,12 +120,14 @@ iree_status_t iree_async_proactor_io_uring_detect_capabilities(
   }
 
   // Baseline capabilities (5.7+): always present when we get here.
-  *out_capabilities = IREE_ASYNC_PROACTOR_CAPABILITY_ABSOLUTE_TIMEOUT |
-                      IREE_ASYNC_PROACTOR_CAPABILITY_LINKED_OPERATIONS |
-                      IREE_ASYNC_PROACTOR_CAPABILITY_FIXED_FILES |
-                      IREE_ASYNC_PROACTOR_CAPABILITY_REGISTERED_BUFFERS |
-                      IREE_ASYNC_PROACTOR_CAPABILITY_DMABUF |
-                      IREE_ASYNC_PROACTOR_CAPABILITY_DEVICE_FENCE;
+  *out_capabilities =
+      IREE_ASYNC_PROACTOR_CAPABILITY_ABSOLUTE_TIMEOUT |
+      IREE_ASYNC_PROACTOR_CAPABILITY_LINKED_OPERATIONS |
+      IREE_ASYNC_PROACTOR_CAPABILITY_FIXED_FILES |
+      IREE_ASYNC_PROACTOR_CAPABILITY_REGISTERED_BUFFERS |
+      IREE_ASYNC_PROACTOR_CAPABILITY_DMABUF |
+      IREE_ASYNC_PROACTOR_CAPABILITY_DEVICE_FENCE |
+      IREE_ASYNC_PROACTOR_CAPABILITY_FILE_OPERATION_CANCELLATION;
 
   // Probe for newer capabilities that require specific opcodes.
   uint64_t supported_opcodes = 0;

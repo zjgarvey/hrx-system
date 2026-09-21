@@ -51,6 +51,9 @@ typedef struct iree_hal_amdgpu_alloca_transaction_t {
   bool reservations_held;
   // True while the transaction owns every entry in |backing_buffers|.
   bool backing_buffers_held;
+  // Submission epoch assigned after the transaction commits. Used only by the
+  // unlocked profiling epilogue.
+  uint64_t submission_id;
 } iree_hal_amdgpu_alloca_transaction_t;
 
 typedef struct iree_hal_amdgpu_dealloca_transaction_t {
@@ -62,6 +65,13 @@ typedef struct iree_hal_amdgpu_dealloca_transaction_t {
   iree_hal_pool_t* pool;
   // Caller-provided storage receiving detached reservation tokens.
   iree_hal_pool_reservation_t* reservations;
+  // Queue frontier copied by value at the exact publication commit.
+  iree_hal_amdgpu_fixed_frontier_t release_frontier;
+  // Submission epoch assigned at the exact publication commit.
+  uint64_t submission_id;
+  // True after publication detached every reservation and before the unlocked
+  // pool-release epilogue consumes them.
+  bool reservations_detached;
 } iree_hal_amdgpu_dealloca_transaction_t;
 
 // Validates/canonicalizes an allocation transaction against the exact source
@@ -75,9 +85,13 @@ iree_status_t iree_hal_amdgpu_host_queue_prepare_alloca_buffers(
 
 // Attempts to reserve bytes from |allocation_pool| and classifies the result
 // as immediate, death-frontier-waitable, or notification-retry-required.
+// |requester_frontier| must be an immutable snapshot captured under
+// submission_mutex. This function invokes pool/profile callbacks and must run
+// without any queue lock held.
 iree_status_t iree_hal_amdgpu_host_queue_acquire_alloca_transaction(
     iree_hal_amdgpu_host_queue_t* queue,
     const iree_hal_amdgpu_wait_resolution_t* resolution,
+    const iree_async_frontier_t* requester_frontier,
     iree_hal_pool_t* allocation_pool,
     iree_hal_pool_reserve_flags_t reserve_flags,
     iree_hal_amdgpu_alloca_transaction_t* transaction);
@@ -96,7 +110,8 @@ void iree_hal_amdgpu_host_queue_release_alloca_transaction(
 
 // Stages every materialized reservation on its transient buffer and submits the
 // queue barrier that commits the transaction on completion. Caller must hold
-// submission_mutex.
+// submission_mutex. Pool cleanup and memory-event recording are deliberately
+// left to an unlocked caller epilogue.
 iree_status_t iree_hal_amdgpu_host_queue_submit_alloca_materialization(
     iree_hal_amdgpu_host_queue_t* queue,
     iree_hal_amdgpu_alloca_transaction_t* transaction,
@@ -105,16 +120,11 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_alloca_materialization(
     iree_hal_amdgpu_host_queue_submission_flags_t submission_flags,
     bool* out_ready);
 
-// Materializes a ready transaction, stages every reservation on its transient
-// buffer, and submits the queue barrier that commits the transaction on
-// completion. Caller must hold submission_mutex.
-iree_status_t iree_hal_amdgpu_host_queue_submit_alloca_transaction(
-    iree_hal_amdgpu_host_queue_t* queue,
-    iree_hal_amdgpu_alloca_transaction_t* transaction,
-    const iree_hal_semaphore_list_t signal_semaphore_list,
-    iree_hal_pool_t* allocation_pool,
-    iree_hal_amdgpu_host_queue_submission_flags_t submission_flags,
-    bool* out_ready);
+// Records the committed pool-backed alloca memory events. Must run without any
+// queue lock held because pool statistics are queried through a public vtable.
+void iree_hal_amdgpu_host_queue_record_committed_alloca(
+    iree_hal_amdgpu_host_queue_t* queue, iree_hal_pool_t* allocation_pool,
+    const iree_hal_amdgpu_alloca_transaction_t* transaction);
 
 // Submits the queue barrier that decommits every transient buffer on
 // completion.
@@ -125,6 +135,12 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_dealloca(
     iree_hal_amdgpu_dealloca_transaction_t* transaction,
     iree_hal_amdgpu_host_queue_submission_flags_t submission_flags,
     bool* out_ready);
+
+// Consumes reservations detached by a committed dealloca and records release
+// profiling against its copied frontier/id. Must run without queue locks.
+void iree_hal_amdgpu_host_queue_release_dealloca_transaction(
+    iree_hal_amdgpu_host_queue_t* queue,
+    iree_hal_amdgpu_dealloca_transaction_t* transaction);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -9,11 +9,12 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <thread>
 
 #include "binding/hip/api.h"
-#include "common/internal.h"
 #include "iree/testing/gtest.h"
+#include "libhrx/cts/core/amdgpu_executable_test_data.hpp"
 
 namespace {
 
@@ -30,6 +31,12 @@ const char* CandidateLibPath() {
 }
 
 using HipInitFn = hipError_t (*)(unsigned int flags);
+using HipGetDeviceFn = hipError_t (*)(int* device);
+using HipGetDevicePropertiesFn = hipError_t (*)(hipDeviceProp_t* properties,
+                                                int device);
+using HipDeviceGetAttributeFn = hipError_t (*)(int* value,
+                                               hipDeviceAttribute_t attribute,
+                                               int device);
 using HipStreamCreateFn = hipError_t (*)(hipStream_t* stream);
 using HipStreamDestroyFn = hipError_t (*)(hipStream_t stream);
 using HipStreamGetIdFn = hipError_t (*)(hipStream_t stream,
@@ -49,6 +56,12 @@ using HipModuleLaunchKernelFn = hipError_t (*)(
     unsigned int grid_dim_z, unsigned int block_dim_x, unsigned int block_dim_y,
     unsigned int block_dim_z, unsigned int shared_memory_bytes,
     hipStream_t stream, void** arguments, void** extra);
+using HipModuleLoadDataFn = hipError_t (*)(hipModule_t* module,
+                                           const void* image);
+using HipModuleGetFunctionFn = hipError_t (*)(hipFunction_t* function,
+                                              hipModule_t module,
+                                              const char* name);
+using HipModuleUnloadFn = hipError_t (*)(hipModule_t module);
 using HipFuncGetAttributeFn = hipError_t (*)(int* value,
                                              hipFuncAttribute_t attribute,
                                              hipFunction_t function);
@@ -72,6 +85,12 @@ struct HipRuntimeApi {
   void* library = nullptr;
   // Initializes the HIP runtime instance.
   HipInitFn init = nullptr;
+  // Queries the thread's current device ordinal.
+  HipGetDeviceFn get_device = nullptr;
+  // Queries the architecture used to select embedded executable data.
+  HipGetDevicePropertiesFn get_device_properties = nullptr;
+  // Queries hardware limits used to derive launch boundaries.
+  HipDeviceGetAttributeFn device_get_attribute = nullptr;
   // Creates the stream used by immediate launch entry points.
   HipStreamCreateFn stream_create = nullptr;
   // Destroys the stream used by immediate launch entry points.
@@ -84,6 +103,12 @@ struct HipRuntimeApi {
   HipExtLaunchKernelFn ext_launch_kernel = nullptr;
   // Launches a module kernel with prepacked or pointer-array arguments.
   HipModuleLaunchKernelFn module_launch_kernel = nullptr;
+  // Loads an in-memory module through the public driver ABI.
+  HipModuleLoadDataFn module_load_data = nullptr;
+  // Resolves a function owned by a loaded public module.
+  HipModuleGetFunctionFn module_get_function = nullptr;
+  // Unloads a public module after every dependent assertion completes.
+  HipModuleUnloadFn module_unload = nullptr;
   // Queries a cached function compatibility attribute.
   HipFuncGetAttributeFn function_get_attribute = nullptr;
   // Updates a mutable function compatibility attribute.
@@ -117,6 +142,12 @@ class HipLaunchValidationApiTest : public testing::Test {
           << "cannot dlopen " << library_path << ": " << dlerror();
 
       api_.init = ResolveHipSymbol<HipInitFn>(api_.library, "hipInit");
+      api_.get_device =
+          ResolveHipSymbol<HipGetDeviceFn>(api_.library, "hipGetDevice");
+      api_.get_device_properties = ResolveHipSymbol<HipGetDevicePropertiesFn>(
+          api_.library, "hipGetDeviceProperties");
+      api_.device_get_attribute = ResolveHipSymbol<HipDeviceGetAttributeFn>(
+          api_.library, "hipDeviceGetAttribute");
       api_.stream_create =
           ResolveHipSymbol<HipStreamCreateFn>(api_.library, "hipStreamCreate");
       api_.stream_destroy = ResolveHipSymbol<HipStreamDestroyFn>(
@@ -129,6 +160,12 @@ class HipLaunchValidationApiTest : public testing::Test {
           api_.library, "hipExtLaunchKernel");
       api_.module_launch_kernel = ResolveHipSymbol<HipModuleLaunchKernelFn>(
           api_.library, "hipModuleLaunchKernel");
+      api_.module_load_data = ResolveHipSymbol<HipModuleLoadDataFn>(
+          api_.library, "hipModuleLoadData");
+      api_.module_get_function = ResolveHipSymbol<HipModuleGetFunctionFn>(
+          api_.library, "hipModuleGetFunction");
+      api_.module_unload =
+          ResolveHipSymbol<HipModuleUnloadFn>(api_.library, "hipModuleUnload");
       api_.function_get_attribute = ResolveHipSymbol<HipFuncGetAttributeFn>(
           api_.library, "hipFuncGetAttribute");
       api_.function_set_attribute = ResolveHipSymbol<HipFuncSetAttributeFn>(
@@ -148,12 +185,18 @@ class HipLaunchValidationApiTest : public testing::Test {
     }
 
     ASSERT_NE(nullptr, api_.init);
+    ASSERT_NE(nullptr, api_.get_device);
+    ASSERT_NE(nullptr, api_.get_device_properties);
+    ASSERT_NE(nullptr, api_.device_get_attribute);
     ASSERT_NE(nullptr, api_.stream_create);
     ASSERT_NE(nullptr, api_.stream_destroy);
     ASSERT_NE(nullptr, api_.stream_get_id);
     ASSERT_NE(nullptr, api_.launch_kernel);
     ASSERT_NE(nullptr, api_.ext_launch_kernel);
     ASSERT_NE(nullptr, api_.module_launch_kernel);
+    ASSERT_NE(nullptr, api_.module_load_data);
+    ASSERT_NE(nullptr, api_.module_get_function);
+    ASSERT_NE(nullptr, api_.module_unload);
     ASSERT_NE(nullptr, api_.function_get_attribute);
     ASSERT_NE(nullptr, api_.function_set_attribute);
     ASSERT_NE(nullptr, api_.graph_create);
@@ -167,12 +210,32 @@ class HipLaunchValidationApiTest : public testing::Test {
       GTEST_SKIP() << "hipInit failed: " << init_result;
     }
     ASSERT_EQ(hipSuccess, api_.stream_create(&stream_));
+    ASSERT_EQ(hipSuccess, api_.get_device(&device_));
+    hipDeviceProp_t properties = {};
+    ASSERT_EQ(hipSuccess, api_.get_device_properties(&properties, device_));
+    const hrx_cts::AmdgpuExecutableTestImage test_image =
+        hrx_cts::FindAmdgpuExecutableTestImage(properties.gcnArchName);
+    ASSERT_NE(nullptr, test_image.file)
+        << "no embedded HSACO for " << properties.gcnArchName;
+    ASSERT_EQ(hipSuccess,
+              api_.module_load_data(&module_, test_image.file->data));
+    ASSERT_EQ(hipSuccess,
+              api_.module_get_function(&noop_function_, module_, "hrx_noop"));
+    ASSERT_EQ(hipSuccess,
+              api_.module_get_function(&store_output_function_, module_,
+                                       "hrx_store_output"));
   }
 
   void TearDown() override {
     if (stream_) {
       EXPECT_EQ(hipSuccess, api_.stream_destroy(stream_));
       stream_ = nullptr;
+    }
+    if (module_) {
+      EXPECT_EQ(hipSuccess, api_.module_unload(module_));
+      module_ = nullptr;
+      noop_function_ = nullptr;
+      store_output_function_ = nullptr;
     }
     // Keep the process-global runtime instance loaded across test cases. The
     // driver services it owns outlive an individual stream and are not
@@ -183,49 +246,69 @@ class HipLaunchValidationApiTest : public testing::Test {
   static HipRuntimeApi api_;
   // Stream supplied to immediate launch entry points.
   hipStream_t stream_ = nullptr;
+  // Device whose architecture selected the embedded module image.
+  int device_ = -1;
+  // Module kept live while its function handles are under test.
+  hipModule_t module_ = nullptr;
+  // Zero-argument function used by configuration-only assertions.
+  hipFunction_t noop_function_ = nullptr;
+  // Two-argument function used to validate short prepacked spans.
+  hipFunction_t store_output_function_ = nullptr;
 };
 
 HipRuntimeApi HipLaunchValidationApiTest::api_;
 
 TEST_F(HipLaunchValidationApiTest,
-       FunctionDynamicSharedMemoryAttributeHonorsGenericCeiling) {
-  iree_hal_streaming_symbol_t symbol = {};
-  symbol.type = IREE_HAL_STREAMING_SYMBOL_TYPE_FUNCTION;
-  symbol.function_attributes.provided_flags =
-      IREE_HAL_STREAMING_FUNCTION_ATTRIBUTE_FLAG_DYNAMIC_SHARED_MEMORY;
-  symbol.function_attributes.maximum_configurable_dynamic_shared_memory_size =
-      4096;
-  iree_atomic_store(
-      &symbol.function_attributes.configured_dynamic_shared_memory_size, 2048,
-      iree_memory_order_relaxed);
-  hipFunction_t function =
-      reinterpret_cast<hipFunction_t>(iree_hal_streaming_symbol_tag(&symbol));
-
-  int value = 0;
-  EXPECT_EQ(hipSuccess,
+       FunctionDynamicSharedMemoryAttributeHonorsReportedCeiling) {
+  int default_capacity = 0;
+  int optin_capacity = 0;
+  int fixed_size = 0;
+  int configured_size = 0;
+  ASSERT_EQ(hipSuccess,
+            api_.device_get_attribute(&default_capacity,
+                                      hipDeviceAttributeMaxSharedMemoryPerBlock,
+                                      device_));
+  ASSERT_EQ(hipSuccess, api_.device_get_attribute(
+                            &optin_capacity,
+                            hipDeviceAttributeSharedMemPerBlockOptin, device_));
+  ASSERT_EQ(hipSuccess,
             api_.function_get_attribute(
-                &value, hipFuncAttributeMaxDynamicSharedSizeBytes, function));
-  EXPECT_EQ(2048, value);
+                &fixed_size, hipFuncAttributeSharedSizeBytes, noop_function_));
+  ASSERT_EQ(hipSuccess,
+            api_.function_get_attribute(
+                &configured_size, hipFuncAttributeMaxDynamicSharedSizeBytes,
+                noop_function_));
+  const int configurable_capacity =
+      optin_capacity != 0 ? optin_capacity : default_capacity;
+  ASSERT_GE(configurable_capacity, fixed_size);
+  ASSERT_GE(default_capacity, 0);
+  const int maximum_configurable_size = configurable_capacity - fixed_size;
+  const int expected_configured_size =
+      default_capacity > fixed_size ? default_capacity - fixed_size : 0;
+  EXPECT_EQ(expected_configured_size, configured_size);
   EXPECT_EQ(hipErrorInvalidValue,
             api_.function_set_attribute(
-                function, hipFuncAttributeMaxDynamicSharedSizeBytes, -1));
-  EXPECT_EQ(hipErrorInvalidValue,
-            api_.function_set_attribute(
-                function, hipFuncAttributeMaxDynamicSharedSizeBytes, 4097));
+                noop_function_, hipFuncAttributeMaxDynamicSharedSizeBytes, -1));
+  if (maximum_configurable_size < std::numeric_limits<int>::max()) {
+    EXPECT_EQ(hipErrorInvalidValue,
+              api_.function_set_attribute(
+                  noop_function_, hipFuncAttributeMaxDynamicSharedSizeBytes,
+                  maximum_configurable_size + 1));
+  }
   EXPECT_EQ(hipSuccess,
             api_.function_set_attribute(
-                function, hipFuncAttributeMaxDynamicSharedSizeBytes, 4096));
+                noop_function_, hipFuncAttributeMaxDynamicSharedSizeBytes,
+                maximum_configurable_size));
   EXPECT_EQ(hipSuccess,
             api_.function_get_attribute(
-                &value, hipFuncAttributeMaxDynamicSharedSizeBytes, function));
-  EXPECT_EQ(4096, value);
+                &configured_size, hipFuncAttributeMaxDynamicSharedSizeBytes,
+                noop_function_));
+  EXPECT_EQ(maximum_configurable_size, configured_size);
 }
 
 TEST_F(HipLaunchValidationApiTest,
        LaunchEntryPointsRejectInvalidConfiguration) {
-  iree_hal_streaming_symbol_t symbol = {};
-  symbol.type = IREE_HAL_STREAMING_SYMBOL_TYPE_FUNCTION;
-  const void* function = iree_hal_streaming_symbol_tag(&symbol);
+  const void* function = reinterpret_cast<const void*>(noop_function_);
   const dim3 invalid_grid = {0, 1, 1};
   const dim3 valid_dimension = {1, 1, 1};
 
@@ -282,9 +365,7 @@ TEST_F(HipLaunchValidationApiTest,
 }
 
 TEST_F(HipLaunchValidationApiTest, LaunchEntryPointsRejectDestroyedStreams) {
-  iree_hal_streaming_symbol_t symbol = {};
-  symbol.type = IREE_HAL_STREAMING_SYMBOL_TYPE_FUNCTION;
-  const void* function = iree_hal_streaming_symbol_tag(&symbol);
+  const void* function = reinterpret_cast<const void*>(noop_function_);
   const dim3 valid_dimension = {1, 1, 1};
   hipStream_t stale_stream = stream_;
   ASSERT_EQ(hipSuccess, api_.stream_destroy(stream_));
@@ -351,9 +432,7 @@ TEST_F(HipLaunchValidationApiTest,
     GTEST_SKIP() << "size_t cannot represent a value above uint32_t";
   }
 
-  iree_hal_streaming_symbol_t symbol = {};
-  symbol.type = IREE_HAL_STREAMING_SYMBOL_TYPE_FUNCTION;
-  const void* function = iree_hal_streaming_symbol_tag(&symbol);
+  const void* function = reinterpret_cast<const void*>(noop_function_);
   const dim3 valid_dimension = {1, 1, 1};
   const size_t largest_dispatch_shared_memory = UINT32_MAX;
   const size_t oversized_shared_memory = (size_t)UINT32_MAX + 1;
@@ -420,15 +499,9 @@ TEST_F(HipLaunchValidationApiTest,
 
 TEST_F(HipLaunchValidationApiTest,
        PrepackedGraphArgumentsRejectShortSpansWithoutMutatingTheNode) {
-  iree_hal_streaming_symbol_t empty_symbol = {};
-  empty_symbol.type = IREE_HAL_STREAMING_SYMBOL_TYPE_FUNCTION;
-  iree_hal_streaming_symbol_t prepacked_symbol = {};
-  prepacked_symbol.type = IREE_HAL_STREAMING_SYMBOL_TYPE_FUNCTION;
-  prepacked_symbol.parameters.constant_bytes = 16;
-  prepacked_symbol.parameters.direct_arg_bytes = 16;
-  const void* empty_function = iree_hal_streaming_symbol_tag(&empty_symbol);
+  const void* empty_function = reinterpret_cast<const void*>(noop_function_);
   const void* prepacked_function =
-      iree_hal_streaming_symbol_tag(&prepacked_symbol);
+      reinterpret_cast<const void*>(store_output_function_);
   const dim3 valid_dimension = {1, 1, 1};
 
   uint8_t argument_storage[16] = {};
